@@ -1,0 +1,22 @@
+{
+  "name": "@piplabs/cdr-crypto",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc && cp src/wasm/cb-mpc-tdh2.js src/wasm/cb-mpc-tdh2.wasm dist/wasm/",
+    "test": "vitest run",
+    "clean": "rm -rf dist",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.6",
+    "@noble/hashes": "^1.5",
+    "@noble/ciphers": "^1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5",
+    "vitest": "^2"
+  }
+}

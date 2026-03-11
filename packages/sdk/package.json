@@ -1,0 +1,25 @@
+{
+  "name": "@piplabs/cdr-sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "clean": "rm -rf dist",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@piplabs/cdr-contracts": "workspace:*",
+    "@piplabs/cdr-crypto": "workspace:*"
+  },
+  "peerDependencies": {
+    "viem": "^2.21"
+  },
+  "devDependencies": {
+    "typescript": "^5.5",
+    "viem": "^2.21",
+    "vitest": "^2"
+  }
+}

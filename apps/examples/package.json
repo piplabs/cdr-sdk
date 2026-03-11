@@ -1,0 +1,18 @@
+{
+  "name": "@piplabs/cdr-examples",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "upload": "tsx upload-cdr.ts",
+    "access": "tsx access-cdr.ts",
+    "query": "tsx query-dkg-state.ts",
+    "e2e": "tsx e2e-demo.ts"
+  },
+  "dependencies": {
+    "@piplabs/cdr-sdk": "workspace:*",
+    "viem": "^2.21"
+  },
+  "devDependencies": {
+    "tsx": "^4"
+  }
+}

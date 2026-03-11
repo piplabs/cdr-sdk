@@ -1,0 +1,24 @@
+{
+  "name": "@piplabs/cdr-cli",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "cdr-cli": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "clean": "rm -rf dist",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@piplabs/cdr-sdk": "workspace:*",
+    "commander": "^12",
+    "viem": "^2.21"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "typescript": "^5.5",
+    "tsx": "^4"
+  }
+}
