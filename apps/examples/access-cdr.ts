@@ -52,14 +52,12 @@ async function main() {
 
   // Step 4: Access CDR (read + collect partials + decrypt)
   console.log("\nAccessing CDR vault...");
-  const label = new TextEncoder().encode(`vault-${uuid}`);
   const { dataKey, txHash } = await client.consumer.accessCDR({
     uuid,
     accessAuxData: "0x",
     requesterPubKey: requesterPubKey as `0x${string}`,
     recipientPrivKey: privKeyBytes,
     globalPubKey,
-    label,
     threshold,
   });
 

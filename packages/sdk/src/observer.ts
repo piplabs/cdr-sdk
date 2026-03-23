@@ -64,7 +64,7 @@ export class Observer {
    */
   private async getFinalizedEvents(params?: { fromBlock?: bigint }) {
     const dkgAddress = contractAddresses[this.network].dkg;
-    const fromBlock = params?.fromBlock ?? 0n;
+    const fromBlock = params?.fromBlock ?? BigInt(0);
 
     const rawLogs = await this.publicClient.getLogs({
       address: dkgAddress,
