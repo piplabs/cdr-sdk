@@ -11,10 +11,10 @@
  *
  * Usage: CDR_PRIVATE_KEY=0x... WRITE_CONDITION=0x... READ_CONDITION=0x... pnpm --filter @piplabs/cdr-examples e2e
  */
-import { createPublicClient, createWalletClient, http, toHex } from "viem";
+import { createPublicClient, createWalletClient, http, toHex, toBytes } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { secp256k1 } from "@noble/curves/secp256k1";
-import { CDRClient, initWasm } from "@piplabs/cdr-sdk";
+import { CDRClient, initWasm, uuidToLabel, tdh2Verify, tdh2Combine, decryptPartial as eciesDecrypt, cdrAbi, contractAddresses, getWasm, type DecryptedPartial } from "@piplabs/cdr-sdk";
 
 const RPC_URL = process.env.RPC_URL ?? "https://odyssey.storyrpc.io";
 const PRIVATE_KEY = process.env.CDR_PRIVATE_KEY;
@@ -43,20 +43,18 @@ async function main() {
   // ===== Step 1: Fetch DKG parameters =====
   console.log("Fetching DKG parameters...");
   const globalPubKey = await client.observer.getGlobalPubKey();
-  const threshold = Number(await client.observer.getOperationalThreshold());
+  const threshold = await client.observer.getThreshold();
   console.log("Global pub key:", toHex(globalPubKey));
   console.log("Threshold:", threshold);
 
   // ===== Step 2: Upload =====
   const dataKey = crypto.getRandomValues(new Uint8Array(32));
-  const label = `vault-${Date.now()}`;
   console.log("\nOriginal data key:", toHex(dataKey));
 
-  console.log("Uploading CDR (encrypt + allocate + write)...");
-  const { uuid, txHashes } = await client.uploader.uploadCDR({
+  console.log("Uploading CDR (allocate + encrypt + write)...");
+  const { uuid, ciphertext, txHashes } = await client.uploader.uploadCDR({
     dataKey,
     globalPubKey,
-    label,
     updatable: false,
     writeConditionAddr: writeCondition,
     readConditionAddr: readCondition,
@@ -67,21 +65,162 @@ async function main() {
   console.log(`Vault allocated: uuid=${uuid}, tx=${txHashes.allocate}`);
   console.log(`Data written: tx=${txHashes.write}`);
 
+  // ===== Debug: Verify ciphertext locally =====
+  const label = uuidToLabel(uuid);
+  console.log("\nDebug — label:", toHex(label));
+  console.log("Debug — ciphertext len:", ciphertext.raw.length);
+  console.log("Debug — ciphertext hex:", toHex(ciphertext.raw));
+  // Strip 0x043f prefix to get raw 32-byte point (what validator stores as GlobalPubKey)
+  console.log("Debug — raw global pub key (no prefix):", toHex(globalPubKey.slice(2)));
+
+  // Read back the on-chain ciphertext and compare
+  const vaultData = await publicClient.readContract({
+    address: contractAddresses.testnet.cdr,
+    abi: cdrAbi,
+    functionName: "vaults",
+    args: [uuid],
+  });
+  const onChainCiphertext = (vaultData as any).encryptedData as `0x${string}`;
+  console.log("Debug — on-chain ciphertext len:", (onChainCiphertext.length - 2) / 2, "bytes");
+  console.log("Debug — ciphertexts match:", toHex(ciphertext.raw) === onChainCiphertext);
+
+  const valid = await tdh2Verify({ ciphertext: ciphertext.raw, globalPubKey, label });
+  console.log("Debug — WASM tdh2Verify:", valid ? "PASS" : "FAIL");
+
+  // Self-test: encrypt a tiny payload and immediately verify, same key
+  const wasm = getWasm()!;
+  const testPlain = new Uint8Array([1, 2, 3, 4]);
+  const testLabel = new Uint8Array(32); // all zeros
+  const testCt = wasm.tdh2Encrypt(globalPubKey, testPlain, testLabel);
+  const testOk = wasm.tdh2Verify(globalPubKey, testCt, testLabel);
+  console.log("Debug — self-test encrypt→verify:", testOk ? "PASS" : "FAIL", "ct_len:", testCt.length);
+
+  // Arithmetic test: 0=pass
+  const arith = wasm.tdh2ArithTest(globalPubKey);
+  console.log("Debug — arith test:", arith === 0 ? "ALL PASS" : `FAIL code=${arith}`);
+  if (arith & 1) console.log("  (a+b)*G != a*G + b*G — linearity broken");
+  if (arith & 2) console.log("  f*G - e*R1 != s*G — NIZK math broken");
+  if (arith & 4) console.log("  f*G != s*G + e*R1 — MODULO arithmetic broken");
+
+  // Diagnostic bitmask: 0=all pass
+  const diag = wasm.tdh2Diag(globalPubKey, testPlain, testLabel);
+  console.log("Debug — diag code:", diag);
+  if (diag === 0) console.log("Debug — diag: ALL CHECKS PASS");
+  if (diag & 2)   console.log("Debug — diag: LABEL MISMATCH");
+  if (diag & 4)   console.log("Debug — diag: R1 NOT ON CURVE");
+  if (diag & 8)   console.log("Debug — diag: R2 NOT ON CURVE");
+  if (diag & 16)  console.log("Debug — diag: GAMMA MISMATCH");
+  if (diag & 32)  console.log("Debug — diag: NIZK PROOF FAILED");
+  if (diag & 64)  console.log("Debug — diag: GAMMA RECOMPUTATION DIFFERS");
+  if (diag & 128) console.log("Debug — diag: PUB KEY Q INVALID");
+
   // ===== Step 3: Access =====
   const privKeyBytes = Buffer.from(PRIVATE_KEY.slice(2), "hex");
   const requesterPubKey = toHex(secp256k1.getPublicKey(privKeyBytes, false));
 
   console.log("\nAccessing CDR vault...");
-  const { dataKey: recoveredKey, txHash: readTx } = await client.consumer.accessCDR({
+
+  // Break apart accessCDR for debugging
+  const vaultData2 = await publicClient.readContract({
+    address: contractAddresses.testnet.cdr,
+    abi: cdrAbi,
+    functionName: "vaults",
+    args: [uuid],
+  });
+  const encryptedData = toBytes((vaultData2 as any).encryptedData);
+
+  const fromBlock = await publicClient.getBlockNumber();
+  const { txHash: readTx } = await client.consumer.read({
     uuid,
     accessAuxData: "0x",
     requesterPubKey: requesterPubKey as `0x${string}`,
-    recipientPrivKey: privKeyBytes,
-    globalPubKey,
-    label: new TextEncoder().encode(label),
-    threshold,
   });
   console.log(`Read requested: tx=${readTx}`);
+
+  const partialEvents = await client.consumer.collectPartials({
+    uuid,
+    minPartials: threshold,
+    fromBlock,
+  });
+  console.log(`Collected ${partialEvents.length} partial decryption events`);
+
+  // Debug: inspect each partial event
+  for (const p of partialEvents) {
+    const encPartialBytes = toBytes(p.encryptedPartial);
+    const ephPubBytes = toBytes(p.ephemeralPubKey);
+    const pubShareBytes = toBytes(p.pubShare);
+    console.log(`\nDebug partial — pid=${p.pid}, validator=${p.validator}`);
+    console.log(`  encryptedPartial: ${encPartialBytes.length} bytes, hex=${p.encryptedPartial.slice(0, 40)}...`);
+    console.log(`  ephemeralPubKey: ${ephPubBytes.length} bytes, first2=${toHex(ephPubBytes.slice(0, 2))}`);
+    console.log(`  pubShare: ${pubShareBytes.length} bytes, hex=${p.pubShare}`);
+  }
+
+  // ECIES decrypt each partial
+  const decryptedPartials: DecryptedPartial[] = await Promise.all(
+    partialEvents.map(async (p) => {
+      const decrypted = await eciesDecrypt({
+        encryptedPartial: toBytes(p.encryptedPartial),
+        ephemeralPubKey: toBytes(p.ephemeralPubKey),
+        recipientPrivKey: privKeyBytes,
+      });
+      return {
+        pid: p.pid,
+        pubShare: toBytes(p.pubShare),
+        partial: decrypted,
+      };
+    }),
+  );
+
+  // Debug: inspect decrypted partials before combine
+  for (const dp of decryptedPartials) {
+    console.log(`\nDebug decrypted — pid=${dp.pid}`);
+    console.log(`  pubShare: ${dp.pubShare.length} bytes, hex=${toHex(dp.pubShare)}`);
+    console.log(`  partial: ${dp.partial.length} bytes, hex=${toHex(dp.partial)}`);
+  }
+
+  console.log(`\nDebug combine inputs:`);
+  console.log(`  globalPubKey: ${globalPubKey.length} bytes, hex=${toHex(globalPubKey)}`);
+  console.log(`  ciphertext: ${encryptedData.length} bytes`);
+  console.log(`  label: ${toHex(label)}`);
+  console.log(`  threshold: ${threshold}`);
+  console.log(`  pids: [${decryptedPartials.map(d => d.pid).join(", ")}]`);
+
+  // Diagnostic: step-by-step combine check using raw WASM
+  try {
+    const diagResult = wasm!.tdh2CombineDiag(
+      threshold,
+      decryptedPartials.map(d => d.pid),
+      decryptedPartials.map(d => d.pubShare),
+      decryptedPartials.map(d => d.partial),
+      globalPubKey,
+      encryptedData,
+      label,
+    );
+    const stepNames: Record<number, string> = {
+      0x01: "ciphertext deserialization",
+      0x02: "pub share deserialization",
+      0x04: "partial deserialization",
+      0x08: "quorum check",
+      0x10: "ciphertext verify",
+      0x20: "check_partial_decryption_helper (NIZK)",
+      0x40: "curve check Xi",
+      0x80: "reconstruct_exponent",
+      0x100: "final AES-GCM decrypt",
+    };
+    console.log(`\nDiag result: step=0x${diagResult.stepCode.toString(16)}, failIdx=${diagResult.failIdx}`);
+    console.log(`  → ${stepNames[diagResult.stepCode] ?? (diagResult.stepCode === 0 ? "ALL PASS" : "unknown")}`);
+  } catch (e: any) {
+    console.log(`\nDiag not available: ${e.message}`);
+  }
+
+  // Now combine
+  const recoveredKey = await tdh2Combine({
+    ciphertext: { raw: encryptedData, label },
+    partials: decryptedPartials,
+    globalPubKey,
+    label,
+    threshold,
+  });
 
   // ===== Step 4: Verify =====
   const original = toHex(dataKey);
