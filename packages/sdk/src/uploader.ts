@@ -1,6 +1,7 @@
 import { parseEventLogs, toHex, type PublicClient, type WalletClient } from "viem";
 import { cdrAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
 import { tdh2Encrypt, type TDH2Ciphertext } from "@piplabs/cdr-crypto";
+import { uuidToLabel } from "./label.js";
 
 export class Uploader {
   private publicClient: PublicClient;
@@ -21,12 +22,12 @@ export class Uploader {
   async encryptDataKey(params: {
     dataKey: Uint8Array;
     globalPubKey: Uint8Array;
-    label: string;
+    label: Uint8Array;
   }): Promise<TDH2Ciphertext> {
     return tdh2Encrypt({
       plaintext: params.dataKey,
       globalPubKey: params.globalPubKey,
-      label: new TextEncoder().encode(params.label),
+      label: params.label,
     });
   }
 
@@ -98,14 +99,15 @@ export class Uploader {
       value: fee,
     });
 
+    await this.publicClient.waitForTransactionReceipt({ hash: txHash });
+
     return { txHash };
   }
 
-  /** Convenience: encrypt data key, allocate vault, and write encrypted data in one call */
+  /** Convenience: allocate vault to get UUID, encrypt data key with UUID-derived label, and write encrypted data in one call */
   async uploadCDR(params: {
     dataKey: Uint8Array;
     globalPubKey: Uint8Array;
-    label: string;
     updatable: boolean;
     writeConditionAddr: `0x${string}`;
     readConditionAddr: `0x${string}`;
@@ -119,12 +121,7 @@ export class Uploader {
     ciphertext: TDH2Ciphertext;
     txHashes: { allocate: `0x${string}`; write: `0x${string}` };
   }> {
-    const ciphertext = await this.encryptDataKey({
-      dataKey: params.dataKey,
-      globalPubKey: params.globalPubKey,
-      label: params.label,
-    });
-
+    // Step 1: Allocate vault first to get the UUID
     const { txHash: allocateTx, uuid } = await this.allocate({
       updatable: params.updatable,
       writeConditionAddr: params.writeConditionAddr,
@@ -134,6 +131,15 @@ export class Uploader {
       feeOverride: params.allocateFeeOverride,
     });
 
+    // Step 2: Encrypt using UUID-derived label (matches validator's uuidToLabel)
+    const label = uuidToLabel(uuid);
+    const ciphertext = await this.encryptDataKey({
+      dataKey: params.dataKey,
+      globalPubKey: params.globalPubKey,
+      label,
+    });
+
+    // Step 3: Write encrypted data to the vault
     const encryptedDataHex = toHex(ciphertext.raw);
     const { txHash: writeTx } = await this.write({
       uuid,

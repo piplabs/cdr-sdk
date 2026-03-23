@@ -190,6 +190,11 @@ export const cdrAbi = [
         "internalType": "bytes"
       },
       {
+        "name": "ciphertext",
+        "type": "bytes",
+        "internalType": "bytes"
+      },
+      {
         "name": "uuid",
         "type": "uint32",
         "internalType": "uint32"
@@ -350,6 +355,12 @@ export const cdrAbi = [
         "internalType": "bytes"
       },
       {
+        "name": "ciphertext",
+        "type": "bytes",
+        "indexed": false,
+        "internalType": "bytes"
+      },
+      {
         "name": "uuid",
         "type": "uint32",
         "indexed": false,
@@ -360,6 +371,12 @@ export const cdrAbi = [
         "type": "bytes",
         "indexed": false,
         "internalType": "bytes"
+      },
+      {
+        "name": "fee",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
       }
     ],
     "anonymous": false

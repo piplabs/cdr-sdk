@@ -27,6 +27,21 @@ export async function tdh2Encrypt(params: {
  * Internally builds a cb-mpc access structure from the partials' PIDs and
  * the threshold value, then calls TDH2Combine.
  */
+/**
+ * Verify a TDH2 ciphertext against a public key and label.
+ * Returns true if valid, false otherwise.
+ */
+export async function tdh2Verify(params: {
+  ciphertext: Uint8Array;
+  globalPubKey: Uint8Array;
+  label: Uint8Array;
+}): Promise<boolean> {
+  const wasm = getWasm();
+  if (!wasm) throw new WasmNotInitializedError();
+
+  return wasm.tdh2Verify(params.globalPubKey, params.ciphertext, params.label);
+}
+
 export async function tdh2Combine(params: {
   ciphertext: TDH2Ciphertext;
   partials: DecryptedPartial[];

@@ -3,6 +3,7 @@ import { cdrAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts"
 import { decryptPartial as eciesDecrypt, tdh2Combine, type TDH2Ciphertext, type DecryptedPartial } from "@piplabs/cdr-crypto";
 import { PartialCollectionTimeoutError } from "./errors.js";
 import type { PartialDecryptionEvent } from "./types.js";
+import { uuidToLabel } from "./label.js";
 
 export class Consumer {
   private publicClient: PublicClient;
@@ -153,7 +154,6 @@ export class Consumer {
     requesterPubKey: `0x${string}`;
     recipientPrivKey: Uint8Array;
     globalPubKey: Uint8Array;
-    label: Uint8Array;
     threshold: number;
     timeoutMs?: number;
     feeOverride?: bigint;
@@ -166,6 +166,8 @@ export class Consumer {
     });
     const vaultResult = vault as { encryptedData: `0x${string}` };
     const encryptedData = toBytes(vaultResult.encryptedData);
+
+    const label = uuidToLabel(params.uuid);
 
     const fromBlock = await this.publicClient.getBlockNumber();
     const { txHash } = await this.read({
@@ -183,11 +185,11 @@ export class Consumer {
     });
 
     const dataKey = await this.decryptDataKey({
-      ciphertext: { raw: encryptedData, label: params.label },
+      ciphertext: { raw: encryptedData, label },
       partials,
       recipientPrivKey: params.recipientPrivKey,
       globalPubKey: params.globalPubKey,
-      label: params.label,
+      label,
       threshold: params.threshold,
     });
 

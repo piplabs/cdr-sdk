@@ -17,7 +17,7 @@ function makePartialDecryptionLog(opts: {
 }) {
   const topic0 = keccak256(
     toBytes(
-      "EncryptedPartialDecryptionSubmitted(address,uint32,uint32,bytes,bytes,bytes,bytes,uint32,bytes)",
+      "EncryptedPartialDecryptionSubmitted(address,uint32,uint32,bytes,bytes,bytes,bytes,bytes,uint32,bytes,uint256)",
     ),
   );
 
@@ -31,8 +31,10 @@ function makePartialDecryptionLog(opts: {
       { name: "ephemeralPubKey", type: "bytes" },
       { name: "pubShare", type: "bytes" },
       { name: "requesterPubKey", type: "bytes" },
+      { name: "ciphertext", type: "bytes" },
       { name: "uuid", type: "uint32" },
       { name: "signature", type: "bytes" },
+      { name: "fee", type: "uint256" },
     ],
     [
       opts.round,
@@ -41,8 +43,10 @@ function makePartialDecryptionLog(opts: {
       "0xcafe0000",
       "0xbabe0000",
       "0xfeed0000",
+      "0xaa",
       opts.uuid,
       "0x5369670000000000",
+      0n,
     ],
   );
 
