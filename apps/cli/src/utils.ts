@@ -1,4 +1,4 @@
-import { createPublicClient, createWalletClient, http } from "viem";
+import { type PublicClient, type WalletClient, createPublicClient, createWalletClient, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { CDRClient, type Network } from "@piplabs/cdr-sdk";
 
@@ -17,13 +17,13 @@ export interface GlobalOptions {
 export function createClient(opts: GlobalOptions): CDRClient {
   const rpcUrl = opts.rpcUrl ?? DEFAULT_RPC_URLS[opts.network];
 
-  const publicClient = createPublicClient({ transport: http(rpcUrl) });
+  const publicClient = createPublicClient({ transport: http(rpcUrl) }) as PublicClient;
 
   let walletClient;
   const pk = opts.privateKey ?? process.env.CDR_PRIVATE_KEY;
   if (pk) {
     const account = privateKeyToAccount(pk as `0x${string}`);
-    walletClient = createWalletClient({ account, transport: http(rpcUrl) });
+    walletClient = createWalletClient({ account, transport: http(rpcUrl) }) as WalletClient;
   }
 
   return new CDRClient({ network: opts.network, publicClient, walletClient });
