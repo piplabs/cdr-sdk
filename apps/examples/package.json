@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@piplabs/cdr-sdk": "workspace:*",
-    "viem": "^2.21"
+    "viem": "^2.47.6"
   },
   "devDependencies": {
     "tsx": "^4"

@@ -14,11 +14,11 @@
   "dependencies": {
     "@piplabs/cdr-sdk": "workspace:*",
     "commander": "^12",
-    "viem": "^2.21"
+    "viem": "^2.47.6"
   },
   "devDependencies": {
     "@types/node": "^20",
-    "typescript": "^5.5",
-    "tsx": "^4"
+    "tsx": "^4",
+    "typescript": "^5.5"
   }
 }

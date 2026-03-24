@@ -19,7 +19,7 @@
   },
   "devDependencies": {
     "typescript": "^5.5",
-    "viem": "^2.21",
+    "viem": "^2.47.6",
     "vitest": "^2"
   }
 }
