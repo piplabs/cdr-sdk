@@ -18,8 +18,8 @@ import { CDRClient, initWasm } from "@piplabs/cdr-sdk";
 await initWasm();
 
 const account = privateKeyToAccount("0xYOUR_PRIVATE_KEY");
-const publicClient = createPublicClient({ transport: http("https://odyssey.storyrpc.io") });
-const walletClient = createWalletClient({ account, transport: http("https://odyssey.storyrpc.io") });
+const publicClient = createPublicClient({ transport: http("https://aeneid.storyrpc.io") });
+const walletClient = createWalletClient({ account, transport: http("https://aeneid.storyrpc.io") });
 
 const client = new CDRClient({ network: "testnet", publicClient, walletClient });
 
@@ -45,7 +45,7 @@ console.log("Vault UUID:", uuid);
 
 | Network  | `network` param | RPC URL                          |
 |----------|-----------------|----------------------------------|
-| Testnet  | `"testnet"`     | `https://odyssey.storyrpc.io`    |
+| Testnet  | `"testnet"`     | `https://aeneid.storyrpc.io`    |
 | Mainnet  | `"mainnet"`     | `https://rpc.story.foundation`   |
 
 Point to any Story-compatible RPC (devnets, local nodes) by changing the `http()` transport URL:

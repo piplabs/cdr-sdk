@@ -4,7 +4,7 @@ import { CDRClient, type Network } from "@piplabs/cdr-sdk";
 
 const DEFAULT_RPC_URLS: Record<Network, string> = {
   mainnet: "https://rpc.story.foundation",
-  testnet: "https://odyssey.storyrpc.io",
+  testnet: "https://aeneid.storyrpc.io",
 };
 
 export interface GlobalOptions {

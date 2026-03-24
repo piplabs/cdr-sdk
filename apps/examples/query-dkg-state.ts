@@ -6,7 +6,7 @@
 import { createPublicClient, http } from "viem";
 import { CDRClient } from "@piplabs/cdr-sdk";
 
-const RPC_URL = process.env.RPC_URL ?? "https://odyssey.storyrpc.io";
+const RPC_URL = process.env.RPC_URL ?? "https://aeneid.storyrpc.io";
 
 async function main() {
   // Create a read-only client (no wallet needed)

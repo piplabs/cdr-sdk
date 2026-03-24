@@ -16,7 +16,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { secp256k1 } from "@noble/curves/secp256k1";
 import { CDRClient, initWasm, uuidToLabel, tdh2Verify, tdh2Combine, decryptPartial as eciesDecrypt, cdrAbi, contractAddresses, getWasm, type DecryptedPartial } from "@piplabs/cdr-sdk";
 
-const RPC_URL = process.env.RPC_URL ?? "https://odyssey.storyrpc.io";
+const RPC_URL = process.env.RPC_URL ?? "https://aeneid.storyrpc.io";
 const PRIVATE_KEY = process.env.CDR_PRIVATE_KEY;
 
 async function main() {

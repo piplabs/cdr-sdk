@@ -13,7 +13,7 @@ import { createPublicClient, createWalletClient, http, toHex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { CDRClient, initWasm } from "@piplabs/cdr-sdk";
 
-const RPC_URL = process.env.RPC_URL ?? "https://odyssey.storyrpc.io";
+const RPC_URL = process.env.RPC_URL ?? "https://aeneid.storyrpc.io";
 const PRIVATE_KEY = process.env.CDR_PRIVATE_KEY;
 
 async function main() {

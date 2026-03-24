@@ -16,7 +16,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { secp256k1 } from "@noble/curves/secp256k1";
 import { CDRClient, initWasm } from "@piplabs/cdr-sdk";
 
-const RPC_URL = process.env.RPC_URL ?? "https://odyssey.storyrpc.io";
+const RPC_URL = process.env.RPC_URL ?? "https://aeneid.storyrpc.io";
 const PRIVATE_KEY = process.env.CDR_PRIVATE_KEY;
 const VAULT_UUID = process.env.VAULT_UUID;
 
