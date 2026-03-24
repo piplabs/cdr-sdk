@@ -50,7 +50,6 @@ async function main() {
   const { uuid, txHashes } = await client.uploader.uploadCDR({
     dataKey,
     globalPubKey,
-    label: `vault-${Date.now()}`,
     updatable: false,
     writeConditionAddr: writeCondition,
     readConditionAddr: readCondition,

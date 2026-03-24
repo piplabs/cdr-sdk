@@ -74,7 +74,7 @@ export class Consumer {
           fromBlock: lastScannedBlock,
           toBlock: currentBlock,
         });
-        lastScannedBlock = currentBlock + 1n;
+        lastScannedBlock = currentBlock + BigInt(1);
 
         const parsed = parseEventLogs({
           abi: cdrAbi,
