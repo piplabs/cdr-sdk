@@ -4,3 +4,4 @@ export * from "./types.js";
 export * from "./errors.js";
 export { initWasm, resetWasm, getWasm, setWasmForTesting, CURVE_ED25519 } from "./wasm/loader.js";
 export type { CbMpcWasm } from "./wasm/loader.js";
+export { verifyPartialSignature } from "./signature.js";

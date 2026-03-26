@@ -52,6 +52,56 @@ function makeFinalizedLog(globalPubKey: `0x${string}`, validator: `0x${string}` 
   };
 }
 
+function makeRegisteredLog(opts: {
+  validatorAddr: `0x${string}`;
+  enclaveCommKey: `0x${string}`;
+  round: number;
+}) {
+  const topic0 = keccak256(
+    toBytes(
+      "Registered(bytes,uint32,address,bytes32,bytes,bytes,bytes32,uint256,bytes32,bytes)",
+    ),
+  );
+  const topic1 = padHex(opts.validatorAddr, { size: 32 });
+
+  const data = encodeAbiParameters(
+    [
+      { name: "enclaveReport", type: "bytes" },
+      { name: "round", type: "uint32" },
+      { name: "enclaveType", type: "bytes32" },
+      { name: "enclaveCommKey", type: "bytes" },
+      { name: "dkgPubKey", type: "bytes" },
+      { name: "codeCommitment", type: "bytes32" },
+      { name: "startBlockHeight", type: "uint256" },
+      { name: "startBlockHash", type: "bytes32" },
+      { name: "validationContext", type: "bytes" },
+    ],
+    [
+      "0x",
+      opts.round,
+      "0x0000000000000000000000000000000000000000000000000000000000000000",
+      opts.enclaveCommKey,
+      "0x",
+      "0x0000000000000000000000000000000000000000000000000000000000000000",
+      0n,
+      "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "0x",
+    ],
+  );
+
+  return {
+    address: "0xcccccc0000000000000000000000000000000004" as `0x${string}`,
+    topics: [topic0, topic1] as [`0x${string}`, `0x${string}`],
+    data,
+    blockHash: "0x0000000000000000000000000000000000000000000000000000000000000000" as `0x${string}`,
+    blockNumber: 50n,
+    transactionHash: "0x0000000000000000000000000000000000000000000000000000000000000002" as `0x${string}`,
+    transactionIndex: 0,
+    logIndex: 0,
+    removed: false,
+  };
+}
+
 describe("Observer", () => {
   it("getVault reads vault from CDR contract", async () => {
     const client = mockPublicClient();
@@ -118,5 +168,57 @@ describe("Observer", () => {
     const pubKey = await observer.getGlobalPubKey();
 
     expect(toHex(pubKey)).toBe(newPubKey);
+  });
+
+  it("getRegisteredValidators returns map of validator address to commPubKey", async () => {
+    const client = mockPublicClient();
+    const commKey = ("0x" + "aa".repeat(64)) as `0x${string}`; // 64 bytes
+    client.getLogs.mockResolvedValueOnce([
+      makeRegisteredLog({
+        validatorAddr: "0x0000000000000000000000000000000000000001",
+        enclaveCommKey: commKey,
+        round: 1,
+      }),
+    ]);
+
+    const observer = new Observer({ network: "testnet", publicClient: client });
+    const validators = await observer.getRegisteredValidators();
+
+    expect(validators.size).toBe(1);
+    const key = validators.get("0x0000000000000000000000000000000000000001");
+    expect(key).toBeDefined();
+    expect(key!.length).toBe(64);
+  });
+
+  it("getRegisteredValidators filters by round when provided", async () => {
+    const client = mockPublicClient();
+    client.getLogs.mockResolvedValueOnce([
+      makeRegisteredLog({
+        validatorAddr: "0x0000000000000000000000000000000000000001",
+        enclaveCommKey: ("0x" + "aa".repeat(64)) as `0x${string}`,
+        round: 1,
+      }),
+      makeRegisteredLog({
+        validatorAddr: "0x0000000000000000000000000000000000000002",
+        enclaveCommKey: ("0x" + "bb".repeat(64)) as `0x${string}`,
+        round: 2,
+      }),
+    ]);
+
+    const observer = new Observer({ network: "testnet", publicClient: client });
+    const validators = await observer.getRegisteredValidators({ round: 2 });
+
+    expect(validators.size).toBe(1);
+    expect(validators.has("0x0000000000000000000000000000000000000002")).toBe(true);
+  });
+
+  it("getRegisteredValidators returns empty map when no Registered events", async () => {
+    const client = mockPublicClient();
+    client.getLogs.mockResolvedValueOnce([]);
+
+    const observer = new Observer({ network: "testnet", publicClient: client });
+    const validators = await observer.getRegisteredValidators();
+
+    expect(validators.size).toBe(0);
   });
 });

@@ -1,6 +1,6 @@
 import { parseEventLogs, toBytes, type PublicClient, type WalletClient } from "viem";
-import { cdrAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
-import { decryptPartial as eciesDecrypt, tdh2Combine, type TDH2Ciphertext, type DecryptedPartial } from "@piplabs/cdr-crypto";
+import { cdrAbi, dkgAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
+import { decryptPartial as eciesDecrypt, tdh2Combine, verifyPartialSignature, type TDH2Ciphertext, type DecryptedPartial } from "@piplabs/cdr-crypto";
 import { PartialCollectionTimeoutError } from "./errors.js";
 import type { PartialDecryptionEvent } from "./types.js";
 import { uuidToLabel } from "./label.js";
@@ -48,9 +48,35 @@ export class Consumer {
     return { txHash };
   }
 
+  /** Fetch validator address → commPubKey map from DKG Registered events */
+  private async getCommPubKeyMap(): Promise<Map<string, Uint8Array>> {
+    const dkgAddress = contractAddresses[this.network].dkg;
+
+    const rawLogs = await this.publicClient.getLogs({
+      address: dkgAddress,
+      fromBlock: BigInt(0),
+      toBlock: "latest",
+    });
+
+    const parsed = parseEventLogs({
+      abi: dkgAbi,
+      logs: rawLogs,
+      eventName: "Registered",
+    });
+
+    const validators = new Map<string, Uint8Array>();
+    for (const log of parsed) {
+      const addr = log.args.validatorAddr.toLowerCase() as `0x${string}`;
+      validators.set(addr, toBytes(log.args.enclaveCommKey));
+    }
+
+    return validators;
+  }
+
   /**
    * Poll for EncryptedPartialDecryptionSubmitted events until minPartials are collected.
    * Filters by uuid to match events for this specific vault read request.
+   * Verifies each partial's TEE signature; invalid partials are skipped.
    */
   async collectPartials(params: {
     uuid: number;
@@ -58,10 +84,15 @@ export class Consumer {
     fromBlock: bigint;
     timeoutMs?: number;
     pollIntervalMs?: number;
+    /** Called when a partial fails signature verification. If not provided, invalid partials are silently skipped. */
+    onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
   }): Promise<PartialDecryptionEvent[]> {
-    const { uuid, minPartials, fromBlock, timeoutMs = 60_000, pollIntervalMs = 3_000 } = params;
+    const { uuid, minPartials, fromBlock, timeoutMs = 60_000, pollIntervalMs = 3_000, onInvalidPartial } = params;
     const cdrAddress = contractAddresses[this.network].cdr;
     const deadline = Date.now() + timeoutMs;
+
+    // Build commPubKey map from DKG Registered events
+    const commPubKeyMap = await this.getCommPubKeyMap();
 
     let lastScannedBlock = fromBlock;
     const collected = new Map<string, PartialDecryptionEvent>();
@@ -86,7 +117,7 @@ export class Consumer {
           if (log.args.uuid === uuid) {
             const key = `${log.args.validator}-${log.args.pid}`;
             if (!collected.has(key)) {
-              collected.set(key, {
+              const event: PartialDecryptionEvent = {
                 validator: log.args.validator,
                 round: log.args.round,
                 pid: log.args.pid,
@@ -96,7 +127,33 @@ export class Consumer {
                 requesterPubKey: log.args.requesterPubKey,
                 uuid: log.args.uuid,
                 signature: log.args.signature,
-              } as PartialDecryptionEvent);
+              };
+
+              // Verify signature
+              const validatorAddr = log.args.validator.toLowerCase();
+              const commPubKey = commPubKeyMap.get(validatorAddr);
+
+              if (!commPubKey) {
+                onInvalidPartial?.(event, new Error(`unknown validator: ${log.args.validator}`));
+                continue;
+              }
+
+              const valid = verifyPartialSignature({
+                round: event.round,
+                ciphertext: toBytes(log.args.ciphertext),
+                encryptedPartial: toBytes(event.encryptedPartial),
+                ephemeralPubKey: toBytes(event.ephemeralPubKey),
+                pubShare: toBytes(event.pubShare),
+                signature: toBytes(event.signature),
+                commPubKey,
+              });
+
+              if (!valid) {
+                onInvalidPartial?.(event, new Error(`invalid signature from validator ${log.args.validator}`));
+                continue;
+              }
+
+              collected.set(key, event);
             }
           }
         }
@@ -157,6 +214,7 @@ export class Consumer {
     threshold: number;
     timeoutMs?: number;
     feeOverride?: bigint;
+    onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
   }): Promise<{ dataKey: Uint8Array; txHash: `0x${string}` }> {
     const vault = await this.publicClient.readContract({
       address: contractAddresses[this.network].cdr,
@@ -182,6 +240,7 @@ export class Consumer {
       minPartials: params.threshold,
       fromBlock,
       timeoutMs: params.timeoutMs,
+      onInvalidPartial: params.onInvalidPartial,
     });
 
     const dataKey = await this.decryptDataKey({
