@@ -128,4 +128,43 @@ export class Observer {
     ]);
     return Math.ceil(participantCount * Number(operationalThreshold) / 1000);
   }
+
+  /**
+   * Get a map of validator address → enclaveCommKey from DKG Registered events.
+   * The commPubKey is the 64-byte uncompressed secp256k1 public key (without 0x04 prefix)
+   * used by the validator's TEE to sign partial decryption responses.
+   *
+   * @param round - If provided, only include validators registered for this round
+   * @returns Map where keys are lowercase checksummed addresses and values are commPubKey bytes
+   */
+  async getRegisteredValidators(params?: {
+    fromBlock?: bigint;
+    round?: number;
+  }): Promise<Map<string, Uint8Array>> {
+    const dkgAddress = contractAddresses[this.network].dkg;
+    const fromBlock = params?.fromBlock ?? BigInt(0);
+
+    const rawLogs = await this.publicClient.getLogs({
+      address: dkgAddress,
+      fromBlock,
+      toBlock: "latest",
+    });
+
+    const parsed = parseEventLogs({
+      abi: dkgAbi,
+      logs: rawLogs,
+      eventName: "Registered",
+    });
+
+    const validators = new Map<string, Uint8Array>();
+    for (const log of parsed) {
+      if (params?.round !== undefined && log.args.round !== params.round) {
+        continue;
+      }
+      const addr = log.args.validatorAddr.toLowerCase() as `0x${string}`;
+      validators.set(addr, toBytes(log.args.enclaveCommKey));
+    }
+
+    return validators;
+  }
 }
