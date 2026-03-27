@@ -1,9 +1,10 @@
-import { parseEventLogs, toBytes, type PublicClient, type WalletClient } from "viem";
+import { parseEventLogs, toBytes, fromHex, type PublicClient, type WalletClient } from "viem";
 import { cdrAbi, dkgAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
-import { decryptPartial as eciesDecrypt, tdh2Combine, verifyPartialSignature, type TDH2Ciphertext, type DecryptedPartial } from "@piplabs/cdr-crypto";
+import { decryptPartial as eciesDecrypt, tdh2Combine, verifyPartialSignature, decryptFile, type TDH2Ciphertext, type DecryptedPartial } from "@piplabs/cdr-crypto";
 import { PartialCollectionTimeoutError } from "./errors.js";
 import type { PartialDecryptionEvent } from "./types.js";
 import { uuidToLabel } from "./label.js";
+import type { StorageProvider } from "./storage/types.js";
 
 export class Consumer {
   private publicClient: PublicClient;
@@ -253,5 +254,49 @@ export class Consumer {
     });
 
     return { dataKey, txHash };
+  }
+
+  /** Convenience: access vault, parse CID + key payload, download from storage, and decrypt file */
+  async downloadFile(params: {
+    uuid: number;
+    accessAuxData: `0x${string}`;
+    requesterPubKey: `0x${string}`;
+    recipientPrivKey: Uint8Array;
+    globalPubKey: Uint8Array;
+    threshold: number;
+    storageProvider: StorageProvider;
+    timeoutMs?: number;
+    feeOverride?: bigint;
+    onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
+  }): Promise<{
+    content: Uint8Array;
+    cid: string;
+    txHash: `0x${string}`;
+  }> {
+    // Step 1: Access vault to get decrypted payload
+    const { dataKey: payloadBytes, txHash } = await this.accessCDR({
+      uuid: params.uuid,
+      accessAuxData: params.accessAuxData,
+      requesterPubKey: params.requesterPubKey,
+      recipientPrivKey: params.recipientPrivKey,
+      globalPubKey: params.globalPubKey,
+      threshold: params.threshold,
+      timeoutMs: params.timeoutMs,
+      feeOverride: params.feeOverride,
+      onInvalidPartial: params.onInvalidPartial,
+    });
+
+    // Step 2: Parse JSON payload
+    const payloadStr = new TextDecoder().decode(payloadBytes);
+    const { cid, key: keyHex } = JSON.parse(payloadStr) as { cid: string; key: `0x${string}` };
+    const key = fromHex(keyHex, "bytes");
+
+    // Step 3: Download encrypted file from storage
+    const encryptedFile = await params.storageProvider.download(cid);
+
+    // Step 4: Decrypt file
+    const content = decryptFile({ ciphertext: encryptedFile, key });
+
+    return { content, cid, txHash };
   }
 }
