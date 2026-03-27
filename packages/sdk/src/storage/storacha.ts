@@ -12,7 +12,9 @@ export class StorachaProvider implements StorageProvider {
   }
 
   async upload(data: Uint8Array): Promise<string> {
-    const blob = new Blob([data as BlobPart]);
+    const buf = new ArrayBuffer(data.byteLength);
+    new Uint8Array(buf).set(data);
+    const blob = new Blob([buf]);
     const cid = await this.client.uploadFile(blob);
     return cid.toString();
   }

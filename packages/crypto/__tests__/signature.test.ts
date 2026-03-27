@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { secp256k1 } from "@noble/curves/secp256k1";
-import { keccak_256 as keccak256 } from "@noble/hashes/sha3";
+import { keccak_256 as keccak256 } from "@noble/hashes/sha3.js";
 import { RLP } from "@ethereumjs/rlp";
 import { verifyPartialSignature } from "../src/signature.js";
 

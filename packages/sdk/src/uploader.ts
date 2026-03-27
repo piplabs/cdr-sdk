@@ -189,20 +189,7 @@ export class Uploader {
     const payload = JSON.stringify({ cid, key: toHex(key) });
     const payloadBytes = new TextEncoder().encode(payload);
 
-    // Step 4: Size check (default on)
-    if (checkSize) {
-      const cdrAddress = contractAddresses[this.network].cdr;
-      const maxSize = await this.publicClient.readContract({
-        address: cdrAddress,
-        abi: cdrAbi,
-        functionName: "maxEncryptedDataSize",
-      });
-      if (BigInt(payloadBytes.length) > maxSize) {
-        throw new ContentSizeExceededError(payloadBytes.length, maxSize);
-      }
-    }
-
-    // Step 5: Allocate vault
+    // Step 4: Allocate vault
     const { txHash: allocateTx, uuid } = await this.allocate({
       updatable: params.updatable,
       writeConditionAddr: params.writeConditionAddr,
@@ -212,7 +199,7 @@ export class Uploader {
       feeOverride: params.allocateFeeOverride,
     });
 
-    // Step 6: TDH2-encrypt the payload with UUID-derived label
+    // Step 5: TDH2-encrypt the payload with UUID-derived label
     const label = uuidToLabel(uuid);
     const ciphertext = await this.encryptDataKey({
       dataKey: payloadBytes,
@@ -220,8 +207,19 @@ export class Uploader {
       label,
     });
 
-    // Step 7: Write to vault
+    // Step 6: Size check on actual TDH2 ciphertext (default on)
     const encryptedDataHex = toHex(ciphertext.raw);
+    if (checkSize) {
+      const cdrAddress = contractAddresses[this.network].cdr;
+      const maxSize = await this.publicClient.readContract({
+        address: cdrAddress,
+        abi: cdrAbi,
+        functionName: "maxEncryptedDataSize",
+      });
+      if (BigInt(ciphertext.raw.length) > maxSize) {
+        throw new ContentSizeExceededError(ciphertext.raw.length, maxSize);
+      }
+    }
     const { txHash: writeTx } = await this.write({
       uuid,
       accessAuxData: params.accessAuxData,

@@ -2,15 +2,12 @@ import type { StorageProvider } from "./types.js";
 
 /** IPFS storage provider using the Helia SDK. */
 export class HeliaProvider implements StorageProvider {
-  private helia: any;
   private fs: any;
 
   /**
-   * @param helia - An initialized Helia node instance
-   * @param unixfs - A @helia/unixfs instance created from the Helia node
+   * @param params.unixfs - A @helia/unixfs instance created from the Helia node
    */
-  constructor(params: { helia: any; unixfs: any }) {
-    this.helia = params.helia;
+  constructor(params: { unixfs: any }) {
     this.fs = params.unixfs;
   }
 
@@ -20,8 +17,7 @@ export class HeliaProvider implements StorageProvider {
   }
 
   async download(cid: string): Promise<Uint8Array> {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { CID } = await import("multiformats/cid" as any);
+    const { CID } = await import("multiformats/cid");
     const parsedCid = CID.parse(cid);
     const chunks: Uint8Array[] = [];
     for await (const chunk of this.fs.cat(parsedCid)) {

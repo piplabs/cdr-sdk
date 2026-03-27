@@ -1,5 +1,5 @@
-import { gcm } from "@noble/ciphers/aes";
-import { randomBytes } from "@noble/hashes/utils";
+import { gcm } from "@noble/ciphers/aes.js";
+import { randomBytes } from "@noble/hashes/utils.js";
 
 const AES_KEY_LENGTH = 32;
 const IV_LENGTH = 12;

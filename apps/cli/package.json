@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@piplabs/cdr-sdk": "workspace:*",
-    "commander": "^12",
+    "commander": "^14",
     "viem": "^2.47.6"
   },
   "devDependencies": {

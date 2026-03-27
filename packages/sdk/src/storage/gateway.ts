@@ -16,7 +16,9 @@ export class GatewayProvider implements StorageProvider {
 
   async upload(data: Uint8Array): Promise<string> {
     const formData = new FormData();
-    formData.append("file", new Blob([data as BlobPart]));
+    const buf = new ArrayBuffer(data.byteLength);
+    new Uint8Array(buf).set(data);
+    formData.append("file", new Blob([buf]));
 
     const response = await fetch(`${this.apiUrl}/api/v0/add`, {
       method: "POST",
