@@ -29,3 +29,16 @@ export class ContractRevertError extends CDRError {
     this.reason = reason;
   }
 }
+
+export class ContentSizeExceededError extends CDRError {
+  actual: number;
+  max: bigint;
+  constructor(actual: number, max: bigint) {
+    super(
+      `Vault payload size ${actual} bytes exceeds max ${max} bytes`,
+      "CONTENT_SIZE_EXCEEDED",
+    );
+    this.actual = actual;
+    this.max = max;
+  }
+}
