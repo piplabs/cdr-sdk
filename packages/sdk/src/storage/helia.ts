@@ -1,18 +1,25 @@
-import type { StorageProvider } from "./types.js";
+import type { StorageProvider, UploadOptions } from "./types.js";
 
 /** IPFS storage provider using the Helia SDK. */
 export class HeliaProvider implements StorageProvider {
+  private helia: any;
   private fs: any;
 
   /**
+   * @param params.helia - An initialized Helia node instance (used for pinning)
    * @param params.unixfs - A @helia/unixfs instance created from the Helia node
    */
-  constructor(params: { unixfs: any }) {
+  constructor(params: { helia: any; unixfs: any }) {
+    this.helia = params.helia;
     this.fs = params.unixfs;
   }
 
-  async upload(data: Uint8Array): Promise<string> {
+  async upload(data: Uint8Array, options?: UploadOptions): Promise<string> {
+    const { pin = true } = options ?? {};
     const cid = await this.fs.addBytes(data);
+    if (pin) {
+      await this.helia.pins.add(cid);
+    }
     return cid.toString();
   }
 

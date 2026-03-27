@@ -117,7 +117,7 @@ describe("Uploader.uploadFile", () => {
     expect(encryptFile).toHaveBeenCalledWith(content);
 
     // storage provider received the encrypted file bytes
-    expect(storageProvider.upload).toHaveBeenCalledWith(fakeCiphertext);
+    expect(storageProvider.upload).toHaveBeenCalledWith(fakeCiphertext, { pin: true });
 
     // tdh2Encrypt received JSON payload containing CID and key
     const tdh2Call = vi.mocked(tdh2Encrypt).mock.calls[0][0];

@@ -1,4 +1,4 @@
-import type { StorageProvider } from "./types.js";
+import type { StorageProvider, UploadOptions } from "./types.js";
 
 /** Generic IPFS HTTP API + gateway provider. */
 export class GatewayProvider implements StorageProvider {
@@ -14,7 +14,8 @@ export class GatewayProvider implements StorageProvider {
     this.gatewayUrl = params.gatewayUrl.replace(/\/+$/, "");
   }
 
-  async upload(data: Uint8Array): Promise<string> {
+  async upload(data: Uint8Array, options?: UploadOptions): Promise<string> {
+    const { pin = true } = options ?? {};
     const formData = new FormData();
     const buf = new ArrayBuffer(data.byteLength);
     new Uint8Array(buf).set(data);
@@ -30,7 +31,18 @@ export class GatewayProvider implements StorageProvider {
     }
 
     const result = await response.json();
-    return result.Hash;
+    const cid = result.Hash;
+
+    if (pin) {
+      const pinResponse = await fetch(`${this.apiUrl}/api/v0/pin/add?arg=${cid}`, {
+        method: "POST",
+      });
+      if (!pinResponse.ok) {
+        throw new Error(`IPFS pin failed: ${pinResponse.status} ${pinResponse.statusText}`);
+      }
+    }
+
+    return cid;
   }
 
   async download(cid: string): Promise<Uint8Array> {

@@ -169,6 +169,7 @@ export class Uploader {
     readConditionData: `0x${string}`;
     accessAuxData: `0x${string}`;
     checkSize?: boolean;
+    pin?: boolean;
     allocateFeeOverride?: bigint;
     writeFeeOverride?: bigint;
   }): Promise<{
@@ -177,13 +178,13 @@ export class Uploader {
     ciphertext: TDH2Ciphertext;
     txHashes: { allocate: `0x${string}`; write: `0x${string}` };
   }> {
-    const { content, storageProvider, checkSize = true } = params;
+    const { content, storageProvider, checkSize = true, pin = true } = params;
 
     // Step 1: Encrypt file with ephemeral AES key
     const { ciphertext: encryptedFile, key } = encryptFile(content);
 
     // Step 2: Upload encrypted file to storage
-    const cid = await storageProvider.upload(encryptedFile);
+    const cid = await storageProvider.upload(encryptedFile, { pin });
 
     // Step 3: Build vault payload JSON
     const payload = JSON.stringify({ cid, key: toHex(key) });
