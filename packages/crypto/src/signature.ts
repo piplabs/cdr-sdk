@@ -1,7 +1,7 @@
 import { RLP } from "@ethereumjs/rlp";
 import { secp256k1 } from "@noble/curves/secp256k1";
-import { keccak_256 as keccak256Noble } from "@noble/hashes/sha3";
-import { bytesToHex } from "@noble/hashes/utils";
+import { keccak_256 as keccak256Noble } from "@noble/hashes/sha3.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 
 /**
  * Verify a partial decryption signature produced by the story-kernel TEE.

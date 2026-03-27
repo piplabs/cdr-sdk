@@ -309,6 +309,19 @@ export const cdrAbi = [
     "stateMutability": "view"
   },
   {
+    "type": "function",
+    "name": "maxEncryptedDataSize",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
     "type": "event",
     "name": "EncryptedPartialDecryptionSubmitted",
     "inputs": [

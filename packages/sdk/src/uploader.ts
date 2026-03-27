@@ -1,7 +1,9 @@
 import { parseEventLogs, toHex, type PublicClient, type WalletClient } from "viem";
 import { cdrAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
-import { tdh2Encrypt, type TDH2Ciphertext } from "@piplabs/cdr-crypto";
+import { tdh2Encrypt, encryptFile, type TDH2Ciphertext } from "@piplabs/cdr-crypto";
 import { uuidToLabel } from "./label.js";
+import { ContentSizeExceededError } from "./errors.js";
+import type { StorageProvider } from "./storage/types.js";
 
 export class Uploader {
   private publicClient: PublicClient;
@@ -150,6 +152,85 @@ export class Uploader {
 
     return {
       uuid,
+      ciphertext,
+      txHashes: { allocate: allocateTx, write: writeTx },
+    };
+  }
+
+  /** Encrypt a file, upload to storage, and write CID + key reference to a new vault */
+  async uploadFile(params: {
+    content: Uint8Array;
+    storageProvider: StorageProvider;
+    globalPubKey: Uint8Array;
+    updatable: boolean;
+    writeConditionAddr: `0x${string}`;
+    readConditionAddr: `0x${string}`;
+    writeConditionData: `0x${string}`;
+    readConditionData: `0x${string}`;
+    accessAuxData: `0x${string}`;
+    checkSize?: boolean;
+    pin?: boolean;
+    allocateFeeOverride?: bigint;
+    writeFeeOverride?: bigint;
+  }): Promise<{
+    uuid: number;
+    cid: string;
+    ciphertext: TDH2Ciphertext;
+    txHashes: { allocate: `0x${string}`; write: `0x${string}` };
+  }> {
+    const { content, storageProvider, checkSize = true, pin = true } = params;
+
+    // Step 1: Encrypt file with ephemeral AES key
+    const { ciphertext: encryptedFile, key } = encryptFile(content);
+
+    // Step 2: Upload encrypted file to storage
+    const cid = await storageProvider.upload(encryptedFile, { pin });
+
+    // Step 3: Build vault payload JSON
+    const payload = JSON.stringify({ cid, key: toHex(key) });
+    const payloadBytes = new TextEncoder().encode(payload);
+
+    // Step 4: Allocate vault
+    const { txHash: allocateTx, uuid } = await this.allocate({
+      updatable: params.updatable,
+      writeConditionAddr: params.writeConditionAddr,
+      readConditionAddr: params.readConditionAddr,
+      writeConditionData: params.writeConditionData,
+      readConditionData: params.readConditionData,
+      feeOverride: params.allocateFeeOverride,
+    });
+
+    // Step 5: TDH2-encrypt the payload with UUID-derived label
+    const label = uuidToLabel(uuid);
+    const ciphertext = await this.encryptDataKey({
+      dataKey: payloadBytes,
+      globalPubKey: params.globalPubKey,
+      label,
+    });
+
+    // Step 6: Size check on actual TDH2 ciphertext (default on)
+    const encryptedDataHex = toHex(ciphertext.raw);
+    if (checkSize) {
+      const cdrAddress = contractAddresses[this.network].cdr;
+      const maxSize = await this.publicClient.readContract({
+        address: cdrAddress,
+        abi: cdrAbi,
+        functionName: "maxEncryptedDataSize",
+      });
+      if (BigInt(ciphertext.raw.length) > maxSize) {
+        throw new ContentSizeExceededError(ciphertext.raw.length, maxSize);
+      }
+    }
+    const { txHash: writeTx } = await this.write({
+      uuid,
+      accessAuxData: params.accessAuxData,
+      encryptedData: encryptedDataHex,
+      feeOverride: params.writeFeeOverride,
+    });
+
+    return {
+      uuid,
+      cid,
       ciphertext,
       txHashes: { allocate: allocateTx, write: writeTx },
     };

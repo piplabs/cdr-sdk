@@ -167,4 +167,13 @@ export class Observer {
 
     return validators;
   }
+
+  /** Get the maximum allowed encrypted data size for vault writes */
+  async getMaxEncryptedDataSize(): Promise<bigint> {
+    return this.publicClient.readContract({
+      address: contractAddresses[this.network].cdr,
+      abi: cdrAbi,
+      functionName: "maxEncryptedDataSize",
+    });
+  }
 }

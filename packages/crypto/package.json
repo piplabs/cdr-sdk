@@ -12,9 +12,9 @@
   },
   "dependencies": {
     "@ethereumjs/rlp": "^10.1.1",
-    "@noble/ciphers": "^1.0",
+    "@noble/ciphers": "^2.1.1",
     "@noble/curves": "^1.6",
-    "@noble/hashes": "^1.5"
+    "@noble/hashes": "^2.0.1"
   },
   "devDependencies": {
     "typescript": "^5.5",

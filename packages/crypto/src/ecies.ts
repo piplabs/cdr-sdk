@@ -1,8 +1,8 @@
 import { secp256k1 } from "@noble/curves/secp256k1";
-import { hkdf } from "@noble/hashes/hkdf";
-import { sha256 } from "@noble/hashes/sha256";
-import { gcm } from "@noble/ciphers/aes";
-import { randomBytes } from "@noble/hashes/utils";
+import { hkdf } from "@noble/hashes/hkdf.js";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { gcm } from "@noble/ciphers/aes.js";
+import { randomBytes } from "@noble/hashes/utils.js";
 
 const HKDF_INFO = new TextEncoder().encode("dkg-tdh2-partial");
 const AES_KEY_LENGTH = 32;
