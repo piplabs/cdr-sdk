@@ -8,8 +8,8 @@ export interface TDH2Ciphertext {
 
 /** Decrypted partial from a single validator, ready for tdh2Combine */
 export interface DecryptedPartial {
-  /** 1-based validator index from DKG registration order */
-  pid: number;
+  /** Validator name (used as key in the access structure) */
+  name: string;
   /** Ed25519 public share with curve code prefix (0x043f + 32 bytes = 34 bytes) */
   pubShare: Uint8Array;
   /** Raw decrypted partial decryption bytes */

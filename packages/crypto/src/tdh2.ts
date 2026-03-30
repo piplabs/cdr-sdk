@@ -22,12 +22,6 @@ export async function tdh2Encrypt(params: {
 }
 
 /**
- * Combine threshold partial decryptions to recover the plaintext.
- *
- * Internally builds a cb-mpc access structure from the partials' PIDs and
- * the threshold value, then calls TDH2Combine.
- */
-/**
  * Verify a TDH2 ciphertext against a public key and label.
  * Returns true if valid, false otherwise.
  */
@@ -62,9 +56,9 @@ export async function tdh2Combine(params: {
     throw new InvalidCiphertextError("empty ciphertext");
   }
 
-  const pids = partials.map((p) => p.pid);
+  const names = partials.map((p) => p.name);
   const pubShares = partials.map((p) => p.pubShare);
   const partialBytes = partials.map((p) => p.partial);
 
-  return wasm.tdh2Combine(threshold, pids, pubShares, partialBytes, globalPubKey, ciphertext.raw, label);
+  return wasm.tdh2Combine(names, pubShares, partialBytes, globalPubKey, ciphertext.raw, label, threshold);
 }
