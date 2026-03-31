@@ -95,25 +95,6 @@ async function main() {
   const testOk = wasm.tdh2Verify(globalPubKey, testCt, testLabel);
   console.log("Debug — self-test encrypt→verify:", testOk ? "PASS" : "FAIL", "ct_len:", testCt.length);
 
-  // Arithmetic test: 0=pass
-  const arith = wasm.tdh2ArithTest(globalPubKey);
-  console.log("Debug — arith test:", arith === 0 ? "ALL PASS" : `FAIL code=${arith}`);
-  if (arith & 1) console.log("  (a+b)*G != a*G + b*G — linearity broken");
-  if (arith & 2) console.log("  f*G - e*R1 != s*G — NIZK math broken");
-  if (arith & 4) console.log("  f*G != s*G + e*R1 — MODULO arithmetic broken");
-
-  // Diagnostic bitmask: 0=all pass
-  const diag = wasm.tdh2Diag(globalPubKey, testPlain, testLabel);
-  console.log("Debug — diag code:", diag);
-  if (diag === 0) console.log("Debug — diag: ALL CHECKS PASS");
-  if (diag & 2)   console.log("Debug — diag: LABEL MISMATCH");
-  if (diag & 4)   console.log("Debug — diag: R1 NOT ON CURVE");
-  if (diag & 8)   console.log("Debug — diag: R2 NOT ON CURVE");
-  if (diag & 16)  console.log("Debug — diag: GAMMA MISMATCH");
-  if (diag & 32)  console.log("Debug — diag: NIZK PROOF FAILED");
-  if (diag & 64)  console.log("Debug — diag: GAMMA RECOMPUTATION DIFFERS");
-  if (diag & 128) console.log("Debug — diag: PUB KEY Q INVALID");
-
   // ===== Step 3: Access =====
   const privKeyBytes = Buffer.from(PRIVATE_KEY.slice(2), "hex");
   const requesterPubKey = toHex(secp256k1.getPublicKey(privKeyBytes, false));
@@ -164,7 +145,7 @@ async function main() {
         recipientPrivKey: privKeyBytes,
       });
       return {
-        pid: p.pid,
+        name: String(p.pid),
         pubShare: toBytes(p.pubShare),
         partial: decrypted,
       };
@@ -173,7 +154,7 @@ async function main() {
 
   // Debug: inspect decrypted partials before combine
   for (const dp of decryptedPartials) {
-    console.log(`\nDebug decrypted — pid=${dp.pid}`);
+    console.log(`\nDebug decrypted — name=${dp.name}`);
     console.log(`  pubShare: ${dp.pubShare.length} bytes, hex=${toHex(dp.pubShare)}`);
     console.log(`  partial: ${dp.partial.length} bytes, hex=${toHex(dp.partial)}`);
   }
@@ -183,35 +164,7 @@ async function main() {
   console.log(`  ciphertext: ${encryptedData.length} bytes`);
   console.log(`  label: ${toHex(label)}`);
   console.log(`  threshold: ${threshold}`);
-  console.log(`  pids: [${decryptedPartials.map(d => d.pid).join(", ")}]`);
-
-  // Diagnostic: step-by-step combine check using raw WASM
-  try {
-    const diagResult = wasm!.tdh2CombineDiag(
-      threshold,
-      decryptedPartials.map(d => d.pid),
-      decryptedPartials.map(d => d.pubShare),
-      decryptedPartials.map(d => d.partial),
-      globalPubKey,
-      encryptedData,
-      label,
-    );
-    const stepNames: Record<number, string> = {
-      0x01: "ciphertext deserialization",
-      0x02: "pub share deserialization",
-      0x04: "partial deserialization",
-      0x08: "quorum check",
-      0x10: "ciphertext verify",
-      0x20: "check_partial_decryption_helper (NIZK)",
-      0x40: "curve check Xi",
-      0x80: "reconstruct_exponent",
-      0x100: "final AES-GCM decrypt",
-    };
-    console.log(`\nDiag result: step=0x${diagResult.stepCode.toString(16)}, failIdx=${diagResult.failIdx}`);
-    console.log(`  → ${stepNames[diagResult.stepCode] ?? (diagResult.stepCode === 0 ? "ALL PASS" : "unknown")}`);
-  } catch (e: any) {
-    console.log(`\nDiag not available: ${e.message}`);
-  }
+  console.log(`  names: [${decryptedPartials.map(d => d.name).join(", ")}]`);
 
   // Now combine
   const recoveredKey = await tdh2Combine({
