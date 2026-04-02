@@ -14,10 +14,12 @@ export class CDRClient {
     network: Network;
     publicClient: PublicClient;
     walletClient?: WalletClient;
+    /** Minimum threshold ratio override (0-1). The effective threshold is max(contract threshold, ceil(participants * minThresholdRatio)). */
+    minThresholdRatio?: number;
   }) {
     const { network, publicClient, walletClient } = params;
 
-    this.observer = new Observer({ network, publicClient });
+    this.observer = new Observer({ network, publicClient, minThresholdRatio: params.minThresholdRatio });
 
     if (walletClient) {
       this._uploader = new Uploader({ network, publicClient, walletClient });

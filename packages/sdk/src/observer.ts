@@ -6,10 +6,12 @@ import type { Vault } from "./types.js";
 export class Observer {
   private publicClient: PublicClient;
   private network: Network;
+  private minThresholdRatio?: number;
 
-  constructor(params: { network: Network; publicClient: PublicClient }) {
+  constructor(params: { network: Network; publicClient: PublicClient; minThresholdRatio?: number }) {
     this.publicClient = params.publicClient;
     this.network = params.network;
+    this.minThresholdRatio = params.minThresholdRatio;
   }
 
   /**
@@ -158,7 +160,8 @@ export class Observer {
 
   /**
    * Get the absolute threshold (minimum number of partial decryptions needed).
-   * Computes: ceil(participantCount * operationalThreshold / 1000)
+   * Computes: ceil(participantCount * operationalThreshold / 1000).
+   * If `minThresholdRatio` was set, returns max(contractThreshold, ceil(participants * minThresholdRatio)).
    * @example
    * ```ts
    * const threshold = await observer.getThreshold();
@@ -169,7 +172,14 @@ export class Observer {
       this.getOperationalThreshold(),
       this.getParticipantCount(params),
     ]);
-    return Math.ceil(participantCount * Number(operationalThreshold) / 1000);
+    const contractThreshold = Math.ceil(participantCount * Number(operationalThreshold) / 1000);
+
+    if (this.minThresholdRatio !== undefined) {
+      const overrideThreshold = Math.ceil(participantCount * this.minThresholdRatio);
+      return Math.max(contractThreshold, overrideThreshold);
+    }
+
+    return contractThreshold;
   }
 
   /**
