@@ -31,6 +31,7 @@ interface EmscriptenModule {
   ): number;
   _wasm_ac_new_node(nodeType: number, namePtr: number, nameSize: number, threshold: number): number;
   _wasm_ac_add_child(parent: number, child: number): void;
+  _wasm_ac_set_node_pid(handle: number, pid: number): void;
   _wasm_ac_new(root: number, curveCode: number): number;
   _wasm_ac_free(handle: number): void;
   _wasm_tdh2_combine(
@@ -178,6 +179,14 @@ export class CbMpcWasm {
       const namePtr = this.allocBytes(namesBufs[i]);
       const leafHandle = M._wasm_ac_new_node(NODE_LEAF, namePtr, namesBufs[i].length, 0);
       M._free(namePtr);
+      // Set explicit PID on each leaf node — the name is the string
+      // representation of the validator's integer PID (e.g. "1", "2", "3").
+      // Without this, the C++ layer hashes the name to derive a PID, which
+      // won't match the integer PIDs used during DKG secret sharing.
+      const pid = parseInt(names[i], 10);
+      if (!isNaN(pid)) {
+        M._wasm_ac_set_node_pid(leafHandle, pid);
+      }
       M._wasm_ac_add_child(rootHandle, leafHandle);
     }
 
