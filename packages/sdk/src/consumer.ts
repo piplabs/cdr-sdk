@@ -6,6 +6,7 @@ import type { PartialDecryptionEvent } from "./types.js";
 import { uuidToLabel } from "./label.js";
 import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
+import type { AttestationConfig } from "./attestation.js";
 
 export class Consumer {
   private publicClient: PublicClient;
@@ -117,6 +118,8 @@ export class Consumer {
     pollIntervalMs?: number;
     /** Called when a partial fails signature verification. If not provided, invalid partials are silently skipped. */
     onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
+    /** If provided, verify each validator's attestation report. Invalid attestations trigger onInvalidPartial. */
+    attestationConfig?: AttestationConfig;
   }): Promise<PartialDecryptionEvent[]> {
     const { uuid, minPartials, fromBlock, timeoutMs = 60_000, pollIntervalMs = 3_000, onInvalidPartial } = params;
     const cdrAddress = contractAddresses[this.network].cdr;
