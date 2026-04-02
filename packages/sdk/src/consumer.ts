@@ -223,6 +223,11 @@ export class Consumer {
     feeOverride?: bigint;
     onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
   }): Promise<{ dataKey: Uint8Array; txHash: `0x${string}` }> {
+    // Validate key pair: both must be provided or both omitted
+    if (params.requesterPubKey && !params.recipientPrivKey || !params.requesterPubKey && params.recipientPrivKey) {
+      throw new Error("requesterPubKey and recipientPrivKey must both be provided or both omitted");
+    }
+
     // Auto-generate ephemeral keypair if not provided
     let recipientPrivKey = params.recipientPrivKey;
     let requesterPubKey = params.requesterPubKey;
