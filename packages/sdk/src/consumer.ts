@@ -1,7 +1,7 @@
 import { parseEventLogs, toBytes, toHex, fromHex, type PublicClient, type WalletClient } from "viem";
 import { cdrAbi, dkgAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
 import { decryptPartial as eciesDecrypt, tdh2Combine, verifyPartialSignature, decryptFile, generateEphemeralKeyPair, type TDH2Ciphertext, type DecryptedPartial } from "@piplabs/cdr-crypto";
-import { PartialCollectionTimeoutError, InvalidParamsError, ObserverRequiredError } from "./errors.js";
+import { PartialCollectionTimeoutError, InvalidParamsError, ObserverRequiredError, CidIntegrityError } from "./errors.js";
 import type { PartialDecryptionEvent } from "./types.js";
 import { uuidToLabel } from "./label.js";
 import type { StorageProvider } from "./storage/types.js";
@@ -369,6 +369,8 @@ export class Consumer {
     timeoutMs?: number;
     feeOverride?: bigint;
     onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
+    /** Skip CID integrity verification of downloaded file (default: false). */
+    skipCidVerification?: boolean;
   }): Promise<{
     content: Uint8Array;
     cid: string;
@@ -395,7 +397,28 @@ export class Consumer {
     // Step 3: Download encrypted file from storage
     const encryptedFile = await params.storageProvider.download(cid);
 
-    // Step 4: Decrypt file
+    // Step 4: Verify CID integrity (if multiformats is available)
+    if (!params.skipCidVerification) {
+      try {
+        const cidMod: any = await import("multiformats/cid");
+        const hashMod: any = await import("multiformats/hashes/sha2");
+        const CID = cidMod.CID;
+        const sha256 = hashMod.sha256;
+
+        const expectedCid = CID.parse(cid);
+        const hash = await sha256.digest(encryptedFile);
+        const actualCid = CID.create(expectedCid.version, expectedCid.code, hash);
+
+        if (!expectedCid.equals(actualCid)) {
+          throw new CidIntegrityError(cid, String(actualCid));
+        }
+      } catch (e) {
+        if (e instanceof CidIntegrityError) throw e;
+        // multiformats not installed — skip verification silently
+      }
+    }
+
+    // Step 5: Decrypt file
     const content = decryptFile({ ciphertext: encryptedFile, key });
 
     return { content, cid, txHash };

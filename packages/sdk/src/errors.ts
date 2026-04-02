@@ -42,6 +42,15 @@ export class ObserverRequiredError extends CDRError {
   }
 }
 
+export class CidIntegrityError extends CDRError {
+  constructor(expected: string, actual: string) {
+    super(
+      `CID integrity check failed: expected ${expected}, got ${actual}`,
+      "CID_INTEGRITY",
+    );
+  }
+}
+
 export class RpcConsensusError extends CDRError {
   constructor(field: string) {
     super(
