@@ -21,7 +21,7 @@ export class CDRClient {
 
     if (walletClient) {
       this._uploader = new Uploader({ network, publicClient, walletClient });
-      this._consumer = new Consumer({ network, publicClient, walletClient });
+      this._consumer = new Consumer({ network, publicClient, walletClient, observer: this.observer });
     } else {
       this._uploader = null;
       this._consumer = null;

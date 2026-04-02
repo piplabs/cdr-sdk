@@ -1,24 +1,28 @@
-import { parseEventLogs, toBytes, fromHex, type PublicClient, type WalletClient } from "viem";
+import { parseEventLogs, toBytes, toHex, fromHex, type PublicClient, type WalletClient } from "viem";
 import { cdrAbi, dkgAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
-import { decryptPartial as eciesDecrypt, tdh2Combine, verifyPartialSignature, decryptFile, type TDH2Ciphertext, type DecryptedPartial } from "@piplabs/cdr-crypto";
+import { decryptPartial as eciesDecrypt, tdh2Combine, verifyPartialSignature, decryptFile, generateEphemeralKeyPair, type TDH2Ciphertext, type DecryptedPartial } from "@piplabs/cdr-crypto";
 import { PartialCollectionTimeoutError } from "./errors.js";
 import type { PartialDecryptionEvent } from "./types.js";
 import { uuidToLabel } from "./label.js";
 import type { StorageProvider } from "./storage/types.js";
+import { Observer } from "./observer.js";
 
 export class Consumer {
   private publicClient: PublicClient;
   private walletClient: WalletClient;
   private network: Network;
+  private observer: Observer | null;
 
   constructor(params: {
     network: Network;
     publicClient: PublicClient;
     walletClient: WalletClient;
+    observer?: Observer;
   }) {
     this.publicClient = params.publicClient;
     this.walletClient = params.walletClient;
     this.network = params.network;
+    this.observer = params.observer ?? null;
   }
 
   /** Request a vault read. Auto-queries read fee. Emits VaultRead event for validators. */
@@ -205,65 +209,98 @@ export class Consumer {
     });
   }
 
-  /** Convenience: read + collect + decrypt in one call */
+  /** Convenience: read + collect + decrypt in one call.
+   *  If requesterPubKey/recipientPrivKey are omitted, an ephemeral secp256k1 keypair is generated and the private key is zeroed after use.
+   *  If globalPubKey/threshold are omitted, they are auto-queried via the Observer (requires observer to be set). */
   async accessCDR(params: {
     uuid: number;
     accessAuxData: `0x${string}`;
-    requesterPubKey: `0x${string}`;
-    recipientPrivKey: Uint8Array;
-    globalPubKey: Uint8Array;
-    threshold: number;
+    requesterPubKey?: `0x${string}`;
+    recipientPrivKey?: Uint8Array;
+    globalPubKey?: Uint8Array;
+    threshold?: number;
     timeoutMs?: number;
     feeOverride?: bigint;
     onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
   }): Promise<{ dataKey: Uint8Array; txHash: `0x${string}` }> {
-    const vault = await this.publicClient.readContract({
-      address: contractAddresses[this.network].cdr,
-      abi: cdrAbi,
-      functionName: "vaults",
-      args: [params.uuid],
-    });
-    const vaultResult = vault as { encryptedData: `0x${string}` };
-    const encryptedData = toBytes(vaultResult.encryptedData);
+    // Auto-generate ephemeral keypair if not provided
+    let recipientPrivKey = params.recipientPrivKey;
+    let requesterPubKey = params.requesterPubKey;
+    let ephemeralGenerated = false;
+    if (!recipientPrivKey || !requesterPubKey) {
+      const kp = generateEphemeralKeyPair();
+      recipientPrivKey = kp.privateKey;
+      requesterPubKey = toHex(kp.publicKey);
+      ephemeralGenerated = true;
+    }
 
-    const label = uuidToLabel(params.uuid);
+    // Auto-query globalPubKey and threshold from Observer if not provided
+    let globalPubKey = params.globalPubKey;
+    let threshold = params.threshold;
+    if (!globalPubKey || threshold === undefined) {
+      if (!this.observer) {
+        throw new Error("globalPubKey and threshold are required when no Observer is configured");
+      }
+      [globalPubKey, threshold] = await Promise.all([
+        globalPubKey ? Promise.resolve(globalPubKey) : this.observer.getGlobalPubKey(),
+        threshold !== undefined ? Promise.resolve(threshold) : this.observer.getThreshold(),
+      ]);
+    }
 
-    const fromBlock = await this.publicClient.getBlockNumber();
-    const { txHash } = await this.read({
-      uuid: params.uuid,
-      accessAuxData: params.accessAuxData,
-      requesterPubKey: params.requesterPubKey,
-      feeOverride: params.feeOverride,
-    });
+    try {
+      const vault = await this.publicClient.readContract({
+        address: contractAddresses[this.network].cdr,
+        abi: cdrAbi,
+        functionName: "vaults",
+        args: [params.uuid],
+      });
+      const vaultResult = vault as { encryptedData: `0x${string}` };
+      const encryptedData = toBytes(vaultResult.encryptedData);
 
-    const partials = await this.collectPartials({
-      uuid: params.uuid,
-      minPartials: params.threshold,
-      fromBlock,
-      timeoutMs: params.timeoutMs,
-      onInvalidPartial: params.onInvalidPartial,
-    });
+      const label = uuidToLabel(params.uuid);
 
-    const dataKey = await this.decryptDataKey({
-      ciphertext: { raw: encryptedData, label },
-      partials,
-      recipientPrivKey: params.recipientPrivKey,
-      globalPubKey: params.globalPubKey,
-      label,
-      threshold: params.threshold,
-    });
+      const fromBlock = await this.publicClient.getBlockNumber();
+      const { txHash } = await this.read({
+        uuid: params.uuid,
+        accessAuxData: params.accessAuxData,
+        requesterPubKey,
+        feeOverride: params.feeOverride,
+      });
 
-    return { dataKey, txHash };
+      const partials = await this.collectPartials({
+        uuid: params.uuid,
+        minPartials: threshold,
+        fromBlock,
+        timeoutMs: params.timeoutMs,
+        onInvalidPartial: params.onInvalidPartial,
+      });
+
+      const dataKey = await this.decryptDataKey({
+        ciphertext: { raw: encryptedData, label },
+        partials,
+        recipientPrivKey,
+        globalPubKey,
+        label,
+        threshold,
+      });
+
+      return { dataKey, txHash };
+    } finally {
+      if (ephemeralGenerated && recipientPrivKey) {
+        recipientPrivKey.fill(0);
+      }
+    }
   }
 
-  /** Convenience: access vault, parse CID + key payload, download from storage, and decrypt file */
+  /** Convenience: access vault, parse CID + key payload, download from storage, and decrypt file.
+   *  Key/threshold params are optional — see accessCDR() for auto-generation behavior. */
   async downloadFile(params: {
     uuid: number;
     accessAuxData: `0x${string}`;
-    requesterPubKey: `0x${string}`;
-    recipientPrivKey: Uint8Array;
-    globalPubKey: Uint8Array;
-    threshold: number;
+    requesterPubKey?: `0x${string}`;
+    recipientPrivKey?: Uint8Array;
+    globalPubKey?: Uint8Array;
+    threshold?: number;
     storageProvider: StorageProvider;
     timeoutMs?: number;
     feeOverride?: bigint;

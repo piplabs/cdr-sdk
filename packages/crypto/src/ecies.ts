@@ -40,6 +40,19 @@ export async function decryptPartial(params: {
 }
 
 /**
+ * Generate an ephemeral secp256k1 keypair for CDR vault read requests.
+ * The caller is responsible for zeroing `privateKey` after use.
+ */
+export function generateEphemeralKeyPair(): {
+  privateKey: Uint8Array;
+  publicKey: Uint8Array;
+} {
+  const privateKey = secp256k1.utils.randomPrivateKey();
+  const publicKey = secp256k1.getPublicKey(privateKey, false); // uncompressed 65 bytes
+  return { privateKey, publicKey };
+}
+
+/**
  * Encrypt data to a recipient's public key (test helper, mirrors validator behavior).
  * This function is NOT part of the public API — only used in tests.
  * The barrel export (index.ts) should NOT re-export this function.
