@@ -62,16 +62,16 @@ importers:
   packages/crypto:
     dependencies:
       '@ethereumjs/rlp':
-        specifier: ^10.1.1
+        specifier: 10.1.1
         version: 10.1.1
       '@noble/ciphers':
-        specifier: ^2.1.1
+        specifier: 2.1.1
         version: 2.1.1
       '@noble/curves':
-        specifier: ^1.6
-        version: 1.9.1
+        specifier: 1.6.0
+        version: 1.6.0
       '@noble/hashes':
-        specifier: ^2.0.1
+        specifier: 2.0.1
         version: 2.0.1
     devDependencies:
       typescript:
@@ -844,6 +844,10 @@ packages:
     resolution: {integrity: sha512-bysYuiVfhxNJuldNXlFEitTVdNnYUc+XNJZd7Qm2a5j1vZHgY+fazadNFWFaMK/2vye0JVlxV3gHmC0WDfAOQw==}
     engines: {node: '>= 20.19.0'}
 
+  '@noble/curves@1.6.0':
+    resolution: {integrity: sha512-TlaHRXDehJuRNR9TfZDNQ45mMEd5dwUwmicsafcIX4SsNiqnCHKjE/1alYPd/lDRVhxdhUAlv8uEhMCI5zjIJQ==}
+    engines: {node: ^14.21.3 || >=16}
+
   '@noble/curves@1.9.1':
     resolution: {integrity: sha512-k11yZxZg+t+gWvBbIswW0yoJlu8cHOC7dhunwOzoWH/mXGBiYyR4YY6hAEK/3EUs4UpB8la1RfdRpeGsFHkWsA==}
     engines: {node: ^14.21.3 || >=16}
@@ -854,6 +858,10 @@ packages:
 
   '@noble/ed25519@1.7.5':
     resolution: {integrity: sha512-xuS0nwRMQBvSxDa7UxMb61xTiH3MxTgUfhyPUALVIe0FlOAz4sjELwyDRyUvqeEYfRSG9qNjFIycqLZppg4RSA==}
+
+  '@noble/hashes@1.5.0':
+    resolution: {integrity: sha512-1j6kQFb7QRru7eKN3ZDvRcP13rugwdxZqCjbiAVZfIJwgj2A65UmT4TgARXGlXgnRkORLTDTrO19ZErt7+QXgA==}
+    engines: {node: ^14.21.3 || >=16}
 
   '@noble/hashes@1.8.0':
     resolution: {integrity: sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A==}
@@ -4557,6 +4565,10 @@ snapshots:
 
   '@noble/ciphers@2.1.1': {}
 
+  '@noble/curves@1.6.0':
+    dependencies:
+      '@noble/hashes': 1.5.0
+
   '@noble/curves@1.9.1':
     dependencies:
       '@noble/hashes': 1.8.0
@@ -4566,6 +4578,8 @@ snapshots:
       '@noble/hashes': 2.0.1
 
   '@noble/ed25519@1.7.5': {}
+
+  '@noble/hashes@1.5.0': {}
 
   '@noble/hashes@1.8.0': {}
 
