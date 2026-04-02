@@ -357,7 +357,12 @@ export class Uploader {
           "0x",
         ],
       });
-    } catch {
+    } catch (e: any) {
+      // A revert inside the function body means the function exists — contract is valid.
+      // Only throw if the function selector itself is missing (zero data / execution error).
+      if (e?.cause?.name === "ContractFunctionRevertedError") {
+        return; // Function exists but reverted with dummy args — expected
+      }
       throw new InvalidConditionContractError(address, type);
     }
   }

@@ -144,7 +144,7 @@ export class Observer {
       const primaryHex = toHex(rawPoint);
       const dkgAddress = contractAddresses[this.network].dkg;
 
-      const results = await Promise.all(
+      const settled = await Promise.allSettled(
         this.validationClients.map(async (client) => {
           const logs = await client.getLogs({
             address: dkgAddress,
@@ -157,8 +157,8 @@ export class Observer {
         }),
       );
 
-      for (const result of results) {
-        if (result !== null && result !== primaryHex) {
+      for (const s of settled) {
+        if (s.status === "fulfilled" && s.value !== null && s.value !== primaryHex) {
           throw new RpcConsensusError("globalPubKey");
         }
       }

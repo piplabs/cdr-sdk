@@ -402,9 +402,16 @@ export class Consumer {
 
     // Step 4: Verify CID integrity (if multiformats is available)
     if (!params.skipCidVerification) {
+      let cidMod: any;
+      let hashMod: any;
       try {
-        const cidMod: any = await import("multiformats/cid");
-        const hashMod: any = await import("multiformats/hashes/sha2");
+        cidMod = await import("multiformats/cid");
+        hashMod = await import("multiformats/hashes/sha2");
+      } catch {
+        // multiformats not installed — skip verification
+      }
+
+      if (cidMod && hashMod) {
         const CID = cidMod.CID;
         const sha256 = hashMod.sha256;
 
@@ -415,9 +422,6 @@ export class Consumer {
         if (!expectedCid.equals(actualCid)) {
           throw new CidIntegrityError(cid, String(actualCid));
         }
-      } catch (e) {
-        if (e instanceof CidIntegrityError) throw e;
-        // multiformats not installed — skip verification silently
       }
     }
 
