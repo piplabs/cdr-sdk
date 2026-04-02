@@ -42,6 +42,15 @@ export class ObserverRequiredError extends CDRError {
   }
 }
 
+export class RpcConsensusError extends CDRError {
+  constructor(field: string) {
+    super(
+      `RPC consensus failure: ${field} returned different values across providers`,
+      "RPC_CONSENSUS",
+    );
+  }
+}
+
 export class InvalidConditionContractError extends CDRError {
   constructor(address: string, type: "write" | "read") {
     super(

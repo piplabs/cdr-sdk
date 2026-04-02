@@ -1,17 +1,25 @@
-import { parseEventLogs, toBytes, type PublicClient } from "viem";
+import { parseEventLogs, toBytes, toHex, type PublicClient } from "viem";
 import { cdrAbi, dkgAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
 import { CURVE_ED25519 } from "@piplabs/cdr-crypto";
 import type { Vault } from "./types.js";
+import { RpcConsensusError } from "./errors.js";
 
 export class Observer {
   private publicClient: PublicClient;
   private network: Network;
   private minThresholdRatio?: number;
+  private validationClients?: PublicClient[];
 
-  constructor(params: { network: Network; publicClient: PublicClient; minThresholdRatio?: number }) {
+  constructor(params: {
+    network: Network;
+    publicClient: PublicClient;
+    minThresholdRatio?: number;
+    validationClients?: PublicClient[];
+  }) {
     this.publicClient = params.publicClient;
     this.network = params.network;
     this.minThresholdRatio = params.minThresholdRatio;
+    this.validationClients = params.validationClients;
   }
 
   /**
@@ -130,6 +138,31 @@ export class Observer {
     const parsed = await this.getFinalizedEvents(params);
     const latest = parsed[parsed.length - 1];
     const rawPoint = toBytes(latest.args.globalPubKey);
+
+    // Cross-validate against additional RPCs if configured
+    if (this.validationClients?.length) {
+      const primaryHex = toHex(rawPoint);
+      const dkgAddress = contractAddresses[this.network].dkg;
+
+      const results = await Promise.all(
+        this.validationClients.map(async (client) => {
+          const logs = await client.getLogs({
+            address: dkgAddress,
+            fromBlock: params?.fromBlock ?? BigInt(0),
+            toBlock: "latest",
+          });
+          const events = parseEventLogs({ abi: dkgAbi, logs, eventName: "Finalized" });
+          if (events.length === 0) return null;
+          return events[events.length - 1].args.globalPubKey;
+        }),
+      );
+
+      for (const result of results) {
+        if (result !== null && result !== primaryHex) {
+          throw new RpcConsensusError("globalPubKey");
+        }
+      }
+    }
 
     // The contract returns the raw 32-byte Ed25519 point. The WASM TDH2
     // functions expect a 2-byte curve-code prefix (0x043f for Ed25519).
