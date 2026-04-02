@@ -71,8 +71,13 @@ export class Consumer {
     return { txHash };
   }
 
-  /** Fetch validator address → commPubKey map from DKG Registered events */
-  private async getCommPubKeyMap(): Promise<Map<string, Uint8Array>> {
+  /**
+   * Fetch validator address → commPubKey[] map from DKG Registered events.
+   * Each validator may re-register with a new commPubKey in each DKG round,
+   * so we keep all keys (most recent first) to handle round mismatch during
+   * signature verification.
+   */
+  private async getCommPubKeyMap(): Promise<Map<string, Uint8Array[]>> {
     const dkgAddress = contractAddresses[this.network].dkg;
 
     const rawLogs = await this.publicClient.getLogs({
@@ -87,10 +92,12 @@ export class Consumer {
       eventName: "Registered",
     });
 
-    const validators = new Map<string, Uint8Array>();
+    const validators = new Map<string, Uint8Array[]>();
     for (const log of parsed) {
       const addr = log.args.validatorAddr.toLowerCase() as `0x${string}`;
-      validators.set(addr, toBytes(log.args.enclaveCommKey));
+      const keys = validators.get(addr) ?? [];
+      keys.push(toBytes(log.args.enclaveCommKey));
+      validators.set(addr, keys);
     }
 
     return validators;
@@ -163,24 +170,29 @@ export class Consumer {
                 signature: log.args.signature,
               };
 
-              // Verify signature
+              // Verify signature — try all known commPubKeys for this validator
+              // (DKG round rotation may cause the signing key to differ from the latest registration)
               const validatorAddr = log.args.validator.toLowerCase();
-              const commPubKey = commPubKeyMap.get(validatorAddr);
+              const commPubKeys = commPubKeyMap.get(validatorAddr);
 
-              if (!commPubKey) {
+              if (!commPubKeys || commPubKeys.length === 0) {
                 onInvalidPartial?.(event, new Error(`unknown validator: ${log.args.validator}`));
                 continue;
               }
 
-              const valid = verifyPartialSignature({
-                round: event.round,
-                ciphertext: toBytes(log.args.ciphertext),
-                encryptedPartial: toBytes(event.encryptedPartial),
-                ephemeralPubKey: toBytes(event.ephemeralPubKey),
-                pubShare: toBytes(event.pubShare),
-                signature: toBytes(event.signature),
-                commPubKey,
-              });
+              let valid = false;
+              for (let ki = commPubKeys.length - 1; ki >= 0; ki--) {
+                valid = verifyPartialSignature({
+                  round: event.round,
+                  ciphertext: toBytes(log.args.ciphertext),
+                  encryptedPartial: toBytes(event.encryptedPartial),
+                  ephemeralPubKey: toBytes(event.ephemeralPubKey),
+                  pubShare: toBytes(event.pubShare),
+                  signature: toBytes(event.signature),
+                  commPubKey: commPubKeys[ki],
+                });
+                if (valid) break;
+              }
 
               if (!valid) {
                 onInvalidPartial?.(event, new Error(`invalid signature from validator ${log.args.validator}`));
