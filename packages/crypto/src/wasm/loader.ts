@@ -9,6 +9,8 @@
  */
 
 import createCbMpcModule from "./cb-mpc-tdh2.js";
+import { WASM_MANIFEST } from "./manifest.js";
+import { WasmIntegrityError } from "../errors.js";
 
 /** Opaque WASM module instance */
 interface EmscriptenModule {
@@ -251,12 +253,47 @@ export class CbMpcWasm {
 
 let wasmInstance: CbMpcWasm | null = null;
 
+async function verifyWasmHash(): Promise<void> {
+  const wasmUrl = new URL("cb-mpc-tdh2.wasm", import.meta.url);
+  let wasmBytes: ArrayBuffer;
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const g = globalThis as any;
+  if (g.process?.versions?.node) {
+    // Dynamic import with variable to prevent TS from resolving node modules
+    const nodeFs = "node:fs";
+    const nodeUrl = "node:url";
+    const fs: any = await import(nodeFs);
+    const url: any = await import(nodeUrl);
+    const buf = fs.readFileSync(url.fileURLToPath(wasmUrl));
+    wasmBytes = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+  } else {
+    const response = await fetch(wasmUrl.href);
+    wasmBytes = await response.arrayBuffer();
+  }
+
+  const hashBuffer = await globalThis.crypto.subtle.digest("SHA-256", wasmBytes);
+  const hashArray = new Uint8Array(hashBuffer);
+  const actual = Array.from(hashArray).map(b => b.toString(16).padStart(2, "0")).join("");
+  const expected = WASM_MANIFEST["cb-mpc-tdh2.wasm"];
+
+  if (actual !== expected) {
+    throw new WasmIntegrityError(expected, actual);
+  }
+}
+
 /**
  * Initialize the WASM module. Must be called once before using tdh2Encrypt/tdh2Combine.
  * Subsequent calls are no-ops and return immediately.
+ *
+ * @param options.skipHashCheck - If true, skip SHA-256 verification of the WASM binary (default: false)
  */
-export async function initWasm(): Promise<void> {
+export async function initWasm(options?: { skipHashCheck?: boolean }): Promise<void> {
   if (wasmInstance) return;
+
+  if (!options?.skipHashCheck) {
+    await verifyWasmHash();
+  }
 
   const Module = await createCbMpcModule() as unknown as EmscriptenModule;
 
