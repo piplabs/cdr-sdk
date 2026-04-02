@@ -30,6 +30,18 @@ export class ContractRevertError extends CDRError {
   }
 }
 
+export class InvalidParamsError extends CDRError {
+  constructor(message: string) {
+    super(message, "INVALID_PARAMS");
+  }
+}
+
+export class ObserverRequiredError extends CDRError {
+  constructor() {
+    super("globalPubKey and threshold are required when no Observer is configured", "OBSERVER_REQUIRED");
+  }
+}
+
 export class ContentSizeExceededError extends CDRError {
   actual: number;
   max: bigint;

@@ -1,7 +1,7 @@
 import { parseEventLogs, toBytes, toHex, fromHex, type PublicClient, type WalletClient } from "viem";
 import { cdrAbi, dkgAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
 import { decryptPartial as eciesDecrypt, tdh2Combine, verifyPartialSignature, decryptFile, generateEphemeralKeyPair, type TDH2Ciphertext, type DecryptedPartial } from "@piplabs/cdr-crypto";
-import { PartialCollectionTimeoutError } from "./errors.js";
+import { PartialCollectionTimeoutError, InvalidParamsError, ObserverRequiredError } from "./errors.js";
 import type { PartialDecryptionEvent } from "./types.js";
 import { uuidToLabel } from "./label.js";
 import type { StorageProvider } from "./storage/types.js";
@@ -273,8 +273,8 @@ export class Consumer {
     onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
   }): Promise<{ dataKey: Uint8Array; txHash: `0x${string}` }> {
     // Validate key pair: both must be provided or both omitted
-    if (params.requesterPubKey && !params.recipientPrivKey || !params.requesterPubKey && params.recipientPrivKey) {
-      throw new Error("requesterPubKey and recipientPrivKey must both be provided or both omitted");
+    if ((params.requesterPubKey && !params.recipientPrivKey) || (!params.requesterPubKey && params.recipientPrivKey)) {
+      throw new InvalidParamsError("requesterPubKey and recipientPrivKey must both be provided or both omitted");
     }
 
     // Auto-generate ephemeral keypair if not provided
@@ -293,7 +293,7 @@ export class Consumer {
     let threshold = params.threshold;
     if (!globalPubKey || threshold === undefined) {
       if (!this.observer) {
-        throw new Error("globalPubKey and threshold are required when no Observer is configured");
+        throw new ObserverRequiredError();
       }
       [globalPubKey, threshold] = await Promise.all([
         globalPubKey ? Promise.resolve(globalPubKey) : this.observer.getGlobalPubKey(),
