@@ -32,7 +32,17 @@ export class Consumer {
     this.readFileVault = this.downloadFile.bind(this);
   }
 
-  /** Request a vault read. Auto-queries read fee. Emits VaultRead event for validators. */
+  /**
+   * Request a vault read. Auto-queries read fee. Emits VaultRead event for validators.
+   * @example
+   * ```ts
+   * const { txHash } = await consumer.read({
+   *   uuid: 42,
+   *   accessAuxData: "0x",
+   *   requesterPubKey: "0x04...",
+   * });
+   * ```
+   */
   async read(params: {
     uuid: number;
     accessAuxData: `0x${string}`;
@@ -89,6 +99,15 @@ export class Consumer {
    * Poll for EncryptedPartialDecryptionSubmitted events until minPartials are collected.
    * Filters by uuid to match events for this specific vault read request.
    * Verifies each partial's TEE signature; invalid partials are skipped.
+   * @example
+   * ```ts
+   * const partials = await consumer.collectPartials({
+   *   uuid: 42,
+   *   minPartials: 3,
+   *   fromBlock: startBlock,
+   *   timeoutMs: 60_000,
+   * });
+   * ```
    */
   async collectPartials(params: {
     uuid: number;
@@ -181,7 +200,20 @@ export class Consumer {
     throw new PartialCollectionTimeoutError(collected.size, minPartials, timeoutMs);
   }
 
-  /** Decrypt collected partials and combine to recover the original data key */
+  /**
+   * Decrypt collected partials and combine to recover the original data key.
+   * @example
+   * ```ts
+   * const dataKey = await consumer.decryptDataKey({
+   *   ciphertext: { raw: encryptedData, label },
+   *   partials,
+   *   recipientPrivKey,
+   *   globalPubKey,
+   *   label,
+   *   threshold: 3,
+   * });
+   * ```
+   */
   async decryptDataKey(params: {
     ciphertext: TDH2Ciphertext;
     partials: PartialDecryptionEvent[];
@@ -216,9 +248,19 @@ export class Consumer {
     });
   }
 
-  /** Convenience: read + collect + decrypt in one call.
-   *  If requesterPubKey/recipientPrivKey are omitted, an ephemeral secp256k1 keypair is generated and the private key is zeroed after use.
-   *  If globalPubKey/threshold are omitted, they are auto-queried via the Observer (requires observer to be set). */
+  /**
+   * Convenience: read + collect + decrypt in one call.
+   * If requesterPubKey/recipientPrivKey are omitted, an ephemeral secp256k1 keypair is generated and the private key is zeroed after use.
+   * If globalPubKey/threshold are omitted, they are auto-queried via the Observer (requires observer to be set).
+   * @example
+   * ```ts
+   * // Simplified — keys and DKG params auto-managed:
+   * const { dataKey, txHash } = await consumer.accessCDR({
+   *   uuid: 42,
+   *   accessAuxData: "0x",
+   * });
+   * ```
+   */
   async accessCDR(params: {
     uuid: number;
     accessAuxData: `0x${string}`;
@@ -304,8 +346,18 @@ export class Consumer {
     }
   }
 
-  /** Convenience: access vault, parse CID + key payload, download from storage, and decrypt file.
-   *  Key/threshold params are optional — see accessCDR() for auto-generation behavior. */
+  /**
+   * Convenience: access vault, parse CID + key payload, download from storage, and decrypt file.
+   * Key/threshold params are optional — see accessCDR() for auto-generation behavior.
+   * @example
+   * ```ts
+   * const { content, cid } = await consumer.downloadFile({
+   *   uuid: 42,
+   *   accessAuxData: "0x",
+   *   storageProvider,
+   * });
+   * ```
+   */
   async downloadFile(params: {
     uuid: number;
     accessAuxData: `0x${string}`;

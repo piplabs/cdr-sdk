@@ -12,7 +12,14 @@ export class Observer {
     this.network = params.network;
   }
 
-  /** Get a vault's details by UUID */
+  /**
+   * Get a vault's details by UUID.
+   * @example
+   * ```ts
+   * const vault = await observer.getVault(42);
+   * console.log(vault.readConditionAddr);
+   * ```
+   */
   async getVault(uuid: number): Promise<Vault> {
     const result = await this.publicClient.readContract({
       address: contractAddresses[this.network].cdr,
@@ -23,7 +30,13 @@ export class Observer {
     return { uuid, ...result } as unknown as Vault;
   }
 
-  /** Get current allocation fee */
+  /**
+   * Get current allocation fee.
+   * @example
+   * ```ts
+   * const fee = await observer.getAllocateFee();
+   * ```
+   */
   async getAllocateFee(): Promise<bigint> {
     return this.publicClient.readContract({
       address: contractAddresses[this.network].cdr,
@@ -32,7 +45,13 @@ export class Observer {
     });
   }
 
-  /** Get current write fee */
+  /**
+   * Get current write fee.
+   * @example
+   * ```ts
+   * const fee = await observer.getWriteFee();
+   * ```
+   */
   async getWriteFee(): Promise<bigint> {
     return this.publicClient.readContract({
       address: contractAddresses[this.network].cdr,
@@ -41,7 +60,13 @@ export class Observer {
     });
   }
 
-  /** Get current read fee */
+  /**
+   * Get current read fee.
+   * @example
+   * ```ts
+   * const fee = await observer.getReadFee();
+   * ```
+   */
   async getReadFee(): Promise<bigint> {
     return this.publicClient.readContract({
       address: contractAddresses[this.network].cdr,
@@ -50,7 +75,13 @@ export class Observer {
     });
   }
 
-  /** Get DKG operational threshold */
+  /**
+   * Get DKG operational threshold.
+   * @example
+   * ```ts
+   * const threshold = await observer.getOperationalThreshold();
+   * ```
+   */
   async getOperationalThreshold(): Promise<bigint> {
     return this.publicClient.readContract({
       address: contractAddresses[this.network].dkg,
@@ -88,6 +119,10 @@ export class Observer {
   /**
    * Get the DKG global public key from the most recent Finalized event.
    * Returns the raw bytes of the globalPubKey (Ed25519 point with curve-code prefix).
+   * @example
+   * ```ts
+   * const globalPubKey = await observer.getGlobalPubKey();
+   * ```
    */
   async getGlobalPubKey(params?: { fromBlock?: bigint }): Promise<Uint8Array> {
     const parsed = await this.getFinalizedEvents(params);
@@ -110,6 +145,10 @@ export class Observer {
   /**
    * Get the number of participants in the latest DKG round
    * by counting Finalized events with the same round as the most recent event.
+   * @example
+   * ```ts
+   * const count = await observer.getParticipantCount();
+   * ```
    */
   async getParticipantCount(params?: { fromBlock?: bigint }): Promise<number> {
     const parsed = await this.getFinalizedEvents(params);
@@ -120,6 +159,10 @@ export class Observer {
   /**
    * Get the absolute threshold (minimum number of partial decryptions needed).
    * Computes: ceil(participantCount * operationalThreshold / 1000)
+   * @example
+   * ```ts
+   * const threshold = await observer.getThreshold();
+   * ```
    */
   async getThreshold(params?: { fromBlock?: bigint }): Promise<number> {
     const [operationalThreshold, participantCount] = await Promise.all([
@@ -136,6 +179,13 @@ export class Observer {
    *
    * @param round - If provided, only include validators registered for this round
    * @returns Map where keys are lowercase checksummed addresses and values are commPubKey bytes
+   * @example
+   * ```ts
+   * const validators = await observer.getRegisteredValidators();
+   * for (const [addr, commKey] of validators) {
+   *   console.log(addr, commKey.length);
+   * }
+   * ```
    */
   async getRegisteredValidators(params?: {
     fromBlock?: bigint;
@@ -168,7 +218,13 @@ export class Observer {
     return validators;
   }
 
-  /** Get the maximum allowed encrypted data size for vault writes */
+  /**
+   * Get the maximum allowed encrypted data size for vault writes.
+   * @example
+   * ```ts
+   * const maxSize = await observer.getMaxEncryptedDataSize();
+   * ```
+   */
   async getMaxEncryptedDataSize(): Promise<bigint> {
     return this.publicClient.readContract({
       address: contractAddresses[this.network].cdr,

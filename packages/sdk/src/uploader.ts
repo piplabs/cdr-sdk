@@ -27,7 +27,17 @@ export class Uploader {
     this.createFileVault = this.uploadFile.bind(this);
   }
 
-  /** Encrypt a data key using TDH2 to the DKG global public key */
+  /**
+   * Encrypt a data key using TDH2 to the DKG global public key.
+   * @example
+   * ```ts
+   * const ciphertext = await uploader.encryptDataKey({
+   *   dataKey: new TextEncoder().encode("secret"),
+   *   globalPubKey,
+   *   label: uuidToLabel(uuid),
+   * });
+   * ```
+   */
   async encryptDataKey(params: {
     dataKey: Uint8Array;
     globalPubKey: Uint8Array;
@@ -40,7 +50,19 @@ export class Uploader {
     });
   }
 
-  /** Allocate a new vault on-chain. Auto-queries allocation fee unless feeOverride is provided. */
+  /**
+   * Allocate a new vault on-chain. Auto-queries allocation fee unless feeOverride is provided.
+   * @example
+   * ```ts
+   * const { uuid, txHash } = await uploader.allocate({
+   *   updatable: false,
+   *   writeConditionAddr: "0x...",
+   *   readConditionAddr: "0x...",
+   *   writeConditionData: "0x",
+   *   readConditionData: "0x",
+   * });
+   * ```
+   */
   async allocate(params: {
     updatable: boolean;
     writeConditionAddr: `0x${string}`;
@@ -83,7 +105,17 @@ export class Uploader {
     return { txHash, uuid };
   }
 
-  /** Write encrypted data to an existing vault. Auto-queries write fee. */
+  /**
+   * Write encrypted data to an existing vault. Auto-queries write fee.
+   * @example
+   * ```ts
+   * const { txHash } = await uploader.write({
+   *   uuid: 42,
+   *   accessAuxData: "0x",
+   *   encryptedData: "0x...",
+   * });
+   * ```
+   */
   async write(params: {
     uuid: number;
     accessAuxData: `0x${string}`;
@@ -113,7 +145,23 @@ export class Uploader {
     return { txHash };
   }
 
-  /** Convenience: allocate vault to get UUID, encrypt data key with UUID-derived label, and write encrypted data in one call */
+  /**
+   * Convenience: allocate vault, encrypt data key with UUID-derived label, and write in one call.
+   * @example
+   * ```ts
+   * const result = await uploader.uploadCDR({
+   *   dataKey: new TextEncoder().encode("secret"),
+   *   globalPubKey,
+   *   updatable: false,
+   *   writeConditionAddr: writeCondition.address,
+   *   readConditionAddr: readCondition.address,
+   *   writeConditionData: writeCondition.conditionData,
+   *   readConditionData: readCondition.conditionData,
+   *   accessAuxData: "0x",
+   * });
+   * console.log("UUID:", result.uuid);
+   * ```
+   */
   async uploadCDR(params: {
     dataKey: Uint8Array;
     globalPubKey: Uint8Array;
@@ -164,7 +212,24 @@ export class Uploader {
     };
   }
 
-  /** Encrypt a file, upload to storage, and write CID + key reference to a new vault */
+  /**
+   * Encrypt a file, upload to storage, and write CID + key reference to a new vault.
+   * @example
+   * ```ts
+   * const result = await uploader.uploadFile({
+   *   content: fileBytes,
+   *   storageProvider,
+   *   globalPubKey,
+   *   updatable: false,
+   *   writeConditionAddr: "0x...",
+   *   readConditionAddr: "0x...",
+   *   writeConditionData: "0x",
+   *   readConditionData: "0x",
+   *   accessAuxData: "0x",
+   * });
+   * console.log("CID:", result.cid);
+   * ```
+   */
   async uploadFile(params: {
     content: Uint8Array;
     storageProvider: StorageProvider;
