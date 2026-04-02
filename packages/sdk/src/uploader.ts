@@ -1,8 +1,8 @@
-import { parseEventLogs, toHex, type PublicClient, type WalletClient } from "viem";
+import { parseEventLogs, toHex, toBytes, type PublicClient, type WalletClient } from "viem";
 import { cdrAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
 import { tdh2Encrypt, encryptFile, type TDH2Ciphertext } from "@piplabs/cdr-crypto";
 import { uuidToLabel } from "./label.js";
-import { ContentSizeExceededError } from "./errors.js";
+import { ContentSizeExceededError, LabelMismatchError } from "./errors.js";
 import type { StorageProvider } from "./storage/types.js";
 
 export class Uploader {
@@ -121,7 +121,19 @@ export class Uploader {
     accessAuxData: `0x${string}`;
     encryptedData: `0x${string}`;
     feeOverride?: bigint;
+    /** Skip label binding validation (default: false). */
+    skipLabelValidation?: boolean;
   }): Promise<{ txHash: `0x${string}` }> {
+    // Validate that the ciphertext contains the expected UUID-derived label
+    if (!params.skipLabelValidation) {
+      const expectedLabel = uuidToLabel(params.uuid);
+      const rawBytes = toBytes(params.encryptedData);
+      if (!containsLabel(rawBytes, expectedLabel)) {
+        const expectedHex = toHex(expectedLabel);
+        throw new LabelMismatchError(expectedHex, `not found in ciphertext for uuid ${params.uuid}`);
+      }
+    }
+
     const cdrAddress = contractAddresses[this.network].cdr;
 
     const fee = params.feeOverride ?? await this.publicClient.readContract({
@@ -319,4 +331,17 @@ export class Uploader {
     }
     return parsed[0].args.uuid;
   }
+}
+
+/** Check if the raw ciphertext bytes contain the expected 32-byte label. */
+function containsLabel(raw: Uint8Array, label: Uint8Array): boolean {
+  if (raw.length < label.length) return false;
+  outer:
+  for (let i = 0; i <= raw.length - label.length; i++) {
+    for (let j = 0; j < label.length; j++) {
+      if (raw[i + j] !== label[j]) continue outer;
+    }
+    return true;
+  }
+  return false;
 }

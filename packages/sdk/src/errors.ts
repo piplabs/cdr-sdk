@@ -42,6 +42,15 @@ export class ObserverRequiredError extends CDRError {
   }
 }
 
+export class LabelMismatchError extends CDRError {
+  constructor(expected: string, actual: string) {
+    super(
+      `TDH2 ciphertext label mismatch: expected ${expected}, got ${actual}`,
+      "LABEL_MISMATCH",
+    );
+  }
+}
+
 export class ContentSizeExceededError extends CDRError {
   actual: number;
   max: bigint;
