@@ -2,7 +2,7 @@ import { parseEventLogs, toHex, toBytes, type PublicClient, type WalletClient } 
 import { cdrAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
 import { tdh2Encrypt, encryptFile, type TDH2Ciphertext } from "@piplabs/cdr-crypto";
 import { uuidToLabel } from "./label.js";
-import { ContentSizeExceededError, LabelMismatchError } from "./errors.js";
+import { ContentSizeExceededError, LabelMismatchError, InvalidConditionContractError } from "./errors.js";
 import type { StorageProvider } from "./storage/types.js";
 
 export class Uploader {
@@ -70,11 +70,20 @@ export class Uploader {
     writeConditionData: `0x${string}`;
     readConditionData: `0x${string}`;
     feeOverride?: bigint;
-    // TODO: In the future, add a `validateConditions: boolean` param
-    // to check for the existence of the required method signatures
-    // (checkWriteCondition / checkReadCondition) on the condition
-    // contract addresses before submitting the transaction.
+    /** Skip condition contract interface validation (default: false). */
+    skipConditionValidation?: boolean;
   }): Promise<{ txHash: `0x${string}`; uuid: number }> {
+    const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as const;
+
+    if (!params.skipConditionValidation) {
+      if (params.writeConditionAddr !== ZERO_ADDRESS) {
+        await this.validateConditionContract(params.writeConditionAddr, "write");
+      }
+      if (params.readConditionAddr !== ZERO_ADDRESS) {
+        await this.validateConditionContract(params.readConditionAddr, "read");
+      }
+    }
+
     const cdrAddress = contractAddresses[this.network].cdr;
 
     const fee = params.feeOverride ?? await this.publicClient.readContract({
@@ -318,6 +327,39 @@ export class Uploader {
       ciphertext,
       txHashes: { allocate: allocateTx, write: writeTx },
     };
+  }
+
+  private async validateConditionContract(
+    address: `0x${string}`,
+    type: "write" | "read",
+  ): Promise<void> {
+    const functionName = type === "write" ? "checkWriteCondition" : "checkReadCondition";
+    const conditionAbi = [{
+      type: "function" as const,
+      name: functionName,
+      inputs: [
+        { name: "caller", type: "address" },
+        { name: "conditionData", type: "bytes" },
+        { name: "accessAuxData", type: "bytes" },
+      ],
+      outputs: [{ name: "", type: "bool" }],
+      stateMutability: "view" as const,
+    }];
+
+    try {
+      await this.publicClient.simulateContract({
+        address,
+        abi: conditionAbi,
+        functionName,
+        args: [
+          "0x0000000000000000000000000000000000000000",
+          "0x",
+          "0x",
+        ],
+      });
+    } catch {
+      throw new InvalidConditionContractError(address, type);
+    }
   }
 
   private parseVaultAllocatedUuid(logs: any[]): number {

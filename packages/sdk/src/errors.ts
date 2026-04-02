@@ -42,6 +42,15 @@ export class ObserverRequiredError extends CDRError {
   }
 }
 
+export class InvalidConditionContractError extends CDRError {
+  constructor(address: string, type: "write" | "read") {
+    super(
+      `${type} condition contract at ${address} does not implement the required interface`,
+      "INVALID_CONDITION_CONTRACT",
+    );
+  }
+}
+
 export class LabelMismatchError extends CDRError {
   constructor(expected: string, actual: string) {
     super(
