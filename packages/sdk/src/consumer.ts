@@ -13,6 +13,11 @@ export class Consumer {
   private network: Network;
   private observer: Observer | null;
 
+  /** Alias for {@link accessCDR} */
+  readVault: Consumer["accessCDR"];
+  /** Alias for {@link downloadFile} */
+  readFileVault: Consumer["downloadFile"];
+
   constructor(params: {
     network: Network;
     publicClient: PublicClient;
@@ -23,6 +28,8 @@ export class Consumer {
     this.walletClient = params.walletClient;
     this.network = params.network;
     this.observer = params.observer ?? null;
+    this.readVault = this.accessCDR.bind(this);
+    this.readFileVault = this.downloadFile.bind(this);
   }
 
   /** Request a vault read. Auto-queries read fee. Emits VaultRead event for validators. */

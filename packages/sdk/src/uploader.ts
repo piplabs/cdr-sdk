@@ -10,6 +10,11 @@ export class Uploader {
   private walletClient: WalletClient;
   private network: Network;
 
+  /** Alias for {@link uploadCDR} */
+  createVault: Uploader["uploadCDR"];
+  /** Alias for {@link uploadFile} */
+  createFileVault: Uploader["uploadFile"];
+
   constructor(params: {
     network: Network;
     publicClient: PublicClient;
@@ -18,6 +23,8 @@ export class Uploader {
     this.publicClient = params.publicClient;
     this.walletClient = params.walletClient;
     this.network = params.network;
+    this.createVault = this.uploadCDR.bind(this);
+    this.createFileVault = this.uploadFile.bind(this);
   }
 
   /** Encrypt a data key using TDH2 to the DKG global public key */
