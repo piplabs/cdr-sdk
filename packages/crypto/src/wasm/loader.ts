@@ -41,6 +41,7 @@ interface EmscriptenModule {
     outPtrPtr: number, outSizePtr: number,
   ): number;
   _wasm_ptr_size(): number;
+  _wasm_seed_random(data: number, size: number): void;
   HEAPU8: Uint8Array;
   HEAP32: Int32Array;
   getValue(ptr: number, type: string): number;
@@ -262,6 +263,20 @@ export async function initWasm(): Promise<void> {
   const ptrSize = Module._wasm_ptr_size();
   if (ptrSize !== 4) {
     console.warn(`Unexpected WASM pointer size: ${ptrSize} (expected 4)`);
+  }
+
+  // Seed OpenSSL's RNG — WASM has no OS entropy source
+  if (typeof Module._wasm_seed_random === "function") {
+    const entropy = globalThis.crypto.getRandomValues(new Uint8Array(64));
+    const seedPtr = Module._malloc(entropy.length);
+    try {
+      Module.HEAPU8.set(entropy, seedPtr);
+      Module._wasm_seed_random(seedPtr, entropy.length);
+    } finally {
+      Module._free(seedPtr);
+    }
+  } else {
+    console.warn("WASM module does not export _wasm_seed_random — OpenSSL RNG is unseeded");
   }
 
   wasmInstance = new CbMpcWasm(Module);
