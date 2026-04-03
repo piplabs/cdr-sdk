@@ -36,6 +36,17 @@ export async function tdh2Verify(params: {
   return wasm.tdh2Verify(params.globalPubKey, params.ciphertext, params.label);
 }
 
+/**
+ * Extract the label (associated data) from a serialized TDH2 ciphertext.
+ * Returns the label bytes embedded in the ciphertext.
+ */
+export function tdh2ExtractLabel(ciphertext: Uint8Array): Uint8Array {
+  const wasm = getWasm();
+  if (!wasm) throw new WasmNotInitializedError();
+
+  return wasm.tdh2ExtractLabel(ciphertext);
+}
+
 export async function tdh2Combine(params: {
   ciphertext: TDH2Ciphertext;
   partials: DecryptedPartial[];

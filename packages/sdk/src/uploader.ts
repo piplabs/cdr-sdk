@@ -1,6 +1,6 @@
 import { parseEventLogs, toHex, toBytes, type PublicClient, type WalletClient } from "viem";
 import { cdrAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
-import { tdh2Encrypt, encryptFile, type TDH2Ciphertext } from "@piplabs/cdr-crypto";
+import { tdh2Encrypt, encryptFile, getWasm, type TDH2Ciphertext } from "@piplabs/cdr-crypto";
 import { uuidToLabel } from "./label.js";
 import { ContentSizeExceededError, LabelMismatchError, InvalidConditionContractError } from "./errors.js";
 import type { StorageProvider } from "./storage/types.js";
@@ -133,18 +133,18 @@ export class Uploader {
     /** Skip label binding validation (default: false). */
     skipLabelValidation?: boolean;
   }): Promise<{ txHash: `0x${string}` }> {
-    // Label binding validation: when called directly (not from uploadCDR),
-    // the caller can enable validation. Note: the serialized cb-mpc ciphertext
-    // may not contain the label as a literal substring — the label is used as
-    // associated data during encryption. Validation here is best-effort.
+    // Label binding validation: extract the label from the serialized TDH2
+    // ciphertext via WASM and compare against the expected UUID-derived label.
     if (!params.skipLabelValidation) {
       const expectedLabel = uuidToLabel(params.uuid);
       const rawBytes = toBytes(params.encryptedData);
-      if (rawBytes.length > 0 && containsLabel(rawBytes, expectedLabel)) {
-        // Label found — OK (positive confirmation)
+      const wasm = getWasm();
+      if (wasm && rawBytes.length > 0) {
+        const actualLabel = wasm.tdh2ExtractLabel(rawBytes);
+        if (actualLabel.length > 0 && !actualLabel.every((b, i) => b === expectedLabel[i])) {
+          throw new LabelMismatchError(toHex(expectedLabel), toHex(actualLabel));
+        }
       }
-      // If not found, we do NOT throw — the label may be embedded in a
-      // format we don't understand. The contract enforces label binding.
     }
 
     const cdrAddress = contractAddresses[this.network].cdr;
@@ -382,17 +382,4 @@ export class Uploader {
     }
     return parsed[0].args.uuid;
   }
-}
-
-/** Check if the raw ciphertext bytes contain the expected 32-byte label. */
-function containsLabel(raw: Uint8Array, label: Uint8Array): boolean {
-  if (raw.length < label.length) return false;
-  outer:
-  for (let i = 0; i <= raw.length - label.length; i++) {
-    for (let j = 0; j < label.length; j++) {
-      if (raw[i + j] !== label[j]) continue outer;
-    }
-    return true;
-  }
-  return false;
 }

@@ -43,6 +43,7 @@ interface EmscriptenModule {
     partialsData: number, partialsSizes: number,
     outPtrPtr: number, outSizePtr: number,
   ): number;
+  _wasm_tdh2_extract_label(ctPtr: number, ctSize: number, outPtrPtr: number, outSizePtr: number): number;
   _wasm_ptr_size(): number;
   _wasm_seed_random(data: number, size: number): void;
   HEAPU8: Uint8Array;
@@ -226,6 +227,29 @@ export class CbMpcWasm {
       M._free(outSizePtr);
       M._wasm_ac_free(acHandle);
       M._wasm_tdh2_free_pub_key(pkHandle);
+    }
+  }
+
+  /**
+   * Extract the label (associated data) from a serialized TDH2 ciphertext.
+   *
+   * @param ciphertext  Serialized TDH2 ciphertext bytes
+   * @returns The label bytes embedded in the ciphertext
+   */
+  tdh2ExtractLabel(ciphertext: Uint8Array): Uint8Array {
+    const M = this.M;
+
+    const ctPtr = this.allocBytes(ciphertext);
+    const outPtrPtr = M._malloc(4);
+    const outSizePtr = M._malloc(4);
+    try {
+      const rv = M._wasm_tdh2_extract_label(ctPtr, ciphertext.length, outPtrPtr, outSizePtr);
+      if (rv !== 0) throw new Error(`wasm_tdh2_extract_label failed: ${rv}`);
+      return this.readResult(outPtrPtr, outSizePtr);
+    } finally {
+      M._free(ctPtr);
+      M._free(outPtrPtr);
+      M._free(outSizePtr);
     }
   }
 

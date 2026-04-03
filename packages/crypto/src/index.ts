@@ -1,4 +1,4 @@
-export { tdh2Encrypt, tdh2Verify, tdh2Combine } from "./tdh2.js";
+export { tdh2Encrypt, tdh2Verify, tdh2Combine, tdh2ExtractLabel } from "./tdh2.js";
 export { decryptPartial, generateEphemeralKeyPair } from "./ecies.js";
 export * from "./types.js";
 export * from "./errors.js";

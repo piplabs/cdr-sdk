@@ -3821,6 +3821,7 @@ var _wasm_tdh2_pub_key_from_point,
   _wasm_seed_random,
   _wasm_test_bn_rand,
   _wasm_test_uint128,
+  _wasm_tdh2_extract_label,
   _wasm_ptr_size,
   _free,
   __emscripten_stack_restore,
@@ -3846,6 +3847,7 @@ function assignWasmExports(wasmExports) {
   _wasm_seed_random = Module['_wasm_seed_random'] = wasmExports['wasm_seed_random'];
   _wasm_test_bn_rand = Module['_wasm_test_bn_rand'] = wasmExports['wasm_test_bn_rand'];
   _wasm_test_uint128 = Module['_wasm_test_uint128'] = wasmExports['wasm_test_uint128'];
+  _wasm_tdh2_extract_label = Module['_wasm_tdh2_extract_label'] = wasmExports['wasm_tdh2_extract_label'];
   _wasm_ptr_size = Module['_wasm_ptr_size'] = wasmExports['wasm_ptr_size'];
   _free = Module['_free'] = wasmExports['free'];
   __emscripten_stack_restore = wasmExports['_emscripten_stack_restore'];
