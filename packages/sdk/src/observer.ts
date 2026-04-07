@@ -146,7 +146,8 @@ export class Observer {
   /**
    * Get parsed Finalized events from the DKG contract.
    */
-  private async getFinalizedEvents(params?: { fromBlock?: bigint; toBlock?: bigint }) {
+  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+  private async getFinalizedEvents(params?: { fromBlock?: bigint; toBlock?: bigint }): Promise<Array<{ args: { round: number; globalPubKey: `0x${string}`; validatorAddr: `0x${string}` } }>> {
     const toBlock =
       params?.toBlock ?? (await this.publicClient.getBlockNumber());
     const fromBlock = params?.fromBlock ??
