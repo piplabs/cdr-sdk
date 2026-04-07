@@ -77,12 +77,19 @@ export class Consumer {
    * so we keep all keys (most recent first) to handle round mismatch during
    * signature verification.
    */
+  /** Default lookback window: ~7 days at ~2 s/block. Matches Observer.DEFAULT_LOOKBACK_BLOCKS. */
+  private static readonly DEFAULT_LOOKBACK_BLOCKS = 302_400n;
+
   private async getCommPubKeyMap(): Promise<Map<string, Uint8Array[]>> {
     const dkgAddress = contractAddresses[this.network].dkg;
+    const latestBlock = await this.publicClient.getBlockNumber();
+    const fromBlock = latestBlock > Consumer.DEFAULT_LOOKBACK_BLOCKS
+      ? latestBlock - Consumer.DEFAULT_LOOKBACK_BLOCKS
+      : 0n;
 
     const rawLogs = await this.publicClient.getLogs({
       address: dkgAddress,
-      fromBlock: BigInt(0),
+      fromBlock,
       toBlock: "latest",
     });
 

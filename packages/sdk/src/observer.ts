@@ -1,10 +1,23 @@
-import { parseEventLogs, toBytes, toHex, type PublicClient } from "viem";
+import {
+  getAbiItem,
+  parseEventLogs,
+  toBytes,
+  toHex,
+  type Log,
+  type PublicClient,
+} from "viem";
 import { cdrAbi, dkgAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
 import { CURVE_ED25519 } from "@piplabs/cdr-crypto";
 import type { Vault } from "./types.js";
 import { RpcConsensusError } from "./errors.js";
 
 export class Observer {
+  /** Many RPCs reject or time out on wide eth_getLogs ranges; chunk to stay under typical caps. */
+  private static readonly DKG_LOGS_BLOCK_CHUNK = 8192n;
+
+  /** Default lookback window: ~7 days at ~2 s/block. Avoids scanning from block 0 on long chains. */
+  private static readonly DEFAULT_LOOKBACK_BLOCKS = 302_400n;
+
   private publicClient: PublicClient;
   private network: Network;
   private minThresholdRatio?: number;
@@ -101,17 +114,52 @@ export class Observer {
   }
 
   /**
+   * Fetch DKG logs for a single event type in block chunks (avoids RPC range / size limits).
+   */
+  private async fetchDkgEventLogs(
+    client: PublicClient,
+    eventName: "Finalized" | "Registered",
+    fromBlock: bigint,
+    toBlock: bigint,
+  ): Promise<Log[]> {
+    const dkgAddress = contractAddresses[this.network].dkg;
+    const event = getAbiItem({ abi: dkgAbi, name: eventName });
+    const chunk = Observer.DKG_LOGS_BLOCK_CHUNK;
+    const logs: Log[] = [];
+    let start = fromBlock;
+
+    while (start <= toBlock) {
+      const end = start + chunk - 1n <= toBlock ? start + chunk - 1n : toBlock;
+      const chunkLogs = await client.getLogs({
+        address: dkgAddress,
+        event,
+        fromBlock: start,
+        toBlock: end,
+      });
+      logs.push(...chunkLogs);
+      start = end + 1n;
+    }
+
+    return logs;
+  }
+
+  /**
    * Get parsed Finalized events from the DKG contract.
    */
-  private async getFinalizedEvents(params?: { fromBlock?: bigint }) {
-    const dkgAddress = contractAddresses[this.network].dkg;
-    const fromBlock = params?.fromBlock ?? BigInt(0);
+  private async getFinalizedEvents(params?: { fromBlock?: bigint; toBlock?: bigint }) {
+    const toBlock =
+      params?.toBlock ?? (await this.publicClient.getBlockNumber());
+    const fromBlock = params?.fromBlock ??
+      (toBlock > Observer.DEFAULT_LOOKBACK_BLOCKS
+        ? toBlock - Observer.DEFAULT_LOOKBACK_BLOCKS
+        : 0n);
 
-    const rawLogs = await this.publicClient.getLogs({
-      address: dkgAddress,
+    const rawLogs = await this.fetchDkgEventLogs(
+      this.publicClient,
+      "Finalized",
       fromBlock,
-      toBlock: "latest",
-    });
+      toBlock,
+    );
 
     const parsed = parseEventLogs({
       abi: dkgAbi,
@@ -120,6 +168,10 @@ export class Observer {
     });
 
     if (parsed.length === 0) {
+      // Fallback: if no events in lookback window, try from block 0
+      if (!params?.fromBlock && fromBlock > 0n) {
+        return this.getFinalizedEvents({ fromBlock: 0n, toBlock });
+      }
       throw new Error("No Finalized event found — DKG may not have completed yet");
     }
 
@@ -135,22 +187,27 @@ export class Observer {
    * ```
    */
   async getGlobalPubKey(params?: { fromBlock?: bigint }): Promise<Uint8Array> {
-    const parsed = await this.getFinalizedEvents(params);
+    const toBlock = await this.publicClient.getBlockNumber();
+    const parsed = await this.getFinalizedEvents({ ...params, toBlock });
     const latest = parsed[parsed.length - 1];
     const rawPoint = toBytes(latest.args.globalPubKey);
 
     // Cross-validate against additional RPCs if configured
     if (this.validationClients?.length) {
       const primaryHex = toHex(rawPoint);
-      const dkgAddress = contractAddresses[this.network].dkg;
+      const fromBlock = params?.fromBlock ??
+        (toBlock > Observer.DEFAULT_LOOKBACK_BLOCKS
+          ? toBlock - Observer.DEFAULT_LOOKBACK_BLOCKS
+          : 0n);
 
       const settled = await Promise.allSettled(
         this.validationClients.map(async (client) => {
-          const logs = await client.getLogs({
-            address: dkgAddress,
-            fromBlock: params?.fromBlock ?? BigInt(0),
-            toBlock: "latest",
-          });
+          const logs = await this.fetchDkgEventLogs(
+            client,
+            "Finalized",
+            fromBlock,
+            toBlock,
+          );
           const events = parseEventLogs({ abi: dkgAbi, logs, eventName: "Finalized" });
           if (events.length === 0) return null;
           return events[events.length - 1].args.globalPubKey;
@@ -234,14 +291,18 @@ export class Observer {
     fromBlock?: bigint;
     round?: number;
   }): Promise<Map<string, Uint8Array>> {
-    const dkgAddress = contractAddresses[this.network].dkg;
-    const fromBlock = params?.fromBlock ?? BigInt(0);
+    const toBlock = await this.publicClient.getBlockNumber();
+    const fromBlock = params?.fromBlock ??
+      (toBlock > Observer.DEFAULT_LOOKBACK_BLOCKS
+        ? toBlock - Observer.DEFAULT_LOOKBACK_BLOCKS
+        : 0n);
 
-    const rawLogs = await this.publicClient.getLogs({
-      address: dkgAddress,
+    const rawLogs = await this.fetchDkgEventLogs(
+      this.publicClient,
+      "Registered",
       fromBlock,
-      toBlock: "latest",
-    });
+      toBlock,
+    );
 
     const parsed = parseEventLogs({
       abi: dkgAbi,
