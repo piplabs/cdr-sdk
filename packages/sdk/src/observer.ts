@@ -324,6 +324,63 @@ export class Observer {
   }
 
   /**
+   * Get validator attestation reports (raw SGX quotes) from DKG Registered events.
+   * Returns a map of validator address → enclaveReport bytes (most recent per validator).
+   *
+   * Use with `verifyAttestation()` to verify each validator's TEE enclave
+   * before trusting their partial decryptions.
+   *
+   * @example
+   * ```ts
+   * import { verifyAttestation } from "@piplabs/cdr-sdk";
+   * const attestations = await observer.getValidatorAttestations();
+   * for (const [addr, report] of attestations) {
+   *   const result = await verifyAttestation(report, { expectedMrEnclave: "0x..." });
+   *   console.log(addr, result.valid);
+   * }
+   * ```
+   */
+  async getValidatorAttestations(params?: {
+    fromBlock?: bigint;
+    round?: number;
+  }): Promise<Map<string, Uint8Array>> {
+    const toBlock = await this.publicClient.getBlockNumber();
+    const fromBlock = params?.fromBlock ??
+      (toBlock > Observer.DEFAULT_LOOKBACK_BLOCKS
+        ? toBlock - Observer.DEFAULT_LOOKBACK_BLOCKS
+        : 0n);
+
+    const rawLogs = await this.fetchDkgEventLogs(
+      this.publicClient,
+      "Registered",
+      fromBlock,
+      toBlock,
+    );
+
+    const parsed = parseEventLogs({
+      abi: dkgAbi,
+      logs: rawLogs,
+      eventName: "Registered",
+    });
+
+    const attestations = new Map<string, Uint8Array>();
+    for (const log of parsed) {
+      if (params?.round !== undefined && log.args.round !== params.round) {
+        continue;
+      }
+      const addr = log.args.validatorAddr.toLowerCase() as `0x${string}`;
+      attestations.set(addr, toBytes(log.args.enclaveReport));
+    }
+
+    // Fallback: if lookback window found nothing, scan from block 0
+    if (attestations.size === 0 && fromBlock > 0n) {
+      return this.getValidatorAttestations({ fromBlock: 0n, round: params?.round });
+    }
+
+    return attestations;
+  }
+
+  /**
    * Get the maximum allowed encrypted data size for vault writes.
    * @example
    * ```ts
