@@ -1,14 +1,19 @@
-import { parseEventLogs, toHex, type PublicClient, type WalletClient } from "viem";
+import { parseEventLogs, toHex, toBytes, type PublicClient, type WalletClient } from "viem";
 import { cdrAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
-import { tdh2Encrypt, encryptFile, type TDH2Ciphertext } from "@piplabs/cdr-crypto";
+import { tdh2Encrypt, encryptFile, getWasm, type TDH2Ciphertext } from "@piplabs/cdr-crypto";
 import { uuidToLabel } from "./label.js";
-import { ContentSizeExceededError } from "./errors.js";
+import { ContentSizeExceededError, LabelMismatchError, InvalidConditionContractError } from "./errors.js";
 import type { StorageProvider } from "./storage/types.js";
 
 export class Uploader {
   private publicClient: PublicClient;
   private walletClient: WalletClient;
   private network: Network;
+
+  /** Alias for {@link uploadCDR} */
+  createVault: Uploader["uploadCDR"];
+  /** Alias for {@link uploadFile} */
+  createFileVault: Uploader["uploadFile"];
 
   constructor(params: {
     network: Network;
@@ -18,9 +23,21 @@ export class Uploader {
     this.publicClient = params.publicClient;
     this.walletClient = params.walletClient;
     this.network = params.network;
+    this.createVault = this.uploadCDR.bind(this);
+    this.createFileVault = this.uploadFile.bind(this);
   }
 
-  /** Encrypt a data key using TDH2 to the DKG global public key */
+  /**
+   * Encrypt a data key using TDH2 to the DKG global public key.
+   * @example
+   * ```ts
+   * const ciphertext = await uploader.encryptDataKey({
+   *   dataKey: new TextEncoder().encode("secret"),
+   *   globalPubKey,
+   *   label: uuidToLabel(uuid),
+   * });
+   * ```
+   */
   async encryptDataKey(params: {
     dataKey: Uint8Array;
     globalPubKey: Uint8Array;
@@ -33,7 +50,19 @@ export class Uploader {
     });
   }
 
-  /** Allocate a new vault on-chain. Auto-queries allocation fee unless feeOverride is provided. */
+  /**
+   * Allocate a new vault on-chain. Auto-queries allocation fee unless feeOverride is provided.
+   * @example
+   * ```ts
+   * const { uuid, txHash } = await uploader.allocate({
+   *   updatable: false,
+   *   writeConditionAddr: "0x...",
+   *   readConditionAddr: "0x...",
+   *   writeConditionData: "0x",
+   *   readConditionData: "0x",
+   * });
+   * ```
+   */
   async allocate(params: {
     updatable: boolean;
     writeConditionAddr: `0x${string}`;
@@ -41,11 +70,20 @@ export class Uploader {
     writeConditionData: `0x${string}`;
     readConditionData: `0x${string}`;
     feeOverride?: bigint;
-    // TODO: In the future, add a `validateConditions: boolean` param
-    // to check for the existence of the required method signatures
-    // (checkWriteCondition / checkReadCondition) on the condition
-    // contract addresses before submitting the transaction.
+    /** Skip condition contract interface validation (default: false). */
+    skipConditionValidation?: boolean;
   }): Promise<{ txHash: `0x${string}`; uuid: number }> {
+    const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as const;
+
+    if (!params.skipConditionValidation) {
+      if (params.writeConditionAddr !== ZERO_ADDRESS) {
+        await this.validateConditionContract(params.writeConditionAddr, "write");
+      }
+      if (params.readConditionAddr !== ZERO_ADDRESS) {
+        await this.validateConditionContract(params.readConditionAddr, "read");
+      }
+    }
+
     const cdrAddress = contractAddresses[this.network].cdr;
 
     const fee = params.feeOverride ?? await this.publicClient.readContract({
@@ -76,13 +114,41 @@ export class Uploader {
     return { txHash, uuid };
   }
 
-  /** Write encrypted data to an existing vault. Auto-queries write fee. */
+  /**
+   * Write encrypted data to an existing vault. Auto-queries write fee.
+   * @example
+   * ```ts
+   * const { txHash } = await uploader.write({
+   *   uuid: 42,
+   *   accessAuxData: "0x",
+   *   encryptedData: "0x...",
+   * });
+   * ```
+   */
   async write(params: {
     uuid: number;
     accessAuxData: `0x${string}`;
     encryptedData: `0x${string}`;
     feeOverride?: bigint;
+    /** Skip label binding validation (default: false). */
+    skipLabelValidation?: boolean;
   }): Promise<{ txHash: `0x${string}` }> {
+    // Label binding validation: extract the label from the serialized TDH2
+    // ciphertext via WASM and compare against the expected UUID-derived label.
+    if (!params.skipLabelValidation) {
+      const expectedLabel = uuidToLabel(params.uuid);
+      const rawBytes = toBytes(params.encryptedData);
+      const wasm = getWasm();
+      if (wasm && rawBytes.length > 0) {
+        const actualLabel = wasm.tdh2ExtractLabel(rawBytes);
+        if (actualLabel.length > 0 &&
+            (actualLabel.length !== expectedLabel.length ||
+             !actualLabel.every((b, i) => b === expectedLabel[i]))) {
+          throw new LabelMismatchError(toHex(expectedLabel), toHex(actualLabel));
+        }
+      }
+    }
+
     const cdrAddress = contractAddresses[this.network].cdr;
 
     const fee = params.feeOverride ?? await this.publicClient.readContract({
@@ -106,7 +172,23 @@ export class Uploader {
     return { txHash };
   }
 
-  /** Convenience: allocate vault to get UUID, encrypt data key with UUID-derived label, and write encrypted data in one call */
+  /**
+   * Convenience: allocate vault, encrypt data key with UUID-derived label, and write in one call.
+   * @example
+   * ```ts
+   * const result = await uploader.uploadCDR({
+   *   dataKey: new TextEncoder().encode("secret"),
+   *   globalPubKey,
+   *   updatable: false,
+   *   writeConditionAddr: writeCondition.address,
+   *   readConditionAddr: readCondition.address,
+   *   writeConditionData: writeCondition.conditionData,
+   *   readConditionData: readCondition.conditionData,
+   *   accessAuxData: "0x",
+   * });
+   * console.log("UUID:", result.uuid);
+   * ```
+   */
   async uploadCDR(params: {
     dataKey: Uint8Array;
     globalPubKey: Uint8Array;
@@ -157,7 +239,24 @@ export class Uploader {
     };
   }
 
-  /** Encrypt a file, upload to storage, and write CID + key reference to a new vault */
+  /**
+   * Encrypt a file, upload to storage, and write CID + key reference to a new vault.
+   * @example
+   * ```ts
+   * const result = await uploader.uploadFile({
+   *   content: fileBytes,
+   *   storageProvider,
+   *   globalPubKey,
+   *   updatable: false,
+   *   writeConditionAddr: "0x...",
+   *   readConditionAddr: "0x...",
+   *   writeConditionData: "0x",
+   *   readConditionData: "0x",
+   *   accessAuxData: "0x",
+   * });
+   * console.log("CID:", result.cid);
+   * ```
+   */
   async uploadFile(params: {
     content: Uint8Array;
     storageProvider: StorageProvider;
@@ -234,6 +333,44 @@ export class Uploader {
       ciphertext,
       txHashes: { allocate: allocateTx, write: writeTx },
     };
+  }
+
+  private async validateConditionContract(
+    address: `0x${string}`,
+    type: "write" | "read",
+  ): Promise<void> {
+    const functionName = type === "write" ? "checkWriteCondition" : "checkReadCondition";
+    const conditionAbi = [{
+      type: "function" as const,
+      name: functionName,
+      inputs: [
+        { name: "caller", type: "address" },
+        { name: "conditionData", type: "bytes" },
+        { name: "accessAuxData", type: "bytes" },
+      ],
+      outputs: [{ name: "", type: "bool" }],
+      stateMutability: "view" as const,
+    }];
+
+    try {
+      await this.publicClient.simulateContract({
+        address,
+        abi: conditionAbi,
+        functionName,
+        args: [
+          "0x0000000000000000000000000000000000000000",
+          "0x",
+          "0x",
+        ],
+      });
+    } catch (e: any) {
+      // A revert inside the function body means the function exists — contract is valid.
+      // Only throw if the function selector itself is missing (zero data / execution error).
+      if (e?.cause?.name === "ContractFunctionRevertedError") {
+        return; // Function exists but reverted with dummy args — expected
+      }
+      throw new InvalidConditionContractError(address, type);
+    }
   }
 
   private parseVaultAllocatedUuid(logs: any[]): number {

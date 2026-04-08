@@ -30,6 +30,54 @@ export class ContractRevertError extends CDRError {
   }
 }
 
+export class InvalidParamsError extends CDRError {
+  constructor(message: string) {
+    super(message, "INVALID_PARAMS");
+  }
+}
+
+export class ObserverRequiredError extends CDRError {
+  constructor() {
+    super("globalPubKey and threshold are required when no Observer is configured", "OBSERVER_REQUIRED");
+  }
+}
+
+export class CidIntegrityError extends CDRError {
+  constructor(expected: string, actual: string) {
+    super(
+      `CID integrity check failed: expected ${expected}, got ${actual}`,
+      "CID_INTEGRITY",
+    );
+  }
+}
+
+export class RpcConsensusError extends CDRError {
+  constructor(field: string) {
+    super(
+      `RPC consensus failure: ${field} returned different values across providers`,
+      "RPC_CONSENSUS",
+    );
+  }
+}
+
+export class InvalidConditionContractError extends CDRError {
+  constructor(address: string, type: "write" | "read") {
+    super(
+      `${type} condition contract at ${address} does not implement the required interface`,
+      "INVALID_CONDITION_CONTRACT",
+    );
+  }
+}
+
+export class LabelMismatchError extends CDRError {
+  constructor(expected: string, actual: string) {
+    super(
+      `TDH2 ciphertext label mismatch: expected ${expected}, got ${actual}`,
+      "LABEL_MISMATCH",
+    );
+  }
+}
+
 export class ContentSizeExceededError extends CDRError {
   actual: number;
   max: bigint;

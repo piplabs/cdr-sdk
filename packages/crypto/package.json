@@ -11,10 +11,10 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "@ethereumjs/rlp": "^10.1.1",
-    "@noble/ciphers": "^2.1.1",
-    "@noble/curves": "^1.6",
-    "@noble/hashes": "^2.0.1"
+    "@ethereumjs/rlp": "10.1.1",
+    "@noble/ciphers": "2.1.1",
+    "@noble/curves": "1.6.0",
+    "@noble/hashes": "2.0.1"
   },
   "devDependencies": {
     "typescript": "^5.5",

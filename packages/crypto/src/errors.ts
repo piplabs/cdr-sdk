@@ -19,6 +19,15 @@ export class InvalidCiphertextError extends CDRCryptoError {
   }
 }
 
+export class WasmIntegrityError extends CDRCryptoError {
+  constructor(expected: string, actual: string) {
+    super(
+      `WASM binary hash mismatch: expected ${expected}, got ${actual}`,
+      "WASM_INTEGRITY",
+    );
+  }
+}
+
 export class InsufficientPartialsError extends CDRCryptoError {
   constructor(have: number, need: number) {
     super(`Insufficient partials: have ${have}, need ${need}`, "INSUFFICIENT_PARTIALS");

@@ -9,6 +9,8 @@
  */
 
 import createCbMpcModule from "./cb-mpc-tdh2.js";
+import { WASM_MANIFEST } from "./manifest.js";
+import { WasmIntegrityError } from "../errors.js";
 
 /** Opaque WASM module instance */
 interface EmscriptenModule {
@@ -29,6 +31,7 @@ interface EmscriptenModule {
   ): number;
   _wasm_ac_new_node(nodeType: number, namePtr: number, nameSize: number, threshold: number): number;
   _wasm_ac_add_child(parent: number, child: number): void;
+  _wasm_ac_set_node_pid(handle: number, pid: number): void;
   _wasm_ac_new(root: number, curveCode: number): number;
   _wasm_ac_free(handle: number): void;
   _wasm_tdh2_combine(
@@ -40,7 +43,9 @@ interface EmscriptenModule {
     partialsData: number, partialsSizes: number,
     outPtrPtr: number, outSizePtr: number,
   ): number;
+  _wasm_tdh2_extract_label(ctPtr: number, ctSize: number, outPtrPtr: number, outSizePtr: number): number;
   _wasm_ptr_size(): number;
+  _wasm_seed_random(data: number, size: number): void;
   HEAPU8: Uint8Array;
   HEAP32: Int32Array;
   getValue(ptr: number, type: string): number;
@@ -175,6 +180,14 @@ export class CbMpcWasm {
       const namePtr = this.allocBytes(namesBufs[i]);
       const leafHandle = M._wasm_ac_new_node(NODE_LEAF, namePtr, namesBufs[i].length, 0);
       M._free(namePtr);
+      // Set explicit PID on each leaf node — the name is the string
+      // representation of the validator's integer PID (e.g. "1", "2", "3").
+      // Without this, the C++ layer hashes the name to derive a PID, which
+      // won't match the integer PIDs used during DKG secret sharing.
+      const pid = parseInt(names[i], 10);
+      if (!isNaN(pid)) {
+        M._wasm_ac_set_node_pid(leafHandle, pid);
+      }
       M._wasm_ac_add_child(rootHandle, leafHandle);
     }
 
@@ -217,6 +230,29 @@ export class CbMpcWasm {
     }
   }
 
+  /**
+   * Extract the label (associated data) from a serialized TDH2 ciphertext.
+   *
+   * @param ciphertext  Serialized TDH2 ciphertext bytes
+   * @returns The label bytes embedded in the ciphertext
+   */
+  tdh2ExtractLabel(ciphertext: Uint8Array): Uint8Array {
+    const M = this.M;
+
+    const ctPtr = this.allocBytes(ciphertext);
+    const outPtrPtr = M._malloc(4);
+    const outSizePtr = M._malloc(4);
+    try {
+      const rv = M._wasm_tdh2_extract_label(ctPtr, ciphertext.length, outPtrPtr, outSizePtr);
+      if (rv !== 0) throw new Error(`wasm_tdh2_extract_label failed: ${rv}`);
+      return this.readResult(outPtrPtr, outSizePtr);
+    } finally {
+      M._free(ctPtr);
+      M._free(outPtrPtr);
+      M._free(outSizePtr);
+    }
+  }
+
   private allocBytes(data: Uint8Array): number {
     const ptr = this.M._malloc(data.length);
     this.M.HEAPU8.set(data, ptr);
@@ -250,18 +286,69 @@ export class CbMpcWasm {
 
 let wasmInstance: CbMpcWasm | null = null;
 
+async function verifyWasmHash(): Promise<void> {
+  const wasmUrl = new URL("cb-mpc-tdh2.wasm", import.meta.url);
+  let wasmBytes: ArrayBuffer;
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const g = globalThis as any;
+  if (g.process?.versions?.node) {
+    // Dynamic import with variable to prevent TS from resolving node modules
+    const nodeFs = "node:fs";
+    const nodeUrl = "node:url";
+    const fs: any = await import(nodeFs);
+    const url: any = await import(nodeUrl);
+    const buf = fs.readFileSync(url.fileURLToPath(wasmUrl));
+    wasmBytes = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+  } else {
+    const response = await fetch(wasmUrl.href);
+    wasmBytes = await response.arrayBuffer();
+  }
+
+  const hashBuffer = await globalThis.crypto.subtle.digest("SHA-256", wasmBytes);
+  const hashArray = new Uint8Array(hashBuffer);
+  const actual = Array.from(hashArray).map(b => b.toString(16).padStart(2, "0")).join("");
+  const expected = WASM_MANIFEST["cb-mpc-tdh2.wasm"];
+
+  if (actual !== expected) {
+    throw new WasmIntegrityError(expected, actual);
+  }
+}
+
 /**
  * Initialize the WASM module. Must be called once before using tdh2Encrypt/tdh2Combine.
  * Subsequent calls are no-ops and return immediately.
+ *
+ * @param options.skipHashCheck - If true, skip SHA-256 verification of the WASM binary (default: false)
  */
-export async function initWasm(): Promise<void> {
+export async function initWasm(options?: { skipHashCheck?: boolean }): Promise<void> {
   if (wasmInstance) return;
+
+  if (options?.skipHashCheck) {
+    console.warn("[cdr-crypto] WASM hash verification skipped. Do NOT use skipHashCheck in production.");
+  } else {
+    await verifyWasmHash();
+  }
 
   const Module = await createCbMpcModule() as unknown as EmscriptenModule;
 
   const ptrSize = Module._wasm_ptr_size();
   if (ptrSize !== 4) {
     console.warn(`Unexpected WASM pointer size: ${ptrSize} (expected 4)`);
+  }
+
+  // Seed OpenSSL's RNG — WASM has no OS entropy source
+  if (typeof Module._wasm_seed_random === "function") {
+    const entropy = globalThis.crypto.getRandomValues(new Uint8Array(64));
+    const seedPtr = Module._malloc(entropy.length);
+    try {
+      Module.HEAPU8.set(entropy, seedPtr);
+      Module._wasm_seed_random(seedPtr, entropy.length);
+    } finally {
+      Module._free(seedPtr);
+    }
+  } else {
+    console.warn("WASM module does not export _wasm_seed_random — OpenSSL RNG is unseeded");
   }
 
   wasmInstance = new CbMpcWasm(Module);

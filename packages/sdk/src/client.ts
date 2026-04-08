@@ -1,4 +1,4 @@
-import type { PublicClient, WalletClient } from "viem";
+import { createPublicClient, http, type PublicClient, type WalletClient } from "viem";
 import type { Network } from "@piplabs/cdr-contracts";
 import { Uploader } from "./uploader.js";
 import { Consumer } from "./consumer.js";
@@ -14,14 +14,27 @@ export class CDRClient {
     network: Network;
     publicClient: PublicClient;
     walletClient?: WalletClient;
+    /** Minimum threshold ratio override (0-1). The effective threshold is max(contract threshold, ceil(participants * minThresholdRatio)). */
+    minThresholdRatio?: number;
+    /** Additional RPC URLs for cross-validating critical on-chain reads (e.g., DKG global public key). */
+    validationRpcUrls?: string[];
   }) {
     const { network, publicClient, walletClient } = params;
 
-    this.observer = new Observer({ network, publicClient });
+    const validationClients = params.validationRpcUrls?.map(url =>
+      createPublicClient({ transport: http(url) }),
+    );
+
+    this.observer = new Observer({
+      network,
+      publicClient,
+      minThresholdRatio: params.minThresholdRatio,
+      validationClients,
+    });
 
     if (walletClient) {
       this._uploader = new Uploader({ network, publicClient, walletClient });
-      this._consumer = new Consumer({ network, publicClient, walletClient });
+      this._consumer = new Consumer({ network, publicClient, walletClient, observer: this.observer });
     } else {
       this._uploader = null;
       this._consumer = null;

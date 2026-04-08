@@ -1,27 +1,49 @@
-import { parseEventLogs, toBytes, fromHex, type PublicClient, type WalletClient } from "viem";
+import { parseEventLogs, toBytes, toHex, fromHex, type PublicClient, type WalletClient } from "viem";
 import { cdrAbi, dkgAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
-import { decryptPartial as eciesDecrypt, tdh2Combine, verifyPartialSignature, decryptFile, type TDH2Ciphertext, type DecryptedPartial } from "@piplabs/cdr-crypto";
-import { PartialCollectionTimeoutError } from "./errors.js";
+import { decryptPartial as eciesDecrypt, tdh2Combine, verifyPartialSignature, decryptFile, generateEphemeralKeyPair, type TDH2Ciphertext, type DecryptedPartial } from "@piplabs/cdr-crypto";
+import { PartialCollectionTimeoutError, InvalidParamsError, ObserverRequiredError, CidIntegrityError } from "./errors.js";
 import type { PartialDecryptionEvent } from "./types.js";
 import { uuidToLabel } from "./label.js";
 import type { StorageProvider } from "./storage/types.js";
+import { Observer } from "./observer.js";
+import type { AttestationConfig } from "./attestation.js";
 
 export class Consumer {
   private publicClient: PublicClient;
   private walletClient: WalletClient;
   private network: Network;
+  private observer: Observer | null;
+
+  /** Alias for {@link accessCDR} */
+  readVault: Consumer["accessCDR"];
+  /** Alias for {@link downloadFile} */
+  readFileVault: Consumer["downloadFile"];
 
   constructor(params: {
     network: Network;
     publicClient: PublicClient;
     walletClient: WalletClient;
+    observer?: Observer;
   }) {
     this.publicClient = params.publicClient;
     this.walletClient = params.walletClient;
     this.network = params.network;
+    this.observer = params.observer ?? null;
+    this.readVault = this.accessCDR.bind(this);
+    this.readFileVault = this.downloadFile.bind(this);
   }
 
-  /** Request a vault read. Auto-queries read fee. Emits VaultRead event for validators. */
+  /**
+   * Request a vault read. Auto-queries read fee. Emits VaultRead event for validators.
+   * @example
+   * ```ts
+   * const { txHash } = await consumer.read({
+   *   uuid: 42,
+   *   accessAuxData: "0x",
+   *   requesterPubKey: "0x04...",
+   * });
+   * ```
+   */
   async read(params: {
     uuid: number;
     accessAuxData: `0x${string}`;
@@ -49,13 +71,39 @@ export class Consumer {
     return { txHash };
   }
 
-  /** Fetch validator address → commPubKey map from DKG Registered events */
-  private async getCommPubKeyMap(): Promise<Map<string, Uint8Array>> {
-    const dkgAddress = contractAddresses[this.network].dkg;
+  /**
+   * Fetch validator address → commPubKey[] map from DKG Registered events.
+   * Each validator may re-register with a new commPubKey in each DKG round,
+   * so we keep all keys (most recent first) to handle round mismatch during
+   * signature verification.
+   */
+  /** Default lookback window: ~7 days at ~2 s/block. Matches Observer.DEFAULT_LOOKBACK_BLOCKS. */
+  private static readonly DEFAULT_LOOKBACK_BLOCKS = 302_400n;
 
+  private async getCommPubKeyMap(): Promise<Map<string, Uint8Array[]>> {
+    const dkgAddress = contractAddresses[this.network].dkg;
+    const latestBlock = await this.publicClient.getBlockNumber();
+    const fromBlock = latestBlock > Consumer.DEFAULT_LOOKBACK_BLOCKS
+      ? latestBlock - Consumer.DEFAULT_LOOKBACK_BLOCKS
+      : 0n;
+
+    const validators = await this.fetchRegisteredValidators(dkgAddress, fromBlock);
+
+    // Fallback: if lookback window found no validators, scan from block 0
+    if (validators.size === 0 && fromBlock > 0n) {
+      return this.fetchRegisteredValidators(dkgAddress, 0n);
+    }
+
+    return validators;
+  }
+
+  private async fetchRegisteredValidators(
+    dkgAddress: `0x${string}`,
+    fromBlock: bigint,
+  ): Promise<Map<string, Uint8Array[]>> {
     const rawLogs = await this.publicClient.getLogs({
       address: dkgAddress,
-      fromBlock: BigInt(0),
+      fromBlock,
       toBlock: "latest",
     });
 
@@ -65,10 +113,12 @@ export class Consumer {
       eventName: "Registered",
     });
 
-    const validators = new Map<string, Uint8Array>();
+    const validators = new Map<string, Uint8Array[]>();
     for (const log of parsed) {
       const addr = log.args.validatorAddr.toLowerCase() as `0x${string}`;
-      validators.set(addr, toBytes(log.args.enclaveCommKey));
+      const keys = validators.get(addr) ?? [];
+      keys.push(toBytes(log.args.enclaveCommKey));
+      validators.set(addr, keys);
     }
 
     return validators;
@@ -78,6 +128,15 @@ export class Consumer {
    * Poll for EncryptedPartialDecryptionSubmitted events until minPartials are collected.
    * Filters by uuid to match events for this specific vault read request.
    * Verifies each partial's TEE signature; invalid partials are skipped.
+   * @example
+   * ```ts
+   * const partials = await consumer.collectPartials({
+   *   uuid: 42,
+   *   minPartials: 3,
+   *   fromBlock: startBlock,
+   *   timeoutMs: 60_000,
+   * });
+   * ```
    */
   async collectPartials(params: {
     uuid: number;
@@ -87,6 +146,8 @@ export class Consumer {
     pollIntervalMs?: number;
     /** Called when a partial fails signature verification. If not provided, invalid partials are silently skipped. */
     onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
+    /** If provided, verify each validator's attestation report. Invalid attestations trigger onInvalidPartial. */
+    attestationConfig?: AttestationConfig;
   }): Promise<PartialDecryptionEvent[]> {
     const { uuid, minPartials, fromBlock, timeoutMs = 60_000, pollIntervalMs = 3_000, onInvalidPartial } = params;
     const cdrAddress = contractAddresses[this.network].cdr;
@@ -130,24 +191,29 @@ export class Consumer {
                 signature: log.args.signature,
               };
 
-              // Verify signature
+              // Verify signature — try all known commPubKeys for this validator
+              // (DKG round rotation may cause the signing key to differ from the latest registration)
               const validatorAddr = log.args.validator.toLowerCase();
-              const commPubKey = commPubKeyMap.get(validatorAddr);
+              const commPubKeys = commPubKeyMap.get(validatorAddr);
 
-              if (!commPubKey) {
+              if (!commPubKeys || commPubKeys.length === 0) {
                 onInvalidPartial?.(event, new Error(`unknown validator: ${log.args.validator}`));
                 continue;
               }
 
-              const valid = verifyPartialSignature({
-                round: event.round,
-                ciphertext: toBytes(log.args.ciphertext),
-                encryptedPartial: toBytes(event.encryptedPartial),
-                ephemeralPubKey: toBytes(event.ephemeralPubKey),
-                pubShare: toBytes(event.pubShare),
-                signature: toBytes(event.signature),
-                commPubKey,
-              });
+              let valid = false;
+              for (let ki = commPubKeys.length - 1; ki >= 0; ki--) {
+                valid = verifyPartialSignature({
+                  round: event.round,
+                  ciphertext: toBytes(log.args.ciphertext),
+                  encryptedPartial: toBytes(event.encryptedPartial),
+                  ephemeralPubKey: toBytes(event.ephemeralPubKey),
+                  pubShare: toBytes(event.pubShare),
+                  signature: toBytes(event.signature),
+                  commPubKey: commPubKeys[ki],
+                });
+                if (valid) break;
+              }
 
               if (!valid) {
                 onInvalidPartial?.(event, new Error(`invalid signature from validator ${log.args.validator}`));
@@ -170,7 +236,20 @@ export class Consumer {
     throw new PartialCollectionTimeoutError(collected.size, minPartials, timeoutMs);
   }
 
-  /** Decrypt collected partials and combine to recover the original data key */
+  /**
+   * Decrypt collected partials and combine to recover the original data key.
+   * @example
+   * ```ts
+   * const dataKey = await consumer.decryptDataKey({
+   *   ciphertext: { raw: encryptedData, label },
+   *   partials,
+   *   recipientPrivKey,
+   *   globalPubKey,
+   *   label,
+   *   threshold: 3,
+   * });
+   * ```
+   */
   async decryptDataKey(params: {
     ciphertext: TDH2Ciphertext;
     partials: PartialDecryptionEvent[];
@@ -205,69 +284,129 @@ export class Consumer {
     });
   }
 
-  /** Convenience: read + collect + decrypt in one call */
+  /**
+   * Convenience: read + collect + decrypt in one call.
+   * If requesterPubKey/recipientPrivKey are omitted, an ephemeral secp256k1 keypair is generated and the private key is zeroed after use.
+   * If globalPubKey/threshold are omitted, they are auto-queried via the Observer (requires observer to be set).
+   * @example
+   * ```ts
+   * // Simplified — keys and DKG params auto-managed:
+   * const { dataKey, txHash } = await consumer.accessCDR({
+   *   uuid: 42,
+   *   accessAuxData: "0x",
+   * });
+   * ```
+   */
   async accessCDR(params: {
     uuid: number;
     accessAuxData: `0x${string}`;
-    requesterPubKey: `0x${string}`;
-    recipientPrivKey: Uint8Array;
-    globalPubKey: Uint8Array;
-    threshold: number;
+    requesterPubKey?: `0x${string}`;
+    recipientPrivKey?: Uint8Array;
+    globalPubKey?: Uint8Array;
+    threshold?: number;
     timeoutMs?: number;
     feeOverride?: bigint;
     onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
   }): Promise<{ dataKey: Uint8Array; txHash: `0x${string}` }> {
-    const vault = await this.publicClient.readContract({
-      address: contractAddresses[this.network].cdr,
-      abi: cdrAbi,
-      functionName: "vaults",
-      args: [params.uuid],
-    });
-    const vaultResult = vault as { encryptedData: `0x${string}` };
-    const encryptedData = toBytes(vaultResult.encryptedData);
+    // Validate key pair: both must be provided or both omitted
+    if ((params.requesterPubKey && !params.recipientPrivKey) || (!params.requesterPubKey && params.recipientPrivKey)) {
+      throw new InvalidParamsError("requesterPubKey and recipientPrivKey must both be provided or both omitted");
+    }
 
-    const label = uuidToLabel(params.uuid);
+    // Auto-generate ephemeral keypair if not provided
+    let recipientPrivKey = params.recipientPrivKey;
+    let requesterPubKey = params.requesterPubKey;
+    let ephemeralGenerated = false;
+    if (!recipientPrivKey || !requesterPubKey) {
+      const kp = generateEphemeralKeyPair();
+      recipientPrivKey = kp.privateKey;
+      requesterPubKey = toHex(kp.publicKey);
+      ephemeralGenerated = true;
+    }
 
-    const fromBlock = await this.publicClient.getBlockNumber();
-    const { txHash } = await this.read({
-      uuid: params.uuid,
-      accessAuxData: params.accessAuxData,
-      requesterPubKey: params.requesterPubKey,
-      feeOverride: params.feeOverride,
-    });
+    // Auto-query globalPubKey and threshold from Observer if not provided
+    let globalPubKey = params.globalPubKey;
+    let threshold = params.threshold;
+    if (!globalPubKey || threshold === undefined) {
+      if (!this.observer) {
+        throw new ObserverRequiredError();
+      }
+      [globalPubKey, threshold] = await Promise.all([
+        globalPubKey ? Promise.resolve(globalPubKey) : this.observer.getGlobalPubKey(),
+        threshold !== undefined ? Promise.resolve(threshold) : this.observer.getThreshold(),
+      ]);
+    }
 
-    const partials = await this.collectPartials({
-      uuid: params.uuid,
-      minPartials: params.threshold,
-      fromBlock,
-      timeoutMs: params.timeoutMs,
-      onInvalidPartial: params.onInvalidPartial,
-    });
+    try {
+      const vault = await this.publicClient.readContract({
+        address: contractAddresses[this.network].cdr,
+        abi: cdrAbi,
+        functionName: "vaults",
+        args: [params.uuid],
+      });
+      const vaultResult = vault as { encryptedData: `0x${string}` };
+      const encryptedData = toBytes(vaultResult.encryptedData);
 
-    const dataKey = await this.decryptDataKey({
-      ciphertext: { raw: encryptedData, label },
-      partials,
-      recipientPrivKey: params.recipientPrivKey,
-      globalPubKey: params.globalPubKey,
-      label,
-      threshold: params.threshold,
-    });
+      const label = uuidToLabel(params.uuid);
 
-    return { dataKey, txHash };
+      const fromBlock = await this.publicClient.getBlockNumber();
+      const { txHash } = await this.read({
+        uuid: params.uuid,
+        accessAuxData: params.accessAuxData,
+        requesterPubKey,
+        feeOverride: params.feeOverride,
+      });
+
+      const partials = await this.collectPartials({
+        uuid: params.uuid,
+        minPartials: threshold,
+        fromBlock,
+        timeoutMs: params.timeoutMs,
+        onInvalidPartial: params.onInvalidPartial,
+      });
+
+      const dataKey = await this.decryptDataKey({
+        ciphertext: { raw: encryptedData, label },
+        partials,
+        recipientPrivKey,
+        globalPubKey,
+        label,
+        threshold,
+      });
+
+      return { dataKey, txHash };
+    } finally {
+      if (ephemeralGenerated && recipientPrivKey) {
+        recipientPrivKey.fill(0);
+      }
+    }
   }
 
-  /** Convenience: access vault, parse CID + key payload, download from storage, and decrypt file */
+  /**
+   * Convenience: access vault, parse CID + key payload, download from storage, and decrypt file.
+   * Key/threshold params are optional — see accessCDR() for auto-generation behavior.
+   * @example
+   * ```ts
+   * const { content, cid } = await consumer.downloadFile({
+   *   uuid: 42,
+   *   accessAuxData: "0x",
+   *   storageProvider,
+   * });
+   * ```
+   */
   async downloadFile(params: {
     uuid: number;
     accessAuxData: `0x${string}`;
-    requesterPubKey: `0x${string}`;
-    recipientPrivKey: Uint8Array;
-    globalPubKey: Uint8Array;
-    threshold: number;
+    requesterPubKey?: `0x${string}`;
+    recipientPrivKey?: Uint8Array;
+    globalPubKey?: Uint8Array;
+    threshold?: number;
     storageProvider: StorageProvider;
     timeoutMs?: number;
     feeOverride?: bigint;
     onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
+    /** Skip CID integrity verification of downloaded file (default: false). */
+    skipCidVerification?: boolean;
   }): Promise<{
     content: Uint8Array;
     cid: string;
@@ -294,7 +433,32 @@ export class Consumer {
     // Step 3: Download encrypted file from storage
     const encryptedFile = await params.storageProvider.download(cid);
 
-    // Step 4: Decrypt file
+    // Step 4: Verify CID integrity (if multiformats is available)
+    if (!params.skipCidVerification) {
+      let cidMod: any;
+      let hashMod: any;
+      try {
+        cidMod = await import("multiformats/cid");
+        hashMod = await import("multiformats/hashes/sha2");
+      } catch {
+        // multiformats not installed — skip verification
+      }
+
+      if (cidMod && hashMod) {
+        const CID = cidMod.CID;
+        const sha256 = hashMod.sha256;
+
+        const expectedCid = CID.parse(cid);
+        const hash = await sha256.digest(encryptedFile);
+        const actualCid = CID.create(expectedCid.version, expectedCid.code, hash);
+
+        if (!expectedCid.equals(actualCid)) {
+          throw new CidIntegrityError(cid, String(actualCid));
+        }
+      }
+    }
+
+    // Step 5: Decrypt file
     const content = decryptFile({ ciphertext: encryptedFile, key });
 
     return { content, cid, txHash };
