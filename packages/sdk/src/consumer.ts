@@ -87,6 +87,20 @@ export class Consumer {
       ? latestBlock - Consumer.DEFAULT_LOOKBACK_BLOCKS
       : 0n;
 
+    const validators = await this.fetchRegisteredValidators(dkgAddress, fromBlock);
+
+    // Fallback: if lookback window found no validators, scan from block 0
+    if (validators.size === 0 && fromBlock > 0n) {
+      return this.fetchRegisteredValidators(dkgAddress, 0n);
+    }
+
+    return validators;
+  }
+
+  private async fetchRegisteredValidators(
+    dkgAddress: `0x${string}`,
+    fromBlock: bigint,
+  ): Promise<Map<string, Uint8Array[]>> {
     const rawLogs = await this.publicClient.getLogs({
       address: dkgAddress,
       fromBlock,

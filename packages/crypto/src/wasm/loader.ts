@@ -324,7 +324,9 @@ async function verifyWasmHash(): Promise<void> {
 export async function initWasm(options?: { skipHashCheck?: boolean }): Promise<void> {
   if (wasmInstance) return;
 
-  if (!options?.skipHashCheck) {
+  if (options?.skipHashCheck) {
+    console.warn("[cdr-crypto] WASM hash verification skipped. Do NOT use skipHashCheck in production.");
+  } else {
     await verifyWasmHash();
   }
 
