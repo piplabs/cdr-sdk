@@ -141,7 +141,9 @@ export class Uploader {
       const wasm = getWasm();
       if (wasm && rawBytes.length > 0) {
         const actualLabel = wasm.tdh2ExtractLabel(rawBytes);
-        if (actualLabel.length > 0 && !actualLabel.every((b, i) => b === expectedLabel[i])) {
+        if (actualLabel.length > 0 &&
+            (actualLabel.length !== expectedLabel.length ||
+             !actualLabel.every((b, i) => b === expectedLabel[i]))) {
           throw new LabelMismatchError(toHex(expectedLabel), toHex(actualLabel));
         }
       }
