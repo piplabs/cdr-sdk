@@ -23,6 +23,10 @@ function buildMockQuote(opts?: {
   const size = opts?.size ?? SGX_MIN_QUOTE_SIZE;
   const buf = new Uint8Array(size);
 
+  // Set quote version to 3 (DCAP v3) — bytes 0-1 little-endian
+  buf[0] = 3;
+  buf[1] = 0;
+
   // Fill MRENCLAVE (32 bytes at offset 112)
   const mrEnclave = opts?.mrEnclave ?? new Uint8Array(32).fill(0xaa);
   buf.set(mrEnclave, MRENCLAVE_OFFSET);
