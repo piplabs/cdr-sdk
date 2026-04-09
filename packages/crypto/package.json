@@ -7,6 +7,7 @@
   "scripts": {
     "build": "tsc && cp src/wasm/cb-mpc-tdh2.js src/wasm/cb-mpc-tdh2.wasm dist/wasm/",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit"
   },
@@ -17,6 +18,7 @@
     "@noble/hashes": "2.0.1"
   },
   "devDependencies": {
+    "@vitest/coverage-v8": "^2",
     "typescript": "^5.5",
     "vitest": "^2"
   }

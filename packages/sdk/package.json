@@ -7,6 +7,7 @@
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit"
   },
@@ -15,21 +16,32 @@
     "@piplabs/cdr-crypto": "workspace:*"
   },
   "peerDependencies": {
-    "viem": "^2.21",
-    "helia": ">=5",
+    "@filoz/synapse-sdk": ">=0.1",
     "@helia/unixfs": ">=4",
     "@storacha/client": ">=1",
-    "@filoz/synapse-sdk": ">=0.1",
-    "multiformats": ">=13"
+    "helia": ">=5",
+    "multiformats": ">=13",
+    "viem": "^2.21"
   },
   "peerDependenciesMeta": {
-    "helia": { "optional": true },
-    "@helia/unixfs": { "optional": true },
-    "@storacha/client": { "optional": true },
-    "@filoz/synapse-sdk": { "optional": true },
-    "multiformats": { "optional": true }
+    "helia": {
+      "optional": true
+    },
+    "@helia/unixfs": {
+      "optional": true
+    },
+    "@storacha/client": {
+      "optional": true
+    },
+    "@filoz/synapse-sdk": {
+      "optional": true
+    },
+    "multiformats": {
+      "optional": true
+    }
   },
   "devDependencies": {
+    "@vitest/coverage-v8": "^2",
     "typescript": "^5.5",
     "viem": "^2.47.6",
     "vitest": "^2"

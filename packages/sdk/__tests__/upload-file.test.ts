@@ -4,6 +4,7 @@ import { encodeAbiParameters, keccak256, toBytes, toHex } from "viem";
 vi.mock("@piplabs/cdr-crypto", () => ({
   tdh2Encrypt: vi.fn(),
   encryptFile: vi.fn(),
+  getWasm: vi.fn().mockReturnValue(null),
 }));
 
 import { Uploader } from "../src/uploader.js";
@@ -50,6 +51,7 @@ function mockClients() {
   const publicClient = {
     readContract: vi.fn(),
     waitForTransactionReceipt: vi.fn(),
+    simulateContract: vi.fn().mockRejectedValue({ cause: { name: "ContractFunctionRevertedError" } }),
   } as any;
   const walletClient = {
     writeContract: vi.fn(),

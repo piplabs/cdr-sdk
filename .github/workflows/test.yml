@@ -1,0 +1,47 @@
+name: Unit Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+      - run: pnpm install
+      - run: pnpm build
+      - name: Run tests with coverage
+        run: pnpm test:coverage
+      - name: Generate coverage summary
+        if: always()
+        run: |
+          {
+            echo "## Unit Test Coverage"
+            echo ""
+            for pkg in packages/sdk packages/crypto; do
+              SUMMARY="$pkg/coverage/coverage-summary.json"
+              if [ -f "$SUMMARY" ]; then
+                PKG_NAME=$(basename $pkg)
+                STMTS=$(jq '.total.statements.pct' "$SUMMARY")
+                BRANCHES=$(jq '.total.branches.pct' "$SUMMARY")
+                FUNCS=$(jq '.total.functions.pct' "$SUMMARY")
+                LINES=$(jq '.total.lines.pct' "$SUMMARY")
+                echo "### $PKG_NAME"
+                echo "| Metric | Coverage |"
+                echo "| --- | --- |"
+                echo "| Statements | ${STMTS}% |"
+                echo "| Branches | ${BRANCHES}% |"
+                echo "| Functions | ${FUNCS}% |"
+                echo "| Lines | ${LINES}% |"
+                echo ""
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

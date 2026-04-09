@@ -4,6 +4,7 @@ import { encodeAbiParameters, keccak256, toBytes } from "viem";
 // Mock @piplabs/cdr-crypto before importing Uploader so the WASM loader is never executed.
 vi.mock("@piplabs/cdr-crypto", () => ({
   tdh2Encrypt: vi.fn(),
+  getWasm: vi.fn().mockReturnValue(null),
 }));
 
 import { Uploader } from "../src/uploader.js";
@@ -54,6 +55,7 @@ function mockClients() {
     readContract: vi.fn(),
     waitForTransactionReceipt: vi.fn(),
     getTransactionReceipt: vi.fn(),
+    simulateContract: vi.fn().mockRejectedValue({ cause: { name: "ContractFunctionRevertedError" } }),
   } as any;
   const walletClient = {
     writeContract: vi.fn(),
@@ -189,6 +191,7 @@ describe("Uploader", () => {
         writeConditionData: "0x",
         readConditionData: "0x",
         feeOverride: 0n,
+        skipConditionValidation: true,
       }),
     ).rejects.toThrow("VaultAllocated event not found in transaction logs");
   });
@@ -201,13 +204,14 @@ describe("Uploader", () => {
     const uploader = new Uploader({ network: "testnet", publicClient, walletClient });
     const dataKey = new Uint8Array([10, 20, 30]);
     const globalPubKey = new Uint8Array([99]);
-    const result = await uploader.encryptDataKey({ dataKey, globalPubKey, label: "test-label" });
+    const label = new TextEncoder().encode("test-label");
+    const result = await uploader.encryptDataKey({ dataKey, globalPubKey, label });
 
     expect(tdh2Encrypt).toHaveBeenCalledOnce();
     const callArgs = vi.mocked(tdh2Encrypt).mock.calls[0][0];
     expect(callArgs.plaintext).toBe(dataKey);
     expect(callArgs.globalPubKey).toBe(globalPubKey);
-    expect(callArgs.label).toEqual(new TextEncoder().encode("test-label"));
+    expect(callArgs.label).toEqual(label);
     expect(result).toBe(mockCiphertext);
   });
 });

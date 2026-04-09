@@ -6,6 +6,7 @@ function mockPublicClient(overrides: Record<string, any> = {}) {
   return {
     readContract: vi.fn(),
     getLogs: vi.fn(),
+    getBlockNumber: vi.fn().mockResolvedValue(1000n),
     ...overrides,
   } as any;
 }
@@ -146,7 +147,9 @@ describe("Observer", () => {
 
   it("getGlobalPubKey throws when no Finalized event found", async () => {
     const client = mockPublicClient();
-    client.getLogs.mockResolvedValueOnce([]);
+    // First call: lookback window search returns empty
+    // Second call: fallback from block 0 also returns empty
+    client.getLogs.mockResolvedValue([]);
 
     const observer = new Observer({ network: "testnet", publicClient: client });
 
