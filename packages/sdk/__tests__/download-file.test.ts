@@ -72,6 +72,7 @@ describe("Consumer.downloadFile", () => {
       globalPubKey: new Uint8Array(34),
       threshold: 2,
       storageProvider,
+      skipCidVerification: true,
     });
 
     // accessCDR was called
