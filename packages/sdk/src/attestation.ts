@@ -39,6 +39,7 @@ export interface AttestationResult {
 const SGX_QUOTE_HEADER_SIZE = 48;
 const SGX_REPORT_BODY_SIZE = 384;
 const SGX_MIN_QUOTE_SIZE = SGX_QUOTE_HEADER_SIZE + SGX_REPORT_BODY_SIZE; // 432
+const SGX_DCAP_V3_VERSION = 3; // Expected quote version (bytes 0-1, little-endian)
 
 // Offsets from start of quote (header + offset within report body)
 const MRENCLAVE_OFFSET = SGX_QUOTE_HEADER_SIZE + 64; // 112
@@ -69,6 +70,16 @@ export function parseSgxQuote(report: Uint8Array): {
   if (report.length < SGX_MIN_QUOTE_SIZE) {
     throw new Error(
       `Invalid SGX quote: ${report.length} bytes, minimum ${SGX_MIN_QUOTE_SIZE} required`,
+    );
+  }
+
+  // Validate quote version (bytes 0-1, little-endian). DCAP v3 = 0x0003.
+  // Quote v4 / TDX quotes have different report-body offsets and would
+  // produce incorrect MRENCLAVE/MRSIGNER if parsed with v3 offsets.
+  const quoteVersion = report[0] | (report[1] << 8);
+  if (quoteVersion !== SGX_DCAP_V3_VERSION) {
+    throw new Error(
+      `Unsupported SGX quote version: ${quoteVersion} (expected ${SGX_DCAP_V3_VERSION} for DCAP v3)`,
     );
   }
 

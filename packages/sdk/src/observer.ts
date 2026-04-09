@@ -372,8 +372,11 @@ export class Observer {
       attestations.set(addr, toBytes(log.args.enclaveReport));
     }
 
-    // Fallback: if lookback window found nothing, scan from block 0
-    if (attestations.size === 0 && fromBlock > 0n) {
+    // Fallback: if lookback window found nothing and the caller did NOT
+    // explicitly provide fromBlock, scan from block 0. When the caller
+    // passes an explicit fromBlock we respect their intent and do not
+    // silently expand the search scope.
+    if (attestations.size === 0 && !params?.fromBlock && fromBlock > 0n) {
       return this.getValidatorAttestations({ fromBlock: 0n, round: params?.round });
     }
 
