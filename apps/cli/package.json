@@ -1,6 +1,6 @@
 {
   "name": "@piplabs/cdr-cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "bin": {
     "cdr-cli": "dist/index.js"
