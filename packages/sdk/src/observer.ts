@@ -180,6 +180,48 @@ export class Observer {
   }
 
   /**
+   * Find the highest DKG round that has enough finalized participants to be
+   * considered "active". A round is active when its finalized count >=
+   * minReqFinalizedParticipants (on-chain threshold).
+   *
+   * This fixes issue #36: the previous logic used the latest Finalized event
+   * which could be from a failed round (not enough participants).
+   */
+  private async getActiveRound(
+    allEvents: Array<{ args: { round: number; globalPubKey: `0x${string}`; validatorAddr: `0x${string}` } }>,
+  ): Promise<{ round: number; events: typeof allEvents }> {
+    // Get the on-chain minimum finalized participants threshold
+    const minReq = await this.publicClient.readContract({
+      address: contractAddresses[this.network].dkg,
+      abi: dkgAbi,
+      functionName: "minReqFinalizedParticipants",
+    }) as bigint;
+    const minRequired = Number(minReq);
+
+    // Group events by round
+    const byRound = new Map<number, typeof allEvents>();
+    for (const e of allEvents) {
+      const round = e.args.round;
+      if (!byRound.has(round)) byRound.set(round, []);
+      byRound.get(round)!.push(e);
+    }
+
+    // Find the highest round that meets the threshold (descending order)
+    const rounds = [...byRound.keys()].sort((a, b) => b - a);
+    for (const round of rounds) {
+      const events = byRound.get(round)!;
+      if (events.length >= minRequired) {
+        return { round, events };
+      }
+    }
+
+    // Fallback: no round meets threshold — use the highest round available
+    // (this preserves backward compatibility for devnets with relaxed thresholds)
+    const highestRound = rounds[0];
+    return { round: highestRound, events: byRound.get(highestRound)! };
+  }
+
+  /**
    * Get the DKG global public key from the most recent Finalized event.
    * Returns the raw bytes of the globalPubKey (Ed25519 point with curve-code prefix).
    * @example
@@ -190,7 +232,11 @@ export class Observer {
   async getGlobalPubKey(params?: { fromBlock?: bigint }): Promise<Uint8Array> {
     const toBlock = await this.publicClient.getBlockNumber();
     const parsed = await this.getFinalizedEvents({ ...params, toBlock });
-    const latest = parsed[parsed.length - 1];
+
+    // Issue #36: Use the highest round that meets minReqFinalizedParticipants,
+    // not just the latest Finalized event (which could be from a failed round).
+    const { events: activeEvents } = await this.getActiveRound(parsed);
+    const latest = activeEvents[activeEvents.length - 1];
     const rawPoint = toBytes(latest.args.globalPubKey);
 
     // Cross-validate against additional RPCs if configured
@@ -245,8 +291,9 @@ export class Observer {
    */
   async getParticipantCount(params?: { fromBlock?: bigint }): Promise<number> {
     const parsed = await this.getFinalizedEvents(params);
-    const latestRound = parsed[parsed.length - 1].args.round;
-    return parsed.filter((e) => e.args.round === latestRound).length;
+    // Issue #36: Count participants from the active round, not just the latest round.
+    const { events: activeEvents } = await this.getActiveRound(parsed);
+    return activeEvents.length;
   }
 
   /**

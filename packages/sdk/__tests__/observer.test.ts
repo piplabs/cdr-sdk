@@ -132,12 +132,14 @@ describe("Observer", () => {
     expect(threshold).toBe(3n);
   });
 
-  it("getGlobalPubKey returns globalPubKey from latest Finalized event", async () => {
+  it("getGlobalPubKey returns globalPubKey from active round", async () => {
     const client = mockPublicClient();
     const expectedPubKey = "0xdeadbeefcafebabe";
     client.getLogs.mockResolvedValueOnce([
       makeFinalizedLog(expectedPubKey as `0x${string}`),
     ]);
+    // getActiveRound calls readContract for minReqFinalizedParticipants
+    client.readContract.mockResolvedValueOnce(1n);
 
     const observer = new Observer({ network: "testnet", publicClient: client });
     const pubKey = await observer.getGlobalPubKey();
@@ -158,7 +160,7 @@ describe("Observer", () => {
     );
   });
 
-  it("getGlobalPubKey uses the most recent Finalized event", async () => {
+  it("getGlobalPubKey uses the most recent Finalized event from active round", async () => {
     const client = mockPublicClient();
     const oldPubKey = "0xaaaa";
     const newPubKey = "0xbbbb";
@@ -166,6 +168,8 @@ describe("Observer", () => {
       makeFinalizedLog(oldPubKey as `0x${string}`),
       makeFinalizedLog(newPubKey as `0x${string}`),
     ]);
+    // getActiveRound: minReqFinalizedParticipants = 1 (both events are round 1, so 2 >= 1 → active)
+    client.readContract.mockResolvedValueOnce(1n);
 
     const observer = new Observer({ network: "testnet", publicClient: client });
     const pubKey = await observer.getGlobalPubKey();
