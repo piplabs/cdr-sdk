@@ -1,8 +1,8 @@
-import type { PublicClient, WalletClient } from "viem";
+import { createPublicClient, http, type PublicClient, type WalletClient } from "viem";
 import type { Network } from "@piplabs/cdr-contracts";
 import { Uploader } from "./uploader.js";
 import { Consumer } from "./consumer.js";
-import { Observer } from "./observer.js";
+import { Observer, type DkgSource } from "./observer.js";
 import { WalletClientRequiredError } from "./errors.js";
 
 export class CDRClient {
@@ -14,18 +14,34 @@ export class CDRClient {
     network: Network;
     publicClient: PublicClient;
     walletClient?: WalletClient;
-    /** Minimum threshold ratio override (0-1). The effective threshold is max(API threshold, ceil(participants * minThresholdRatio)). */
-    minThresholdRatio?: number;
-    /** Override the base path for DKG queries (defaults to "/api/dkg"). */
+    /**
+     * Which backend to use for DKG queries (globalPubKey, participant count,
+     * threshold, registered validators). Defaults to "evm-events" which scans
+     * DKG contract events via the provided publicClient. Use "cosmos-api"
+     * when the demo's /api/dkg routes (backed by CometBFT abci_query) are
+     * reachable — it avoids wide eth_getLogs ranges.
+     */
+    dkgSource?: DkgSource;
+    /** Override the base path for DKG queries when dkgSource === "cosmos-api" (defaults to "/api/dkg"). */
     dkgApiBase?: string;
+    /** Minimum threshold ratio override (0-1). The effective threshold is max(source threshold, ceil(participants * minThresholdRatio)). */
+    minThresholdRatio?: number;
+    /** Additional RPC URLs for cross-validating critical on-chain reads (used only in "evm-events" mode). */
+    validationRpcUrls?: string[];
   }) {
-    const { network, publicClient, walletClient, dkgApiBase } = params;
+    const { network, publicClient, walletClient, dkgApiBase, dkgSource } = params;
+
+    const validationClients = params.validationRpcUrls?.map(url =>
+      createPublicClient({ transport: http(url) }),
+    );
 
     this.observer = new Observer({
       network,
       publicClient,
-      minThresholdRatio: params.minThresholdRatio,
+      dkgSource,
       apiBase: dkgApiBase,
+      minThresholdRatio: params.minThresholdRatio,
+      validationClients,
     });
 
     if (walletClient) {

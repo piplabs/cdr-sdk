@@ -296,4 +296,159 @@ describe("Observer", () => {
     // Should be 2 (deduplicated), not 3 (raw count)
     expect(count).toBe(2);
   });
+
+  // --- Cosmos REST API mode (dkgSource: "cosmos-api") ---
+
+  describe("cosmos-api mode", () => {
+    function mockFetch(responses: Record<string, unknown>) {
+      return vi.fn(async (url: string) => {
+        for (const [path, body] of Object.entries(responses)) {
+          if (url.includes(path)) {
+            return {
+              ok: true,
+              status: 200,
+              statusText: "OK",
+              json: async () => body,
+              text: async () => JSON.stringify(body),
+            } as Response;
+          }
+        }
+        return {
+          ok: false,
+          status: 404,
+          statusText: "Not Found",
+          text: async () => "not found",
+        } as Response;
+      });
+    }
+
+    it("getGlobalPubKey fetches from /api/dkg/latest_active", async () => {
+      const client = mockPublicClient();
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = mockFetch({
+        latest_active: {
+          network: {
+            round: 7,
+            total: 3,
+            threshold: 2,
+            globalPublicKeyHex: "0x" + "ab".repeat(32),
+          },
+        },
+      }) as unknown as typeof fetch;
+
+      try {
+        const observer = new Observer({
+          network: "testnet",
+          publicClient: client,
+          dkgSource: "cosmos-api",
+          apiBase: "http://localhost:3000/api/dkg",
+        });
+        const pubKey = await observer.getGlobalPubKey();
+        // 2-byte curve prefix + 32-byte point
+        expect(pubKey.length).toBe(34);
+        expect(client.getLogs).not.toHaveBeenCalled();
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it("getParticipantCount and getThreshold read from cosmos API", async () => {
+      const client = mockPublicClient();
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = mockFetch({
+        latest_active: {
+          network: {
+            round: 7,
+            total: 5,
+            threshold: 3,
+            globalPublicKeyHex: "0x" + "cc".repeat(32),
+          },
+        },
+      }) as unknown as typeof fetch;
+
+      try {
+        const observer = new Observer({
+          network: "testnet",
+          publicClient: client,
+          dkgSource: "cosmos-api",
+          apiBase: "http://localhost:3000/api/dkg",
+        });
+        expect(await observer.getParticipantCount()).toBe(5);
+        expect(await observer.getThreshold()).toBe(3);
+        expect(client.getLogs).not.toHaveBeenCalled();
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it("minThresholdRatio override applies in cosmos-api mode", async () => {
+      const client = mockPublicClient();
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = mockFetch({
+        latest_active: {
+          network: {
+            round: 1,
+            total: 6,
+            threshold: 2, // API says 2, but ceil(6 * 0.67) = 5 takes precedence
+            globalPublicKeyHex: "0x" + "dd".repeat(32),
+          },
+        },
+      }) as unknown as typeof fetch;
+
+      try {
+        const observer = new Observer({
+          network: "testnet",
+          publicClient: client,
+          dkgSource: "cosmos-api",
+          minThresholdRatio: 0.67,
+        });
+        expect(await observer.getThreshold()).toBe(5);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it("getRegisteredValidators fetches from verified_registrations", async () => {
+      const client = mockPublicClient();
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = mockFetch({
+        latest_active: {
+          network: {
+            round: 4,
+            total: 1,
+            threshold: 1,
+            globalPublicKeyHex: "0x" + "ee".repeat(32),
+          },
+        },
+        verified_registrations: {
+          registrations: [
+            {
+              round: 4,
+              validatorAddr: "0xAAAAaaaaaaaaaAAAAaaaaaaAaaAaAaAaAAaAAaaA",
+              index: 0,
+              commPubKeyHex: "0x" + "11".repeat(64),
+              pubKeyShareHex: "0x",
+              status: 1,
+              codeCommitmentHex: "0x",
+            },
+          ],
+        },
+      }) as unknown as typeof fetch;
+
+      try {
+        const observer = new Observer({
+          network: "testnet",
+          publicClient: client,
+          dkgSource: "cosmos-api",
+        });
+        const validators = await observer.getRegisteredValidators();
+        expect(validators.size).toBe(1);
+        const key = validators.get("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        expect(key?.length).toBe(64);
+        expect(client.getLogs).not.toHaveBeenCalled();
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+  });
 });
