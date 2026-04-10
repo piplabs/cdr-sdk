@@ -198,12 +198,17 @@ export class Observer {
     }) as bigint;
     const minRequired = Number(minReq);
 
-    // Group events by round
+    // Group events by round, deduplicate by validatorAddr within each round
     const byRound = new Map<number, typeof allEvents>();
     for (const e of allEvents) {
       const round = e.args.round;
       if (!byRound.has(round)) byRound.set(round, []);
-      byRound.get(round)!.push(e);
+      const existing = byRound.get(round)!;
+      // Deduplicate: skip if this validator already has an event in this round
+      const alreadySeen = existing.some(
+        (prev) => prev.args.validatorAddr.toLowerCase() === e.args.validatorAddr.toLowerCase(),
+      );
+      if (!alreadySeen) existing.push(e);
     }
 
     // Find the highest round that meets the threshold (descending order)
@@ -215,9 +220,14 @@ export class Observer {
       }
     }
 
-    // Fallback: no round meets threshold — use the highest round available
-    // (this preserves backward compatibility for devnets with relaxed thresholds)
+    // Fallback: no round meets threshold — warn and use the highest round available.
+    // This preserves backward compatibility for devnets with relaxed thresholds,
+    // but signals that no round is confirmed active.
     const highestRound = rounds[0];
+    console.warn(
+      `[CDR SDK] Warning: no DKG round meets minReqFinalizedParticipants (${minRequired}). ` +
+      `Using highest round ${highestRound} as fallback. Data encrypted with this key may not be recoverable.`,
+    );
     return { round: highestRound, events: byRound.get(highestRound)! };
   }
 
@@ -257,7 +267,10 @@ export class Observer {
           );
           const events = parseEventLogs({ abi: dkgAbi, logs, eventName: "Finalized" });
           if (events.length === 0) return null;
-          return events[events.length - 1].args.globalPubKey;
+          // Use same getActiveRound logic as primary to avoid false-positive
+          // RpcConsensusError when the latest event is from a failed round
+          const { events: activeEvents } = await this.getActiveRound(events);
+          return activeEvents[activeEvents.length - 1].args.globalPubKey;
         }),
       );
 

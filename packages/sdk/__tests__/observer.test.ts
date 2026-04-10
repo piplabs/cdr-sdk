@@ -11,7 +11,11 @@ function mockPublicClient(overrides: Record<string, any> = {}) {
   } as any;
 }
 
-function makeFinalizedLog(globalPubKey: `0x${string}`, validator: `0x${string}` = "0x0000000000000000000000000000000000000001") {
+function makeFinalizedLog(
+  globalPubKey: `0x${string}`,
+  validator: `0x${string}` = "0x0000000000000000000000000000000000000001",
+  round: number = 1,
+) {
   const topic0 = keccak256(
     toBytes("Finalized(uint32,address,bytes32,bytes32,bytes32,bytes,bytes[],bytes,bytes)"),
   );
@@ -29,7 +33,7 @@ function makeFinalizedLog(globalPubKey: `0x${string}`, validator: `0x${string}` 
       { name: "signature", type: "bytes" },
     ],
     [
-      1,
+      round,
       "0x0000000000000000000000000000000000000000000000000000000000000000",
       "0x0000000000000000000000000000000000000000000000000000000000000000",
       "0x0000000000000000000000000000000000000000000000000000000000000000",
@@ -164,11 +168,12 @@ describe("Observer", () => {
     const client = mockPublicClient();
     const oldPubKey = "0xaaaa";
     const newPubKey = "0xbbbb";
+    // Two different validators in the same round — both counted
     client.getLogs.mockResolvedValueOnce([
-      makeFinalizedLog(oldPubKey as `0x${string}`),
-      makeFinalizedLog(newPubKey as `0x${string}`),
+      makeFinalizedLog(oldPubKey as `0x${string}`, "0x0000000000000000000000000000000000000001"),
+      makeFinalizedLog(newPubKey as `0x${string}`, "0x0000000000000000000000000000000000000002"),
     ]);
-    // getActiveRound: minReqFinalizedParticipants = 1 (both events are round 1, so 2 >= 1 → active)
+    // getActiveRound: minReqFinalizedParticipants = 1 (2 unique validators >= 1 → active)
     client.readContract.mockResolvedValueOnce(1n);
 
     const observer = new Observer({ network: "testnet", publicClient: client });
@@ -227,5 +232,68 @@ describe("Observer", () => {
     const validators = await observer.getRegisteredValidators();
 
     expect(validators.size).toBe(0);
+  });
+
+  // --- Multi-round tests for getActiveRound (Issue #36) ---
+
+  it("getGlobalPubKey skips failed round and uses active round", async () => {
+    const client = mockPublicClient();
+    const activeKey = "0xaaaa";
+    const failedKey = "0xbbbb";
+    // Round 1: 3 validators (meets threshold) — active round
+    // Round 2: 1 validator (below threshold) — failed round
+    client.getLogs.mockResolvedValueOnce([
+      makeFinalizedLog(activeKey as `0x${string}`, "0x0000000000000000000000000000000000000001", 1),
+      makeFinalizedLog(activeKey as `0x${string}`, "0x0000000000000000000000000000000000000002", 1),
+      makeFinalizedLog(activeKey as `0x${string}`, "0x0000000000000000000000000000000000000003", 1),
+      makeFinalizedLog(failedKey as `0x${string}`, "0x0000000000000000000000000000000000000001", 2),
+    ]);
+    // getActiveRound calls readContract for minReqFinalizedParticipants = 3
+    client.readContract.mockResolvedValueOnce(3n);
+
+    const observer = new Observer({ network: "testnet", publicClient: client });
+    const pubKey = await observer.getGlobalPubKey();
+
+    // Should return round 1's key (active), not round 2's (failed)
+    expect(toHex(pubKey)).toBe(activeKey);
+  });
+
+  it("getParticipantCount returns count from active round, not failed round", async () => {
+    const client = mockPublicClient();
+    // Round 1: 3 validators — active
+    // Round 2: 2 validators — failed (minReq=3)
+    client.getLogs.mockResolvedValueOnce([
+      makeFinalizedLog("0xaa" as `0x${string}`, "0x0000000000000000000000000000000000000001", 1),
+      makeFinalizedLog("0xaa" as `0x${string}`, "0x0000000000000000000000000000000000000002", 1),
+      makeFinalizedLog("0xaa" as `0x${string}`, "0x0000000000000000000000000000000000000003", 1),
+      makeFinalizedLog("0xbb" as `0x${string}`, "0x0000000000000000000000000000000000000001", 2),
+      makeFinalizedLog("0xbb" as `0x${string}`, "0x0000000000000000000000000000000000000002", 2),
+    ]);
+    // minReqFinalizedParticipants = 3
+    client.readContract.mockResolvedValueOnce(3n);
+
+    const observer = new Observer({ network: "testnet", publicClient: client });
+    const count = await observer.getParticipantCount();
+
+    // Should return 3 (round 1), not 2 (round 2)
+    expect(count).toBe(3);
+  });
+
+  it("getActiveRound deduplicates by validatorAddr", async () => {
+    const client = mockPublicClient();
+    // Round 1: same validator emits twice (duplicate/reorg)
+    client.getLogs.mockResolvedValueOnce([
+      makeFinalizedLog("0xcc" as `0x${string}`, "0x0000000000000000000000000000000000000001", 1),
+      makeFinalizedLog("0xcc" as `0x${string}`, "0x0000000000000000000000000000000000000001", 1), // duplicate
+      makeFinalizedLog("0xcc" as `0x${string}`, "0x0000000000000000000000000000000000000002", 1),
+    ]);
+    // minReqFinalizedParticipants = 3 — only 2 unique validators, should NOT meet threshold
+    client.readContract.mockResolvedValueOnce(3n);
+
+    const observer = new Observer({ network: "testnet", publicClient: client });
+    const count = await observer.getParticipantCount();
+
+    // Should be 2 (deduplicated), not 3 (raw count)
+    expect(count).toBe(2);
   });
 });
