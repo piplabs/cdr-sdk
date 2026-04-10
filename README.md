@@ -2,11 +2,6 @@
 
 TypeScript SDK for **Confidential Data Rails (CDR)** on Story L1. Encrypt data to a threshold DKG public key, store it in on-chain vaults, and recover it when a quorum of validators provide partial decryptions.
 
-## Installation
-
-```bash
-npm install @piplabs/cdr-sdk viem
-```
 
 ## Quick Start
 
