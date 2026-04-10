@@ -11,6 +11,55 @@ import { CURVE_ED25519 } from "@piplabs/cdr-crypto";
 import type { Vault } from "./types.js";
 import { RpcConsensusError } from "./errors.js";
 
+/**
+ * Which backend to use for DKG queries.
+ *
+ * - `evm-events`: scan DKG contract Finalized/Registered events via the
+ *   provided publicClient. Works against any EVM RPC.
+ * - `cosmos-api`: query the demo's Next.js /api/dkg routes, which use
+ *   CometBFT abci_query under the hood. Avoids wide eth_getLogs ranges.
+ */
+export type DkgSource = "evm-events" | "cosmos-api";
+
+// ---------------------------------------------------------------------------
+// Response shapes from /api/dkg/*
+// ---------------------------------------------------------------------------
+
+interface DKGNetworkJSON {
+  round: number;
+  startBlockHeight: string;
+  activeValSet: string[];
+  total: number;
+  threshold: number;
+  stage: number;
+  isResharing: boolean;
+  globalPublicKeyHex: string;
+  publicCoeffsHex: string[];
+  isUpgrade: boolean;
+}
+
+interface DKGRegistrationJSON {
+  round: number;
+  validatorAddr: string;
+  index: number;
+  commPubKeyHex: string;
+  pubKeyShareHex: string;
+  status: number;
+  codeCommitmentHex: string;
+}
+
+// ---------------------------------------------------------------------------
+
+/**
+ * Observer queries CDR contract state (EVM) and DKG module state.
+ *
+ * DKG state can come from two sources, selected via the `dkgSource` option:
+ *   - `evm-events` (default): scans DKG contract events via viem
+ *   - `cosmos-api`: queries the Next.js /api/dkg routes (CometBFT abci_query)
+ *
+ * CDR reads (vault, fees, maxEncryptedDataSize) and validator attestation
+ * reports always come from EVM — the cosmos API does not expose SGX quotes.
+ */
 export class Observer {
   /** Many RPCs reject or time out on wide eth_getLogs ranges; chunk to stay under typical caps. */
   private static readonly DKG_LOGS_BLOCK_CHUNK = 8192n;
@@ -20,20 +69,37 @@ export class Observer {
 
   private publicClient: PublicClient;
   private network: Network;
+  private dkgSource: DkgSource;
+  private apiBase: string;
   private minThresholdRatio?: number;
   private validationClients?: PublicClient[];
 
   constructor(params: {
     network: Network;
     publicClient: PublicClient;
+    /** DKG query backend. Defaults to `"evm-events"`. */
+    dkgSource?: DkgSource;
+    /**
+     * Base path for the demo's DKG API routes. Used only when
+     * `dkgSource === "cosmos-api"`. Defaults to "/api/dkg".
+     */
+    apiBase?: string;
+    /** Minimum threshold ratio override (0-1). */
     minThresholdRatio?: number;
+    /** Additional RPC clients for cross-validating critical on-chain reads (evm-events mode only). */
     validationClients?: PublicClient[];
   }) {
     this.publicClient = params.publicClient;
     this.network = params.network;
+    this.dkgSource = params.dkgSource ?? "evm-events";
+    this.apiBase = params.apiBase ?? "/api/dkg";
     this.minThresholdRatio = params.minThresholdRatio;
     this.validationClients = params.validationClients;
   }
+
+  // =======================================================================
+  // CDR contract reads (always EVM)
+  // =======================================================================
 
   /**
    * Get a vault's details by UUID.
@@ -53,13 +119,7 @@ export class Observer {
     return { uuid, ...result } as unknown as Vault;
   }
 
-  /**
-   * Get current allocation fee.
-   * @example
-   * ```ts
-   * const fee = await observer.getAllocateFee();
-   * ```
-   */
+  /** Get current allocation fee. */
   async getAllocateFee(): Promise<bigint> {
     return this.publicClient.readContract({
       address: contractAddresses[this.network].cdr,
@@ -68,13 +128,7 @@ export class Observer {
     });
   }
 
-  /**
-   * Get current write fee.
-   * @example
-   * ```ts
-   * const fee = await observer.getWriteFee();
-   * ```
-   */
+  /** Get current write fee. */
   async getWriteFee(): Promise<bigint> {
     return this.publicClient.readContract({
       address: contractAddresses[this.network].cdr,
@@ -83,13 +137,7 @@ export class Observer {
     });
   }
 
-  /**
-   * Get current read fee.
-   * @example
-   * ```ts
-   * const fee = await observer.getReadFee();
-   * ```
-   */
+  /** Get current read fee. */
   async getReadFee(): Promise<bigint> {
     return this.publicClient.readContract({
       address: contractAddresses[this.network].cdr,
@@ -98,13 +146,16 @@ export class Observer {
     });
   }
 
-  /**
-   * Get DKG operational threshold.
-   * @example
-   * ```ts
-   * const threshold = await observer.getOperationalThreshold();
-   * ```
-   */
+  /** Get the maximum allowed encrypted data size for vault writes. */
+  async getMaxEncryptedDataSize(): Promise<bigint> {
+    return this.publicClient.readContract({
+      address: contractAddresses[this.network].cdr,
+      abi: cdrAbi,
+      functionName: "maxEncryptedDataSize",
+    });
+  }
+
+  /** Get DKG operational threshold (basis-points constant from the DKG contract). */
   async getOperationalThreshold(): Promise<bigint> {
     return this.publicClient.readContract({
       address: contractAddresses[this.network].dkg,
@@ -113,9 +164,167 @@ export class Observer {
     });
   }
 
+  // =======================================================================
+  // DKG queries — dispatched to either EVM events or cosmos REST API
+  // =======================================================================
+
   /**
-   * Fetch DKG logs for a single event type in block chunks (avoids RPC range / size limits).
+   * Get the DKG global public key from the active round.
+   * Returns the raw bytes of the globalPubKey (Ed25519 point with curve-code prefix).
+   * @example
+   * ```ts
+   * const globalPubKey = await observer.getGlobalPubKey();
+   * ```
    */
+  async getGlobalPubKey(params?: { fromBlock?: bigint }): Promise<Uint8Array> {
+    const rawPoint =
+      this.dkgSource === "cosmos-api"
+        ? await this.getGlobalPubKeyFromCosmos()
+        : await this.getGlobalPubKeyFromEvents(params);
+
+    // Both sources return the raw 32-byte Ed25519 point. The WASM TDH2
+    // functions expect a 2-byte curve-code prefix (0x043f for Ed25519).
+    if (rawPoint.length === 32) {
+      const prefixed = new Uint8Array(34);
+      prefixed[0] = (CURVE_ED25519 >> 8) & 0xff; // 0x04
+      prefixed[1] = CURVE_ED25519 & 0xff;         // 0x3f
+      prefixed.set(rawPoint, 2);
+      return prefixed;
+    }
+
+    return rawPoint;
+  }
+
+  /**
+   * Get the number of participants in the active DKG round.
+   * @example
+   * ```ts
+   * const count = await observer.getParticipantCount();
+   * ```
+   */
+  async getParticipantCount(params?: { fromBlock?: bigint }): Promise<number> {
+    if (this.dkgSource === "cosmos-api") {
+      const network = await this.getLatestActiveNetwork();
+      return network.total;
+    }
+    const parsed = await this.getFinalizedEvents(params);
+    const { events } = await this.getActiveRound(parsed);
+    return events.length;
+  }
+
+  /**
+   * Get the absolute threshold (minimum number of partial decryptions needed).
+   * - In `evm-events` mode: computes `ceil(participants * operationalThreshold / 1000)`.
+   * - In `cosmos-api` mode: reads `threshold` directly from DKG network state.
+   * If `minThresholdRatio` was set, returns `max(sourceThreshold, ceil(participants * minThresholdRatio))`.
+   */
+  async getThreshold(params?: { fromBlock?: bigint }): Promise<number> {
+    let sourceThreshold: number;
+    let participantCount: number;
+
+    if (this.dkgSource === "cosmos-api") {
+      const network = await this.getLatestActiveNetwork();
+      sourceThreshold = network.threshold;
+      participantCount = network.total;
+    } else {
+      const [operationalThreshold, count] = await Promise.all([
+        this.getOperationalThreshold(),
+        this.getParticipantCount(params),
+      ]);
+      participantCount = count;
+      sourceThreshold = Math.ceil(
+        participantCount * Number(operationalThreshold) / 1000,
+      );
+    }
+
+    if (this.minThresholdRatio !== undefined) {
+      const overrideThreshold = Math.ceil(participantCount * this.minThresholdRatio);
+      return Math.max(sourceThreshold, overrideThreshold);
+    }
+    return sourceThreshold;
+  }
+
+  /**
+   * Get a map of validator address → commPubKey bytes for the active round.
+   * The commPubKey is the uncompressed secp256k1 public key used by the
+   * validator's TEE to sign partial decryption responses.
+   *
+   * In `evm-events` mode, reads DKG `Registered` events; `fromBlock` controls
+   * the lookback window and `round` filters events. In `cosmos-api` mode,
+   * queries `/api/dkg/verified_registrations`; `codeCommitmentHex` narrows
+   * the result to a specific enclave code commitment.
+   */
+  async getRegisteredValidators(params?: {
+    fromBlock?: bigint;
+    round?: number;
+    codeCommitmentHex?: string;
+  }): Promise<Map<string, Uint8Array>> {
+    if (this.dkgSource === "cosmos-api") {
+      return this.getRegisteredValidatorsFromCosmos(params);
+    }
+    return this.getRegisteredValidatorsFromEvents(params);
+  }
+
+  // =======================================================================
+  // Validator attestations — always EVM (cosmos API does not expose quotes)
+  // =======================================================================
+
+  /**
+   * Get validator attestation reports (raw SGX quotes) from DKG Registered events.
+   * Returns a map of validator address → enclaveReport bytes (most recent per validator).
+   *
+   * Use with `verifyAttestation()` to verify each validator's TEE enclave
+   * before trusting their partial decryptions.
+   *
+   * Note: sourced from EVM events regardless of `dkgSource`, because the
+   * cosmos /api/dkg endpoint does not expose raw SGX quotes.
+   */
+  async getValidatorAttestations(params?: {
+    fromBlock?: bigint;
+    round?: number;
+  }): Promise<Map<string, Uint8Array>> {
+    const toBlock = await this.publicClient.getBlockNumber();
+    const fromBlock = params?.fromBlock ??
+      (toBlock > Observer.DEFAULT_LOOKBACK_BLOCKS
+        ? toBlock - Observer.DEFAULT_LOOKBACK_BLOCKS
+        : 0n);
+
+    const rawLogs = await this.fetchDkgEventLogs(
+      this.publicClient,
+      "Registered",
+      fromBlock,
+      toBlock,
+    );
+
+    const parsed = parseEventLogs({
+      abi: dkgAbi,
+      logs: rawLogs,
+      eventName: "Registered",
+    });
+
+    const attestations = new Map<string, Uint8Array>();
+    for (const log of parsed) {
+      if (params?.round !== undefined && log.args.round !== params.round) {
+        continue;
+      }
+      const addr = log.args.validatorAddr.toLowerCase() as `0x${string}`;
+      attestations.set(addr, toBytes(log.args.enclaveReport));
+    }
+
+    // Fallback: if lookback window found nothing and the caller did NOT
+    // explicitly provide fromBlock, scan from block 0.
+    if (attestations.size === 0 && !params?.fromBlock && fromBlock > 0n) {
+      return this.getValidatorAttestations({ fromBlock: 0n, round: params?.round });
+    }
+
+    return attestations;
+  }
+
+  // =======================================================================
+  // Private: EVM event-scanning implementation
+  // =======================================================================
+
+  /** Fetch DKG logs for a single event type in block chunks. */
   private async fetchDkgEventLogs(
     client: PublicClient,
     eventName: "Finalized" | "Registered",
@@ -143,9 +352,7 @@ export class Observer {
     return logs;
   }
 
-  /**
-   * Get parsed Finalized events from the DKG contract.
-   */
+  /** Get parsed Finalized events from the DKG contract. */
   // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
   private async getFinalizedEvents(params?: { fromBlock?: bigint; toBlock?: bigint }): Promise<Array<{ args: { round: number; globalPubKey: `0x${string}`; validatorAddr: `0x${string}` } }>> {
     const toBlock =
@@ -181,16 +388,13 @@ export class Observer {
 
   /**
    * Find the highest DKG round that has enough finalized participants to be
-   * considered "active". A round is active when its finalized count >=
-   * minReqFinalizedParticipants (on-chain threshold).
-   *
-   * This fixes issue #36: the previous logic used the latest Finalized event
-   * which could be from a failed round (not enough participants).
+   * considered "active" — i.e. count >= minReqFinalizedParticipants.
+   * Fixes issue #36: the previous logic used the latest Finalized event which
+   * could be from a failed round.
    */
   private async getActiveRound(
     allEvents: Array<{ args: { round: number; globalPubKey: `0x${string}`; validatorAddr: `0x${string}` } }>,
   ): Promise<{ round: number; events: typeof allEvents }> {
-    // Get the on-chain minimum finalized participants threshold
     const minReq = await this.publicClient.readContract({
       address: contractAddresses[this.network].dkg,
       abi: dkgAbi,
@@ -204,7 +408,6 @@ export class Observer {
       const round = e.args.round;
       if (!byRound.has(round)) byRound.set(round, []);
       const existing = byRound.get(round)!;
-      // Deduplicate: skip if this validator already has an event in this round
       const alreadySeen = existing.some(
         (prev) => prev.args.validatorAddr.toLowerCase() === e.args.validatorAddr.toLowerCase(),
       );
@@ -220,9 +423,7 @@ export class Observer {
       }
     }
 
-    // Fallback: no round meets threshold — warn and use the highest round available.
-    // This preserves backward compatibility for devnets with relaxed thresholds,
-    // but signals that no round is confirmed active.
+    // Fallback: no round meets threshold — warn and use the highest round.
     const highestRound = rounds[0];
     console.warn(
       `[CDR SDK] Warning: no DKG round meets minReqFinalizedParticipants (${minRequired}). ` +
@@ -231,20 +432,10 @@ export class Observer {
     return { round: highestRound, events: byRound.get(highestRound)! };
   }
 
-  /**
-   * Get the DKG global public key from the most recent Finalized event.
-   * Returns the raw bytes of the globalPubKey (Ed25519 point with curve-code prefix).
-   * @example
-   * ```ts
-   * const globalPubKey = await observer.getGlobalPubKey();
-   * ```
-   */
-  async getGlobalPubKey(params?: { fromBlock?: bigint }): Promise<Uint8Array> {
+  private async getGlobalPubKeyFromEvents(params?: { fromBlock?: bigint }): Promise<Uint8Array> {
     const toBlock = await this.publicClient.getBlockNumber();
     const parsed = await this.getFinalizedEvents({ ...params, toBlock });
 
-    // Issue #36: Use the highest round that meets minReqFinalizedParticipants,
-    // not just the latest Finalized event (which could be from a failed round).
     const { events: activeEvents } = await this.getActiveRound(parsed);
     const latest = activeEvents[activeEvents.length - 1];
     const rawPoint = toBytes(latest.args.globalPubKey);
@@ -267,8 +458,6 @@ export class Observer {
           );
           const events = parseEventLogs({ abi: dkgAbi, logs, eventName: "Finalized" });
           if (events.length === 0) return null;
-          // Use same getActiveRound logic as primary to avoid false-positive
-          // RpcConsensusError when the latest event is from a failed round
           const { events: activeEvents } = await this.getActiveRound(events);
           return activeEvents[activeEvents.length - 1].args.globalPubKey;
         }),
@@ -281,74 +470,10 @@ export class Observer {
       }
     }
 
-    // The contract returns the raw 32-byte Ed25519 point. The WASM TDH2
-    // functions expect a 2-byte curve-code prefix (0x043f for Ed25519).
-    if (rawPoint.length === 32) {
-      const prefixed = new Uint8Array(34);
-      prefixed[0] = (CURVE_ED25519 >> 8) & 0xff; // 0x04
-      prefixed[1] = CURVE_ED25519 & 0xff;         // 0x3f
-      prefixed.set(rawPoint, 2);
-      return prefixed;
-    }
-
     return rawPoint;
   }
 
-  /**
-   * Get the number of participants in the latest DKG round
-   * by counting Finalized events with the same round as the most recent event.
-   * @example
-   * ```ts
-   * const count = await observer.getParticipantCount();
-   * ```
-   */
-  async getParticipantCount(params?: { fromBlock?: bigint }): Promise<number> {
-    const parsed = await this.getFinalizedEvents(params);
-    // Issue #36: Count participants from the active round, not just the latest round.
-    const { events: activeEvents } = await this.getActiveRound(parsed);
-    return activeEvents.length;
-  }
-
-  /**
-   * Get the absolute threshold (minimum number of partial decryptions needed).
-   * Computes: ceil(participantCount * operationalThreshold / 1000).
-   * If `minThresholdRatio` was set, returns max(contractThreshold, ceil(participants * minThresholdRatio)).
-   * @example
-   * ```ts
-   * const threshold = await observer.getThreshold();
-   * ```
-   */
-  async getThreshold(params?: { fromBlock?: bigint }): Promise<number> {
-    const [operationalThreshold, participantCount] = await Promise.all([
-      this.getOperationalThreshold(),
-      this.getParticipantCount(params),
-    ]);
-    const contractThreshold = Math.ceil(participantCount * Number(operationalThreshold) / 1000);
-
-    if (this.minThresholdRatio !== undefined) {
-      const overrideThreshold = Math.ceil(participantCount * this.minThresholdRatio);
-      return Math.max(contractThreshold, overrideThreshold);
-    }
-
-    return contractThreshold;
-  }
-
-  /**
-   * Get a map of validator address → enclaveCommKey from DKG Registered events.
-   * The commPubKey is the 64-byte uncompressed secp256k1 public key (without 0x04 prefix)
-   * used by the validator's TEE to sign partial decryption responses.
-   *
-   * @param round - If provided, only include validators registered for this round
-   * @returns Map where keys are lowercase checksummed addresses and values are commPubKey bytes
-   * @example
-   * ```ts
-   * const validators = await observer.getRegisteredValidators();
-   * for (const [addr, commKey] of validators) {
-   *   console.log(addr, commKey.length);
-   * }
-   * ```
-   */
-  async getRegisteredValidators(params?: {
+  private async getRegisteredValidatorsFromEvents(params?: {
     fromBlock?: bigint;
     round?: number;
   }): Promise<Map<string, Uint8Array>> {
@@ -379,82 +504,70 @@ export class Observer {
       const addr = log.args.validatorAddr.toLowerCase() as `0x${string}`;
       validators.set(addr, toBytes(log.args.enclaveCommKey));
     }
-
     return validators;
   }
 
-  /**
-   * Get validator attestation reports (raw SGX quotes) from DKG Registered events.
-   * Returns a map of validator address → enclaveReport bytes (most recent per validator).
-   *
-   * Use with `verifyAttestation()` to verify each validator's TEE enclave
-   * before trusting their partial decryptions.
-   *
-   * @example
-   * ```ts
-   * import { verifyAttestation } from "@piplabs/cdr-sdk";
-   * const attestations = await observer.getValidatorAttestations();
-   * for (const [addr, report] of attestations) {
-   *   const result = await verifyAttestation(report, { expectedMrEnclave: "0x..." });
-   *   console.log(addr, result.valid);
-   * }
-   * ```
-   */
-  async getValidatorAttestations(params?: {
-    fromBlock?: bigint;
-    round?: number;
-  }): Promise<Map<string, Uint8Array>> {
-    const toBlock = await this.publicClient.getBlockNumber();
-    const fromBlock = params?.fromBlock ??
-      (toBlock > Observer.DEFAULT_LOOKBACK_BLOCKS
-        ? toBlock - Observer.DEFAULT_LOOKBACK_BLOCKS
-        : 0n);
+  // =======================================================================
+  // Private: cosmos REST API implementation
+  // =======================================================================
 
-    const rawLogs = await this.fetchDkgEventLogs(
-      this.publicClient,
-      "Registered",
-      fromBlock,
-      toBlock,
+  private async fetchJSON<T>(path: string): Promise<T> {
+    const url = `${this.apiBase}/${path}`;
+    const resp = await fetch(url, { headers: { Accept: "application/json" } });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(`${url} → HTTP ${resp.status}: ${text || resp.statusText}`);
+    }
+    return (await resp.json()) as T;
+  }
+
+  private async getLatestActiveNetwork(): Promise<DKGNetworkJSON> {
+    const { network } = await this.fetchJSON<{ network: DKGNetworkJSON }>(
+      "latest_active",
     );
-
-    const parsed = parseEventLogs({
-      abi: dkgAbi,
-      logs: rawLogs,
-      eventName: "Registered",
-    });
-
-    const attestations = new Map<string, Uint8Array>();
-    for (const log of parsed) {
-      if (params?.round !== undefined && log.args.round !== params.round) {
-        continue;
-      }
-      const addr = log.args.validatorAddr.toLowerCase() as `0x${string}`;
-      attestations.set(addr, toBytes(log.args.enclaveReport));
-    }
-
-    // Fallback: if lookback window found nothing and the caller did NOT
-    // explicitly provide fromBlock, scan from block 0. When the caller
-    // passes an explicit fromBlock we respect their intent and do not
-    // silently expand the search scope.
-    if (attestations.size === 0 && !params?.fromBlock && fromBlock > 0n) {
-      return this.getValidatorAttestations({ fromBlock: 0n, round: params?.round });
-    }
-
-    return attestations;
+    return network;
   }
 
-  /**
-   * Get the maximum allowed encrypted data size for vault writes.
-   * @example
-   * ```ts
-   * const maxSize = await observer.getMaxEncryptedDataSize();
-   * ```
-   */
-  async getMaxEncryptedDataSize(): Promise<bigint> {
-    return this.publicClient.readContract({
-      address: contractAddresses[this.network].cdr,
-      abi: cdrAbi,
-      functionName: "maxEncryptedDataSize",
-    });
+  private async getGlobalPubKeyFromCosmos(): Promise<Uint8Array> {
+    const network = await this.getLatestActiveNetwork();
+    return hexToBytes(network.globalPublicKeyHex);
   }
+
+  private async getRegisteredValidatorsFromCosmos(params?: {
+    round?: number;
+    codeCommitmentHex?: string;
+  }): Promise<Map<string, Uint8Array>> {
+    let round = params?.round;
+    const codeCommitmentHex = params?.codeCommitmentHex ?? "";
+    if (round === undefined) {
+      round = (await this.getLatestActiveNetwork()).round;
+    }
+
+    const search = new URLSearchParams({
+      round: String(round),
+      code_commitment_hex: codeCommitmentHex,
+    });
+    const { registrations } = await this.fetchJSON<{
+      registrations: DKGRegistrationJSON[];
+    }>(`verified_registrations?${search.toString()}`);
+
+    const validators = new Map<string, Uint8Array>();
+    for (const reg of registrations) {
+      validators.set(reg.validatorAddr.toLowerCase(), hexToBytes(reg.commPubKeyHex));
+    }
+    return validators;
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+function hexToBytes(hex: string): Uint8Array {
+  const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
+  if (clean.length === 0) return new Uint8Array();
+  if (clean.length % 2 !== 0) throw new Error(`invalid hex length: ${clean.length}`);
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(clean.substring(i * 2, i * 2 + 2), 16);
+  }
+  return out;
 }
