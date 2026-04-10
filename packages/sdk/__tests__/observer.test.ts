@@ -1,6 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
 import { encodeAbiParameters, keccak256, toBytes, padHex, toHex } from "viem";
 import { Observer } from "../src/observer.js";
+import {
+  encodeLatestActiveResponse,
+  encodeVerifiedRegistrationsResponse,
+} from "../src/cosmos/dkg-proto.js";
 
 function mockPublicClient(overrides: Record<string, any> = {}) {
   return {
@@ -297,81 +301,127 @@ describe("Observer", () => {
     expect(count).toBe(2);
   });
 
-  // --- Cosmos REST API mode (dkgSource: "cosmos-api") ---
+  // --- CometBFT abci_query mode (dkgSource: "cosmos-abci") ---
 
-  describe("cosmos-api mode", () => {
-    function mockFetch(responses: Record<string, unknown>) {
+  describe("cosmos-abci mode", () => {
+    const RPC = "http://localhost:26657";
+
+    function mockAbciFetch(
+      handlers: Array<{
+        match: string;
+        response: Uint8Array;
+      }>,
+    ) {
       return vi.fn(async (url: string) => {
-        for (const [path, body] of Object.entries(responses)) {
-          if (url.includes(path)) {
-            return {
-              ok: true,
-              status: 200,
-              statusText: "OK",
-              json: async () => body,
-              text: async () => JSON.stringify(body),
-            } as Response;
-          }
+        const handler = handlers.find((h) => url.includes(encodeURIComponent(`"${h.match}"`)));
+        if (!handler) {
+          return {
+            ok: false,
+            status: 404,
+            statusText: "Not Found",
+            text: async () => `no mock for ${url}`,
+          } as Response;
         }
+        const valueB64 = Buffer.from(handler.response).toString("base64");
         return {
-          ok: false,
-          status: 404,
-          statusText: "Not Found",
-          text: async () => "not found",
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => ({
+            jsonrpc: "2.0",
+            result: {
+              response: { code: 0, log: "", value: valueB64 },
+            },
+          }),
+          text: async () => "",
         } as Response;
       });
     }
 
-    it("getGlobalPubKey fetches from /api/dkg/latest_active", async () => {
+    function encodedLatestActive(n: {
+      round: number;
+      total: number;
+      threshold: number;
+      globalPublicKey: Uint8Array;
+    }): Uint8Array {
+      return encodeLatestActiveResponse({
+        round: n.round,
+        startBlockHeight: 0n,
+        startBlockHash: new Uint8Array(),
+        activeValSet: [],
+        total: n.total,
+        threshold: n.threshold,
+        stage: 0,
+        isResharing: false,
+        globalPublicKey: n.globalPublicKey,
+        publicCoeffs: [],
+        isUpgrade: false,
+      });
+    }
+
+    it("constructor throws when cometRpcUrl is missing", () => {
+      const client = mockPublicClient();
+      expect(
+        () =>
+          new Observer({
+            network: "testnet",
+            publicClient: client,
+            dkgSource: "cosmos-abci",
+          }),
+      ).toThrow(/cometRpcUrl is required/);
+    });
+
+    it("getGlobalPubKey queries GetLatestActiveDKGNetwork via abci_query", async () => {
       const client = mockPublicClient();
       const originalFetch = globalThis.fetch;
-      globalThis.fetch = mockFetch({
-        latest_active: {
-          network: {
+      globalThis.fetch = mockAbciFetch([
+        {
+          match: "/story.dkg.v1.types.Query/GetLatestActiveDKGNetwork",
+          response: encodedLatestActive({
             round: 7,
             total: 3,
             threshold: 2,
-            globalPublicKeyHex: "0x" + "ab".repeat(32),
-          },
+            globalPublicKey: new Uint8Array(32).fill(0xab),
+          }),
         },
-      }) as unknown as typeof fetch;
+      ]) as unknown as typeof fetch;
 
       try {
         const observer = new Observer({
           network: "testnet",
           publicClient: client,
-          dkgSource: "cosmos-api",
-          apiBase: "http://localhost:3000/api/dkg",
+          dkgSource: "cosmos-abci",
+          cometRpcUrl: RPC,
         });
         const pubKey = await observer.getGlobalPubKey();
-        // 2-byte curve prefix + 32-byte point
-        expect(pubKey.length).toBe(34);
+        expect(pubKey.length).toBe(34); // 2-byte curve prefix + 32-byte point
         expect(client.getLogs).not.toHaveBeenCalled();
       } finally {
         globalThis.fetch = originalFetch;
       }
     });
 
-    it("getParticipantCount and getThreshold read from cosmos API", async () => {
+    it("getParticipantCount and getThreshold read from latest_active", async () => {
       const client = mockPublicClient();
       const originalFetch = globalThis.fetch;
-      globalThis.fetch = mockFetch({
-        latest_active: {
-          network: {
+      globalThis.fetch = mockAbciFetch([
+        {
+          match: "/story.dkg.v1.types.Query/GetLatestActiveDKGNetwork",
+          response: encodedLatestActive({
             round: 7,
             total: 5,
             threshold: 3,
-            globalPublicKeyHex: "0x" + "cc".repeat(32),
-          },
+            globalPublicKey: new Uint8Array(32).fill(0xcc),
+          }),
         },
-      }) as unknown as typeof fetch;
+      ]) as unknown as typeof fetch;
 
       try {
         const observer = new Observer({
           network: "testnet",
           publicClient: client,
-          dkgSource: "cosmos-api",
-          apiBase: "http://localhost:3000/api/dkg",
+          dkgSource: "cosmos-abci",
+          cometRpcUrl: RPC,
         });
         expect(await observer.getParticipantCount()).toBe(5);
         expect(await observer.getThreshold()).toBe(3);
@@ -381,65 +431,75 @@ describe("Observer", () => {
       }
     });
 
-    it("minThresholdRatio override applies in cosmos-api mode", async () => {
+    it("minThresholdRatio override applies in cosmos-abci mode", async () => {
       const client = mockPublicClient();
       const originalFetch = globalThis.fetch;
-      globalThis.fetch = mockFetch({
-        latest_active: {
-          network: {
+      globalThis.fetch = mockAbciFetch([
+        {
+          match: "/story.dkg.v1.types.Query/GetLatestActiveDKGNetwork",
+          response: encodedLatestActive({
             round: 1,
             total: 6,
-            threshold: 2, // API says 2, but ceil(6 * 0.67) = 5 takes precedence
-            globalPublicKeyHex: "0x" + "dd".repeat(32),
-          },
+            threshold: 2,
+            globalPublicKey: new Uint8Array(32).fill(0xdd),
+          }),
         },
-      }) as unknown as typeof fetch;
+      ]) as unknown as typeof fetch;
 
       try {
         const observer = new Observer({
           network: "testnet",
           publicClient: client,
-          dkgSource: "cosmos-api",
+          dkgSource: "cosmos-abci",
+          cometRpcUrl: RPC,
           minThresholdRatio: 0.67,
         });
+        // Source says 2; ceil(6 * 0.67) = 5 wins.
         expect(await observer.getThreshold()).toBe(5);
       } finally {
         globalThis.fetch = originalFetch;
       }
     });
 
-    it("getRegisteredValidators fetches from verified_registrations", async () => {
+    it("getRegisteredValidators queries GetAllVerifiedDKGRegistrations", async () => {
       const client = mockPublicClient();
       const originalFetch = globalThis.fetch;
-      globalThis.fetch = mockFetch({
-        latest_active: {
-          network: {
+      const commKey = new Uint8Array(64).fill(0x11);
+      globalThis.fetch = mockAbciFetch([
+        {
+          match: "/story.dkg.v1.types.Query/GetLatestActiveDKGNetwork",
+          response: encodedLatestActive({
             round: 4,
             total: 1,
             threshold: 1,
-            globalPublicKeyHex: "0x" + "ee".repeat(32),
-          },
+            globalPublicKey: new Uint8Array(32).fill(0xee),
+          }),
         },
-        verified_registrations: {
-          registrations: [
+        {
+          match: "/story.dkg.v1.types.Query/GetAllVerifiedDKGRegistrations",
+          response: encodeVerifiedRegistrationsResponse([
             {
               round: 4,
               validatorAddr: "0xAAAAaaaaaaaaaAAAAaaaaaaAaaAaAaAaAAaAAaaA",
               index: 0,
-              commPubKeyHex: "0x" + "11".repeat(64),
-              pubKeyShareHex: "0x",
+              dkgPubKey: new Uint8Array(),
+              commPubKey: commKey,
+              pubKeyShare: new Uint8Array(),
+              enclaveReport: new Uint8Array(),
               status: 1,
-              codeCommitmentHex: "0x",
+              codeCommitment: new Uint8Array(),
+              enclaveType: new Uint8Array(),
             },
-          ],
+          ]),
         },
-      }) as unknown as typeof fetch;
+      ]) as unknown as typeof fetch;
 
       try {
         const observer = new Observer({
           network: "testnet",
           publicClient: client,
-          dkgSource: "cosmos-api",
+          dkgSource: "cosmos-abci",
+          cometRpcUrl: RPC,
         });
         const validators = await observer.getRegisteredValidators();
         expect(validators.size).toBe(1);

@@ -7,6 +7,8 @@ import { uuidToLabel } from "./label.js";
 import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
 import type { AttestationConfig } from "./attestation.js";
+import { queryCDRPartials } from "./cosmos/abci-query.js";
+import { bytesToHex as cosmosBytesToHex } from "./cosmos/protobuf.js";
 
 export class Consumer {
   private publicClient: PublicClient;
@@ -125,9 +127,20 @@ export class Consumer {
   }
 
   /**
-   * Poll for EncryptedPartialDecryptionSubmitted events until minPartials are collected.
-   * Filters by uuid to match events for this specific vault read request.
-   * Verifies each partial's TEE signature; invalid partials are skipped.
+   * Collect at least `minPartials` partial decryptions for this vault read.
+   *
+   * In the default evm-events mode: polls `EncryptedPartialDecryptionSubmitted`
+   * events from the CDR contract, filtered by uuid, and verifies each partial's
+   * TEE signature against the validator's registered commPubKey.
+   *
+   * In cosmos-abci mode (when the Observer is configured with
+   * `dkgSource: "cosmos-abci"`): polls the x/dkg keeper's GetCDRPartials
+   * query via CometBFT abci_query. Signature verification is performed by
+   * the keeper on ingress (see story/client/x/dkg/keeper/dkg_handler.go
+   * PartialDecryptionSubmitted), so the SDK trusts the keeper state returned
+   * by the node — the same trust level as any EVM RPC read.
+   * The caller must supply `requesterPubKey` in this mode.
+   *
    * @example
    * ```ts
    * const partials = await consumer.collectPartials({
@@ -144,9 +157,26 @@ export class Consumer {
     fromBlock: bigint;
     timeoutMs?: number;
     pollIntervalMs?: number;
-    /** Called when a partial fails signature verification. If not provided, invalid partials are silently skipped. */
+    /** Required in cosmos-abci mode; ignored in evm-events mode. */
+    requesterPubKey?: `0x${string}`;
+    /** Called when a partial fails signature verification. evm-events mode only. */
     onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
     /** If provided, verify each validator's attestation report. Invalid attestations trigger onInvalidPartial. */
+    attestationConfig?: AttestationConfig;
+  }): Promise<PartialDecryptionEvent[]> {
+    if (this.observer?.dkgSource === "cosmos-abci") {
+      return this.collectPartialsFromCosmos(params);
+    }
+    return this.collectPartialsFromEvents(params);
+  }
+
+  private async collectPartialsFromEvents(params: {
+    uuid: number;
+    minPartials: number;
+    fromBlock: bigint;
+    timeoutMs?: number;
+    pollIntervalMs?: number;
+    onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
     attestationConfig?: AttestationConfig;
   }): Promise<PartialDecryptionEvent[]> {
     const { uuid, minPartials, fromBlock, timeoutMs = 60_000, pollIntervalMs = 3_000, onInvalidPartial } = params;
@@ -209,7 +239,7 @@ export class Consumer {
                   encryptedPartial: toBytes(event.encryptedPartial),
                   ephemeralPubKey: toBytes(event.ephemeralPubKey),
                   pubShare: toBytes(event.pubShare),
-                  signature: toBytes(event.signature),
+                  signature: toBytes(log.args.signature),
                   commPubKey: commPubKeys[ki],
                 });
                 if (valid) break;
@@ -234,6 +264,62 @@ export class Consumer {
     }
 
     throw new PartialCollectionTimeoutError(collected.size, minPartials, timeoutMs);
+  }
+
+  private async collectPartialsFromCosmos(params: {
+    uuid: number;
+    minPartials: number;
+    timeoutMs?: number;
+    pollIntervalMs?: number;
+    requesterPubKey?: `0x${string}`;
+  }): Promise<PartialDecryptionEvent[]> {
+    const { uuid, minPartials, timeoutMs = 60_000, pollIntervalMs = 3_000, requesterPubKey } = params;
+    if (!requesterPubKey) {
+      throw new InvalidParamsError(
+        'collectPartials: requesterPubKey is required when observer is configured with dkgSource: "cosmos-abci"',
+      );
+    }
+    const rpcUrl = this.observer?.cometRpcUrl;
+    if (!rpcUrl) {
+      throw new InvalidParamsError(
+        'collectPartials: observer.cometRpcUrl is required when observer is configured with dkgSource: "cosmos-abci"',
+      );
+    }
+    const requesterPubKeyHex = requesterPubKey.replace(/^0x/i, "");
+    const deadline = Date.now() + timeoutMs;
+    let lastCount = 0;
+
+    while (Date.now() < deadline) {
+      const rounds = await queryCDRPartials(rpcUrl, uuid, requesterPubKeyHex);
+
+      // Pick the highest-round bucket with submissions — that's the round
+      // this decrypt request was serviced under.
+      const active = rounds
+        .filter((r) => r.submissions.length > 0)
+        .sort((a, b) => b.round - a.round)[0];
+
+      const subs = active?.submissions ?? [];
+      lastCount = subs.length;
+
+      if (subs.length >= minPartials || (active && active.thresholdMet)) {
+        return subs.slice(0, minPartials).map((s) => {
+          const validatorHex = s.validator.startsWith("0x") ? s.validator : `0x${s.validator}`;
+          return {
+            validator: validatorHex.toLowerCase() as `0x${string}`,
+            round: s.round,
+            pid: s.pid,
+            encryptedPartial: `0x${cosmosBytesToHex(s.encryptedPartial)}` as `0x${string}`,
+            ephemeralPubKey: `0x${cosmosBytesToHex(s.ephemeralPubKey)}` as `0x${string}`,
+            pubShare: `0x${cosmosBytesToHex(s.pubShare)}` as `0x${string}`,
+            uuid,
+          };
+        });
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+
+    throw new PartialCollectionTimeoutError(lastCount, minPartials, timeoutMs);
   }
 
   /**
@@ -362,6 +448,7 @@ export class Consumer {
         minPartials: threshold,
         fromBlock,
         timeoutMs: params.timeoutMs,
+        requesterPubKey,
         onInvalidPartial: params.onInvalidPartial,
       });
 

@@ -10,43 +10,22 @@ import { cdrAbi, dkgAbi, contractAddresses, type Network } from "@piplabs/cdr-co
 import { CURVE_ED25519 } from "@piplabs/cdr-crypto";
 import type { Vault } from "./types.js";
 import { RpcConsensusError } from "./errors.js";
+import {
+  queryLatestActiveDKGNetwork,
+  queryVerifiedRegistrations,
+} from "./cosmos/abci-query.js";
+import type { DKGNetwork } from "./cosmos/dkg-proto.js";
 
 /**
  * Which backend to use for DKG queries.
  *
  * - `evm-events`: scan DKG contract Finalized/Registered events via the
  *   provided publicClient. Works against any EVM RPC.
- * - `cosmos-api`: query the demo's Next.js /api/dkg routes, which use
- *   CometBFT abci_query under the hood. Avoids wide eth_getLogs ranges.
+ * - `cosmos-abci`: query the x/dkg keeper directly via CometBFT abci_query
+ *   (port 26657). Avoids wide eth_getLogs ranges and requires only one
+ *   non-EVM endpoint.
  */
-export type DkgSource = "evm-events" | "cosmos-api";
-
-// ---------------------------------------------------------------------------
-// Response shapes from /api/dkg/*
-// ---------------------------------------------------------------------------
-
-interface DKGNetworkJSON {
-  round: number;
-  startBlockHeight: string;
-  activeValSet: string[];
-  total: number;
-  threshold: number;
-  stage: number;
-  isResharing: boolean;
-  globalPublicKeyHex: string;
-  publicCoeffsHex: string[];
-  isUpgrade: boolean;
-}
-
-interface DKGRegistrationJSON {
-  round: number;
-  validatorAddr: string;
-  index: number;
-  commPubKeyHex: string;
-  pubKeyShareHex: string;
-  status: number;
-  codeCommitmentHex: string;
-}
+export type DkgSource = "evm-events" | "cosmos-abci";
 
 // ---------------------------------------------------------------------------
 
@@ -55,10 +34,10 @@ interface DKGRegistrationJSON {
  *
  * DKG state can come from two sources, selected via the `dkgSource` option:
  *   - `evm-events` (default): scans DKG contract events via viem
- *   - `cosmos-api`: queries the Next.js /api/dkg routes (CometBFT abci_query)
+ *   - `cosmos-abci`: queries the x/dkg keeper via CometBFT abci_query
  *
  * CDR reads (vault, fees, maxEncryptedDataSize) and validator attestation
- * reports always come from EVM — the cosmos API does not expose SGX quotes.
+ * reports always come from EVM — the x/dkg keeper does not expose SGX quotes.
  */
 export class Observer {
   /** Many RPCs reject or time out on wide eth_getLogs ranges; chunk to stay under typical caps. */
@@ -69,8 +48,8 @@ export class Observer {
 
   private publicClient: PublicClient;
   private network: Network;
-  private dkgSource: DkgSource;
-  private apiBase: string;
+  readonly dkgSource: DkgSource;
+  readonly cometRpcUrl: string | undefined;
   private minThresholdRatio?: number;
   private validationClients?: PublicClient[];
 
@@ -80,10 +59,10 @@ export class Observer {
     /** DKG query backend. Defaults to `"evm-events"`. */
     dkgSource?: DkgSource;
     /**
-     * Base path for the demo's DKG API routes. Used only when
-     * `dkgSource === "cosmos-api"`. Defaults to "/api/dkg".
+     * CometBFT RPC base URL (e.g. `"http://node:26657"`). Required when
+     * `dkgSource === "cosmos-abci"`.
      */
-    apiBase?: string;
+    cometRpcUrl?: string;
     /** Minimum threshold ratio override (0-1). */
     minThresholdRatio?: number;
     /** Additional RPC clients for cross-validating critical on-chain reads (evm-events mode only). */
@@ -92,9 +71,15 @@ export class Observer {
     this.publicClient = params.publicClient;
     this.network = params.network;
     this.dkgSource = params.dkgSource ?? "evm-events";
-    this.apiBase = params.apiBase ?? "/api/dkg";
+    this.cometRpcUrl = params.cometRpcUrl;
     this.minThresholdRatio = params.minThresholdRatio;
     this.validationClients = params.validationClients;
+
+    if (this.dkgSource === "cosmos-abci" && !this.cometRpcUrl) {
+      throw new Error(
+        'Observer: cometRpcUrl is required when dkgSource is "cosmos-abci"',
+      );
+    }
   }
 
   // =======================================================================
@@ -178,7 +163,7 @@ export class Observer {
    */
   async getGlobalPubKey(params?: { fromBlock?: bigint }): Promise<Uint8Array> {
     const rawPoint =
-      this.dkgSource === "cosmos-api"
+      this.dkgSource === "cosmos-abci"
         ? await this.getGlobalPubKeyFromCosmos()
         : await this.getGlobalPubKeyFromEvents(params);
 
@@ -203,7 +188,7 @@ export class Observer {
    * ```
    */
   async getParticipantCount(params?: { fromBlock?: bigint }): Promise<number> {
-    if (this.dkgSource === "cosmos-api") {
+    if (this.dkgSource === "cosmos-abci") {
       const network = await this.getLatestActiveNetwork();
       return network.total;
     }
@@ -215,14 +200,14 @@ export class Observer {
   /**
    * Get the absolute threshold (minimum number of partial decryptions needed).
    * - In `evm-events` mode: computes `ceil(participants * operationalThreshold / 1000)`.
-   * - In `cosmos-api` mode: reads `threshold` directly from DKG network state.
+   * - In `cosmos-abci` mode: reads `threshold` directly from DKG network state.
    * If `minThresholdRatio` was set, returns `max(sourceThreshold, ceil(participants * minThresholdRatio))`.
    */
   async getThreshold(params?: { fromBlock?: bigint }): Promise<number> {
     let sourceThreshold: number;
     let participantCount: number;
 
-    if (this.dkgSource === "cosmos-api") {
+    if (this.dkgSource === "cosmos-abci") {
       const network = await this.getLatestActiveNetwork();
       sourceThreshold = network.threshold;
       participantCount = network.total;
@@ -250,16 +235,16 @@ export class Observer {
    * validator's TEE to sign partial decryption responses.
    *
    * In `evm-events` mode, reads DKG `Registered` events; `fromBlock` controls
-   * the lookback window and `round` filters events. In `cosmos-api` mode,
-   * queries `/api/dkg/verified_registrations`; `codeCommitmentHex` narrows
-   * the result to a specific enclave code commitment.
+   * the lookback window and `round` filters events. In `cosmos-abci` mode,
+   * queries the x/dkg keeper's GetAllVerifiedDKGRegistrations via abci_query;
+   * `codeCommitmentHex` narrows the result to a specific enclave code commitment.
    */
   async getRegisteredValidators(params?: {
     fromBlock?: bigint;
     round?: number;
     codeCommitmentHex?: string;
   }): Promise<Map<string, Uint8Array>> {
-    if (this.dkgSource === "cosmos-api") {
+    if (this.dkgSource === "cosmos-abci") {
       return this.getRegisteredValidatorsFromCosmos(params);
     }
     return this.getRegisteredValidatorsFromEvents(params);
@@ -277,7 +262,7 @@ export class Observer {
    * before trusting their partial decryptions.
    *
    * Note: sourced from EVM events regardless of `dkgSource`, because the
-   * cosmos /api/dkg endpoint does not expose raw SGX quotes.
+   * x/dkg keeper does not expose raw SGX quotes.
    */
   async getValidatorAttestations(params?: {
     fromBlock?: bigint;
@@ -508,29 +493,25 @@ export class Observer {
   }
 
   // =======================================================================
-  // Private: cosmos REST API implementation
+  // Private: CometBFT abci_query implementation
   // =======================================================================
 
-  private async fetchJSON<T>(path: string): Promise<T> {
-    const url = `${this.apiBase}/${path}`;
-    const resp = await fetch(url, { headers: { Accept: "application/json" } });
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => "");
-      throw new Error(`${url} → HTTP ${resp.status}: ${text || resp.statusText}`);
+  private requireCometRpcUrl(): string {
+    if (!this.cometRpcUrl) {
+      throw new Error(
+        'Observer: cometRpcUrl is required when dkgSource is "cosmos-abci"',
+      );
     }
-    return (await resp.json()) as T;
+    return this.cometRpcUrl;
   }
 
-  private async getLatestActiveNetwork(): Promise<DKGNetworkJSON> {
-    const { network } = await this.fetchJSON<{ network: DKGNetworkJSON }>(
-      "latest_active",
-    );
-    return network;
+  private async getLatestActiveNetwork(): Promise<DKGNetwork> {
+    return queryLatestActiveDKGNetwork(this.requireCometRpcUrl());
   }
 
   private async getGlobalPubKeyFromCosmos(): Promise<Uint8Array> {
     const network = await this.getLatestActiveNetwork();
-    return hexToBytes(network.globalPublicKeyHex);
+    return network.globalPublicKey;
   }
 
   private async getRegisteredValidatorsFromCosmos(params?: {
@@ -543,31 +524,16 @@ export class Observer {
       round = (await this.getLatestActiveNetwork()).round;
     }
 
-    const search = new URLSearchParams({
-      round: String(round),
-      code_commitment_hex: codeCommitmentHex,
-    });
-    const { registrations } = await this.fetchJSON<{
-      registrations: DKGRegistrationJSON[];
-    }>(`verified_registrations?${search.toString()}`);
+    const registrations = await queryVerifiedRegistrations(
+      this.requireCometRpcUrl(),
+      round,
+      codeCommitmentHex,
+    );
 
     const validators = new Map<string, Uint8Array>();
     for (const reg of registrations) {
-      validators.set(reg.validatorAddr.toLowerCase(), hexToBytes(reg.commPubKeyHex));
+      validators.set(reg.validatorAddr.toLowerCase(), reg.commPubKey);
     }
     return validators;
   }
-}
-
-// ---------------------------------------------------------------------------
-
-function hexToBytes(hex: string): Uint8Array {
-  const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
-  if (clean.length === 0) return new Uint8Array();
-  if (clean.length % 2 !== 0) throw new Error(`invalid hex length: ${clean.length}`);
-  const out = new Uint8Array(clean.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    out[i] = parseInt(clean.substring(i * 2, i * 2 + 2), 16);
-  }
-  return out;
 }

@@ -16,20 +16,23 @@ export class CDRClient {
     walletClient?: WalletClient;
     /**
      * Which backend to use for DKG queries (globalPubKey, participant count,
-     * threshold, registered validators). Defaults to "evm-events" which scans
-     * DKG contract events via the provided publicClient. Use "cosmos-api"
-     * when the demo's /api/dkg routes (backed by CometBFT abci_query) are
-     * reachable — it avoids wide eth_getLogs ranges.
+     * threshold, registered validators, and — in Consumer.collectPartials —
+     * partial decryption submissions). Defaults to `"evm-events"`, which
+     * scans DKG/CDR contract events via the provided publicClient.
+     *
+     * Use `"cosmos-abci"` to query the x/dkg keeper directly via CometBFT
+     * abci_query (port 26657). This avoids wide eth_getLogs ranges and removes
+     * the need for any auxiliary HTTP proxy.
      */
     dkgSource?: DkgSource;
-    /** Override the base path for DKG queries when dkgSource === "cosmos-api" (defaults to "/api/dkg"). */
-    dkgApiBase?: string;
+    /** CometBFT RPC base URL (e.g. `"http://node:26657"`). Required when `dkgSource === "cosmos-abci"`. */
+    cometRpcUrl?: string;
     /** Minimum threshold ratio override (0-1). The effective threshold is max(source threshold, ceil(participants * minThresholdRatio)). */
     minThresholdRatio?: number;
     /** Additional RPC URLs for cross-validating critical on-chain reads (used only in "evm-events" mode). */
     validationRpcUrls?: string[];
   }) {
-    const { network, publicClient, walletClient, dkgApiBase, dkgSource } = params;
+    const { network, publicClient, walletClient, cometRpcUrl, dkgSource } = params;
 
     const validationClients = params.validationRpcUrls?.map(url =>
       createPublicClient({ transport: http(url) }),
@@ -39,7 +42,7 @@ export class CDRClient {
       network,
       publicClient,
       dkgSource,
-      apiBase: dkgApiBase,
+      cometRpcUrl,
       minThresholdRatio: params.minThresholdRatio,
       validationClients,
     });
