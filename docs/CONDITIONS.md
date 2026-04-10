@@ -2,6 +2,70 @@
 
 Vaults use **condition contracts** to control who can write data and who can request reads. When you allocate a vault, you specify a write condition address and a read condition address. The CDR contract calls into these before allowing the operation.
 
+## Deployed Contracts (Aeneid Testnet)
+
+The following condition contracts are deployed on Aeneid (chain ID 1315) and ready to use:
+
+| Contract | Address | Type | Description |
+|----------|---------|------|-------------|
+| OwnerWriteCondition | `0x4C9bFC96d7092b590D497A191826C3dA2277c34B` | Write | Only the address encoded in `writeConditionData` can write |
+| LicenseReadCondition | `0xC0640AD4CF2CaA9914C8e5C44234359a9102f7a3` | Read | Only Story Protocol license token holders for the specified IP can read |
+
+### OwnerWriteCondition Usage
+
+```typescript
+import { encodeAbiParameters } from "viem";
+
+const writeCondData = encodeAbiParameters(
+  [{ type: "address" }],
+  [uploaderAddress],  // Only this address can write
+);
+
+await client.uploader.uploadCDR({
+  // ...
+  writeConditionAddr: "0x4C9bFC96d7092b590D497A191826C3dA2277c34B",
+  writeConditionData: writeCondData,
+});
+```
+
+### LicenseReadCondition Usage
+
+At upload time, encode the LicenseToken contract address and IP ID:
+
+```typescript
+const readCondData = encodeAbiParameters(
+  [{ type: "address" }, { type: "address" }],
+  [
+    "0xFe3838BFb30B34170F00030B52eA4893d8aAC6bC",  // LicenseToken contract
+    "0x3Aa560C9072E0D4A1443CD192745C24A176b4925",  // Your IP ID
+  ],
+);
+
+await client.uploader.uploadCDR({
+  // ...
+  readConditionAddr: "0xC0640AD4CF2CaA9914C8e5C44234359a9102f7a3",
+  readConditionData: readCondData,
+});
+```
+
+At read time, pass the license token IDs as `accessAuxData`:
+
+```typescript
+const accessAuxData = encodeAbiParameters(
+  [{ type: "uint256[]" }],
+  [[BigInt(licenseTokenId)]],
+);
+
+const { dataKey } = await client.consumer.accessCDR({
+  uuid,
+  accessAuxData,
+  timeoutMs: 120_000,
+});
+```
+
+
+---
+
 ## How Conditions Work
 
 When someone calls `write()` or `read()` on the CDR contract, the contract:

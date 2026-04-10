@@ -1,6 +1,6 @@
 # CDR SDK User Guide
 
-The **CDR (Confidential Data Recovery) SDK** provides a TypeScript interface for encrypting, storing, and recovering confidential data on Story L1 using threshold cryptography. Data is encrypted to a Distributed Key Generation (DKG) global public key and can only be decrypted when a threshold of validators provide partial decryptions.
+The **CDR (Confidential Data Rails) SDK** provides a TypeScript interface for encrypting, storing, and recovering confidential data on Story L1 using threshold cryptography. Data is encrypted to a Distributed Key Generation (DKG) global public key and can only be decrypted when a threshold of validators provide partial decryptions.
 
 ## Table of Contents
 
@@ -44,8 +44,8 @@ await initWasm();
 
 // 2. Set up viem clients
 const account = privateKeyToAccount("0xYOUR_PRIVATE_KEY");
-const publicClient = createPublicClient({ transport: http("https://odyssey.storyrpc.io") });
-const walletClient = createWalletClient({ account, transport: http("https://odyssey.storyrpc.io") });
+const publicClient = createPublicClient({ transport: http("https://aeneid.storyrpc.io") });
+const walletClient = createWalletClient({ account, transport: http("https://aeneid.storyrpc.io") });
 
 // 3. Create a CDR client
 const client = new CDRClient({ network: "testnet", publicClient, walletClient });
@@ -78,7 +78,7 @@ The SDK supports multiple Story L1 networks. You select a network when creating 
 
 | Network    | `network` param | Default RPC URL                     | Description                          |
 |------------|-----------------|-------------------------------------|--------------------------------------|
-| Testnet    | `"testnet"`     | `https://odyssey.storyrpc.io`       | Public testnet for development       |
+| Testnet    | `"testnet"`     | `https://aeneid.storyrpc.io`        | Aeneid testnet (chain ID 1315)       |
 | Mainnet    | `"mainnet"`     | `https://rpc.story.foundation`      | Production network                   |
 
 ### Contract Addresses
@@ -96,7 +96,7 @@ Both networks use the same pre-deployed system contract addresses:
 
 ```typescript
 const publicClient = createPublicClient({
-  transport: http("https://odyssey.storyrpc.io"),
+  transport: http("https://aeneid.storyrpc.io"),
 });
 const client = new CDRClient({ network: "testnet", publicClient });
 ```
@@ -140,7 +140,7 @@ const client = new CDRClient({ network: "testnet", publicClient, walletClient })
 A common pattern is to configure the network via environment variables:
 
 ```typescript
-const RPC_URL = process.env.RPC_URL ?? "https://odyssey.storyrpc.io";
+const RPC_URL = process.env.RPC_URL ?? "https://aeneid.storyrpc.io";
 const NETWORK = (process.env.NETWORK ?? "testnet") as "testnet" | "mainnet";
 
 const publicClient = createPublicClient({ transport: http(RPC_URL) });
@@ -149,7 +149,7 @@ const client = new CDRClient({ network: NETWORK, publicClient });
 
 ```bash
 # Testnet (default)
-RPC_URL=https://odyssey.storyrpc.io NETWORK=testnet node app.js
+RPC_URL=https://aeneid.storyrpc.io NETWORK=testnet node app.js
 
 # Mainnet
 RPC_URL=https://rpc.story.foundation NETWORK=mainnet node app.js
@@ -297,7 +297,7 @@ Read-only — no wallet or WASM needed.
 import { createPublicClient, http } from "viem";
 import { CDRClient } from "@piplabs/cdr-sdk";
 
-const publicClient = createPublicClient({ transport: http("https://odyssey.storyrpc.io") });
+const publicClient = createPublicClient({ transport: http("https://aeneid.storyrpc.io") });
 const client = new CDRClient({ network: "testnet", publicClient });
 
 const threshold = await client.observer.getOperationalThreshold();
@@ -325,8 +325,8 @@ import { CDRClient, initWasm } from "@piplabs/cdr-sdk";
 await initWasm();
 
 const account = privateKeyToAccount("0xYOUR_PRIVATE_KEY");
-const publicClient = createPublicClient({ transport: http("https://odyssey.storyrpc.io") });
-const walletClient = createWalletClient({ account, transport: http("https://odyssey.storyrpc.io") });
+const publicClient = createPublicClient({ transport: http("https://aeneid.storyrpc.io") });
+const walletClient = createWalletClient({ account, transport: http("https://aeneid.storyrpc.io") });
 const client = new CDRClient({ network: "testnet", publicClient, walletClient });
 
 // Fetch DKG global public key
@@ -365,8 +365,8 @@ await initWasm();
 
 const PRIVATE_KEY = "0xYOUR_PRIVATE_KEY";
 const account = privateKeyToAccount(PRIVATE_KEY as `0x${string}`);
-const publicClient = createPublicClient({ transport: http("https://odyssey.storyrpc.io") });
-const walletClient = createWalletClient({ account, transport: http("https://odyssey.storyrpc.io") });
+const publicClient = createPublicClient({ transport: http("https://aeneid.storyrpc.io") });
+const walletClient = createWalletClient({ account, transport: http("https://aeneid.storyrpc.io") });
 const client = new CDRClient({ network: "testnet", publicClient, walletClient });
 
 // Get DKG parameters
