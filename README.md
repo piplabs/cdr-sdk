@@ -64,7 +64,6 @@ const { dataKey: recovered } = await client.consumer.accessCDR({
 | Testnet  | `"testnet"`     | `https://aeneid.storyrpc.io`    |
 | Mainnet  | `"mainnet"`     | `https://rpc.story.foundation`   |
 
-Point to any Story-compatible RPC (devnets, local nodes) by changing the `http()` transport URL.
 
 See the [User Guide](./USER_GUIDE.md) for full network configuration details.
 

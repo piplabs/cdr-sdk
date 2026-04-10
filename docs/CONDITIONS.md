@@ -63,7 +63,6 @@ const { dataKey } = await client.consumer.accessCDR({
 });
 ```
 
-> **Note**: Minting license tokens requires wrapping IP to WIP and approving the RoyaltyModule. See the [Release Document](https://www.notion.so/storyprotocol/CDR-SDK-Aeneid-Release-Document-33e051299a548020b06efec9a4a01bcb) for the full manual flow.
 
 ---
 
