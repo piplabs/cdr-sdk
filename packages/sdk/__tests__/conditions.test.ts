@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { decodeAbiParameters } from "viem";
+import { conditionAddresses } from "@piplabs/cdr-contracts";
 import { conditions } from "../src/conditions.js";
 
 describe("conditions", () => {
@@ -95,6 +96,48 @@ describe("conditions", () => {
         address: CONDITION_ADDR,
         conditionData: longData,
       });
+    });
+  });
+
+  describe("fixedFee", () => {
+    it("returns correct address from conditionAddresses and conditionData of 0x", () => {
+      const result = conditions.fixedFee({ network: "testnet" });
+      expect(result.address).toBe(conditionAddresses.testnet!.fixedFee);
+      expect(result.conditionData).toBe("0x");
+    });
+
+    it("throws for unsupported network", () => {
+      expect(() => conditions.fixedFee({ network: "mainnet" })).toThrow(
+        /not available on network "mainnet"/,
+      );
+    });
+  });
+
+  describe("whitelist", () => {
+    it("returns correct address from conditionAddresses and conditionData of 0x", () => {
+      const result = conditions.whitelist({ network: "testnet" });
+      expect(result.address).toBe(conditionAddresses.testnet!.whitelist);
+      expect(result.conditionData).toBe("0x");
+    });
+
+    it("throws for unsupported network", () => {
+      expect(() => conditions.whitelist({ network: "mainnet" })).toThrow(
+        /not available on network "mainnet"/,
+      );
+    });
+  });
+
+  describe("timeBased", () => {
+    it("returns correct address from conditionAddresses and conditionData of 0x", () => {
+      const result = conditions.timeBased({ network: "testnet" });
+      expect(result.address).toBe(conditionAddresses.testnet!.timeBased);
+      expect(result.conditionData).toBe("0x");
+    });
+
+    it("throws for unsupported network", () => {
+      expect(() => conditions.timeBased({ network: "mainnet" })).toThrow(
+        /not available on network "mainnet"/,
+      );
     });
   });
 });

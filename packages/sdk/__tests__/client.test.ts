@@ -56,7 +56,15 @@ describe("CDRClient", () => {
     expect(() => cdr.consumer).toThrow(WalletClientRequiredError);
   });
 
-  it("publicClient + walletClient: all three (observer, uploader, consumer) are defined", () => {
+  it("publicClient only: accessing cdr.conditions throws WalletClientRequiredError", () => {
+    const cdr = new CDRClient({
+      network: "testnet",
+      publicClient: mockPublicClient,
+    });
+    expect(() => cdr.conditions).toThrow(WalletClientRequiredError);
+  });
+
+  it("publicClient + walletClient: all four (observer, uploader, consumer, conditions) are defined", () => {
     const cdr = new CDRClient({
       network: "testnet",
       publicClient: mockPublicClient,
@@ -65,6 +73,7 @@ describe("CDRClient", () => {
     expect(cdr.observer).toBeDefined();
     expect(cdr.uploader).toBeDefined();
     expect(cdr.consumer).toBeDefined();
+    expect(cdr.conditions).toBeDefined();
   });
 
   it("validationRpcUrls passed: construction succeeds without error", () => {
