@@ -1,4 +1,5 @@
 import { encodeAbiParameters } from "viem";
+import { conditionAddresses, type Network } from "@piplabs/cdr-contracts";
 
 /** Condition configuration for a CDR vault read/write gate. */
 export interface ConditionConfig {
@@ -64,4 +65,31 @@ function custom(params: {
   return { address: params.address, conditionData: params.conditionData };
 }
 
-export const conditions = { open, ownerOnly, tokenGate, merkle, custom } as const;
+/** FixedFee condition — requires payment to access. */
+function fixedFee(params: { network: Network }): ConditionConfig {
+  const addresses = conditionAddresses[params.network];
+  if (!addresses) {
+    throw new Error(`Condition contracts are not available on network "${params.network}"`);
+  }
+  return { address: addresses.fixedFee, conditionData: "0x" };
+}
+
+/** Whitelist condition — only whitelisted addresses can access. */
+function whitelist(params: { network: Network }): ConditionConfig {
+  const addresses = conditionAddresses[params.network];
+  if (!addresses) {
+    throw new Error(`Condition contracts are not available on network "${params.network}"`);
+  }
+  return { address: addresses.whitelist, conditionData: "0x" };
+}
+
+/** TimeBased condition — access restricted to a time window. */
+function timeBased(params: { network: Network }): ConditionConfig {
+  const addresses = conditionAddresses[params.network];
+  if (!addresses) {
+    throw new Error(`Condition contracts are not available on network "${params.network}"`);
+  }
+  return { address: addresses.timeBased, conditionData: "0x" };
+}
+
+export const conditions = { open, ownerOnly, tokenGate, merkle, custom, fixedFee, whitelist, timeBased } as const;

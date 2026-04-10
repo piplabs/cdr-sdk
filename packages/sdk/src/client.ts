@@ -3,12 +3,14 @@ import type { Network } from "@piplabs/cdr-contracts";
 import { Uploader } from "./uploader.js";
 import { Consumer } from "./consumer.js";
 import { Observer } from "./observer.js";
+import { ConditionManager } from "./conditionManager.js";
 import { WalletClientRequiredError } from "./errors.js";
 
 export class CDRClient {
   public readonly observer: Observer;
   private _uploader: Uploader | null;
   private _consumer: Consumer | null;
+  private _conditions: ConditionManager | null;
 
   constructor(params: {
     network: Network;
@@ -35,9 +37,11 @@ export class CDRClient {
     if (walletClient) {
       this._uploader = new Uploader({ network, publicClient, walletClient });
       this._consumer = new Consumer({ network, publicClient, walletClient, observer: this.observer });
+      this._conditions = new ConditionManager({ network, publicClient, walletClient });
     } else {
       this._uploader = null;
       this._consumer = null;
+      this._conditions = null;
     }
   }
 
@@ -51,5 +55,11 @@ export class CDRClient {
   get consumer(): Consumer {
     if (!this._consumer) throw new WalletClientRequiredError();
     return this._consumer;
+  }
+
+  /** Access the condition manager. Throws WalletClientRequiredError if no wallet was provided. */
+  get conditions(): ConditionManager {
+    if (!this._conditions) throw new WalletClientRequiredError();
+    return this._conditions;
   }
 }

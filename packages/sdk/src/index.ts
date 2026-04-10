@@ -6,6 +6,7 @@ export * from "./types.js";
 export * from "./errors.js";
 export * from "./label.js";
 export * from "./conditions.js";
+export * from "./conditionManager.js";
 export * from "./attestation.js";
 export * from "./storage/index.js";
 
