@@ -180,6 +180,58 @@ export class Observer {
   }
 
   /**
+   * Find the highest DKG round that has enough finalized participants to be
+   * considered "active". A round is active when its finalized count >=
+   * minReqFinalizedParticipants (on-chain threshold).
+   *
+   * This fixes issue #36: the previous logic used the latest Finalized event
+   * which could be from a failed round (not enough participants).
+   */
+  private async getActiveRound(
+    allEvents: Array<{ args: { round: number; globalPubKey: `0x${string}`; validatorAddr: `0x${string}` } }>,
+  ): Promise<{ round: number; events: typeof allEvents }> {
+    // Get the on-chain minimum finalized participants threshold
+    const minReq = await this.publicClient.readContract({
+      address: contractAddresses[this.network].dkg,
+      abi: dkgAbi,
+      functionName: "minReqFinalizedParticipants",
+    }) as bigint;
+    const minRequired = Number(minReq);
+
+    // Group events by round, deduplicate by validatorAddr within each round
+    const byRound = new Map<number, typeof allEvents>();
+    for (const e of allEvents) {
+      const round = e.args.round;
+      if (!byRound.has(round)) byRound.set(round, []);
+      const existing = byRound.get(round)!;
+      // Deduplicate: skip if this validator already has an event in this round
+      const alreadySeen = existing.some(
+        (prev) => prev.args.validatorAddr.toLowerCase() === e.args.validatorAddr.toLowerCase(),
+      );
+      if (!alreadySeen) existing.push(e);
+    }
+
+    // Find the highest round that meets the threshold (descending order)
+    const rounds = [...byRound.keys()].sort((a, b) => b - a);
+    for (const round of rounds) {
+      const events = byRound.get(round)!;
+      if (events.length >= minRequired) {
+        return { round, events };
+      }
+    }
+
+    // Fallback: no round meets threshold — warn and use the highest round available.
+    // This preserves backward compatibility for devnets with relaxed thresholds,
+    // but signals that no round is confirmed active.
+    const highestRound = rounds[0];
+    console.warn(
+      `[CDR SDK] Warning: no DKG round meets minReqFinalizedParticipants (${minRequired}). ` +
+      `Using highest round ${highestRound} as fallback. Data encrypted with this key may not be recoverable.`,
+    );
+    return { round: highestRound, events: byRound.get(highestRound)! };
+  }
+
+  /**
    * Get the DKG global public key from the most recent Finalized event.
    * Returns the raw bytes of the globalPubKey (Ed25519 point with curve-code prefix).
    * @example
@@ -190,7 +242,11 @@ export class Observer {
   async getGlobalPubKey(params?: { fromBlock?: bigint }): Promise<Uint8Array> {
     const toBlock = await this.publicClient.getBlockNumber();
     const parsed = await this.getFinalizedEvents({ ...params, toBlock });
-    const latest = parsed[parsed.length - 1];
+
+    // Issue #36: Use the highest round that meets minReqFinalizedParticipants,
+    // not just the latest Finalized event (which could be from a failed round).
+    const { events: activeEvents } = await this.getActiveRound(parsed);
+    const latest = activeEvents[activeEvents.length - 1];
     const rawPoint = toBytes(latest.args.globalPubKey);
 
     // Cross-validate against additional RPCs if configured
@@ -211,7 +267,10 @@ export class Observer {
           );
           const events = parseEventLogs({ abi: dkgAbi, logs, eventName: "Finalized" });
           if (events.length === 0) return null;
-          return events[events.length - 1].args.globalPubKey;
+          // Use same getActiveRound logic as primary to avoid false-positive
+          // RpcConsensusError when the latest event is from a failed round
+          const { events: activeEvents } = await this.getActiveRound(events);
+          return activeEvents[activeEvents.length - 1].args.globalPubKey;
         }),
       );
 
@@ -245,8 +304,9 @@ export class Observer {
    */
   async getParticipantCount(params?: { fromBlock?: bigint }): Promise<number> {
     const parsed = await this.getFinalizedEvents(params);
-    const latestRound = parsed[parsed.length - 1].args.round;
-    return parsed.filter((e) => e.args.round === latestRound).length;
+    // Issue #36: Count participants from the active round, not just the latest round.
+    const { events: activeEvents } = await this.getActiveRound(parsed);
+    return activeEvents.length;
   }
 
   /**
