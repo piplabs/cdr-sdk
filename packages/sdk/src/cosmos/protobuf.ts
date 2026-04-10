@@ -140,17 +140,11 @@ export function bytesToHex(b: Uint8Array): string {
 }
 
 export function base64ToBytes(b64: string): Uint8Array {
-  if (typeof globalThis.atob === "function") {
-    return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-  }
-  return new Uint8Array(Buffer.from(b64, "base64"));
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 }
 
 export function bytesToBase64(b: Uint8Array): string {
-  if (typeof globalThis.btoa === "function") {
-    let s = "";
-    for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
-    return btoa(s);
-  }
-  return Buffer.from(b).toString("base64");
+  let s = "";
+  for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+  return btoa(s);
 }
