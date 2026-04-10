@@ -24,10 +24,11 @@ export class HeliaProvider implements StorageProvider {
   }
 
   async download(cid: string): Promise<Uint8Array> {
-    const { CID } = await import("multiformats/cid");
-    const parsedCid = CID.parse(cid);
+    // Pass CID string directly — Helia unixfs cat() should accept string CIDs.
+    // Dynamic import of CID from multiformats can cause version mismatch with
+    // helia's bundled multiformats, making instanceof checks fail.
     const chunks: Uint8Array[] = [];
-    for await (const chunk of this.fs.cat(parsedCid)) {
+    for await (const chunk of this.fs.cat(cid)) {
       chunks.push(chunk);
     }
     const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
