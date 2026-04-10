@@ -15,8 +15,7 @@ import { RpcConsensusError } from "./errors.js";
  * Which backend to use for DKG queries.
  *
  * - `evm-events`: scan DKG contract Finalized/Registered events via the
- *   provided publicClient. This is the default for backward compatibility
- *   with existing deployments that don't expose a cosmos REST API.
+ *   provided publicClient. Works against any EVM RPC.
  * - `cosmos-api`: query the demo's Next.js /api/dkg routes, which use
  *   CometBFT abci_query under the hood. Avoids wide eth_getLogs ranges.
  */
