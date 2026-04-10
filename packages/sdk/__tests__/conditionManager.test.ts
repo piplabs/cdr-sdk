@@ -5,6 +5,7 @@ import { ConditionManager } from "../src/conditionManager.js";
 function mockClients() {
   const publicClient = {
     readContract: vi.fn(),
+    waitForTransactionReceipt: vi.fn().mockResolvedValue({ status: "success" }),
   } as any;
   const walletClient = {
     writeContract: vi.fn().mockResolvedValue("0xtxhash" as `0x${string}`),

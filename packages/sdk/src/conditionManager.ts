@@ -32,10 +32,17 @@ export class ConditionManager {
 
   // ── FixedFee ──────────────────────────────────────────────────────────
 
+  private async sendAndWait(
+    txHash: `0x${string}`,
+  ): Promise<`0x${string}`> {
+    await this.publicClient.waitForTransactionReceipt({ hash: txHash });
+    return txHash;
+  }
+
   /** Register a vault with a fixed fee requirement. */
   async registerFixedFee(params: { uuid: number; fee: bigint }): Promise<`0x${string}`> {
     const addresses = this.getConditionAddresses();
-    return this.walletClient.writeContract({
+    const hash = await this.walletClient.writeContract({
       chain: this.walletClient.chain ?? null,
       account: this.walletClient.account ?? null,
       address: addresses.fixedFee,
@@ -43,12 +50,13 @@ export class ConditionManager {
       functionName: "register",
       args: [params.uuid, params.fee],
     });
+    return this.sendAndWait(hash);
   }
 
   /** Pay the fee for a vault to gain access. */
   async payFee(params: { uuid: number; fee: bigint }): Promise<`0x${string}`> {
     const addresses = this.getConditionAddresses();
-    return this.walletClient.writeContract({
+    const hash = await this.walletClient.writeContract({
       chain: this.walletClient.chain ?? null,
       account: this.walletClient.account ?? null,
       address: addresses.fixedFee,
@@ -57,12 +65,13 @@ export class ConditionManager {
       args: [params.uuid],
       value: params.fee,
     });
+    return this.sendAndWait(hash);
   }
 
   /** Withdraw accumulated fees as a vault creator. */
   async withdrawFees(): Promise<`0x${string}`> {
     const addresses = this.getConditionAddresses();
-    return this.walletClient.writeContract({
+    const hash = await this.walletClient.writeContract({
       chain: this.walletClient.chain ?? null,
       account: this.walletClient.account ?? null,
       address: addresses.fixedFee,
@@ -70,6 +79,7 @@ export class ConditionManager {
       functionName: "withdraw",
       args: [],
     });
+    return this.sendAndWait(hash);
   }
 
   // ── Whitelist ─────────────────────────────────────────────────────────
@@ -77,7 +87,7 @@ export class ConditionManager {
   /** Register a vault with whitelist-based access control. */
   async registerWhitelist(params: { uuid: number }): Promise<`0x${string}`> {
     const addresses = this.getConditionAddresses();
-    return this.walletClient.writeContract({
+    const hash = await this.walletClient.writeContract({
       chain: this.walletClient.chain ?? null,
       account: this.walletClient.account ?? null,
       address: addresses.whitelist,
@@ -85,12 +95,13 @@ export class ConditionManager {
       functionName: "register",
       args: [params.uuid],
     });
+    return this.sendAndWait(hash);
   }
 
   /** Add an account to a vault's whitelist. */
   async addToWhitelist(params: { uuid: number; account: `0x${string}` }): Promise<`0x${string}`> {
     const addresses = this.getConditionAddresses();
-    return this.walletClient.writeContract({
+    const hash = await this.walletClient.writeContract({
       chain: this.walletClient.chain ?? null,
       account: this.walletClient.account ?? null,
       address: addresses.whitelist,
@@ -98,12 +109,13 @@ export class ConditionManager {
       functionName: "addToWhitelist",
       args: [params.uuid, params.account],
     });
+    return this.sendAndWait(hash);
   }
 
   /** Remove an account from a vault's whitelist. */
   async removeFromWhitelist(params: { uuid: number; account: `0x${string}` }): Promise<`0x${string}`> {
     const addresses = this.getConditionAddresses();
-    return this.walletClient.writeContract({
+    const hash = await this.walletClient.writeContract({
       chain: this.walletClient.chain ?? null,
       account: this.walletClient.account ?? null,
       address: addresses.whitelist,
@@ -111,6 +123,7 @@ export class ConditionManager {
       functionName: "removeFromWhitelist",
       args: [params.uuid, params.account],
     });
+    return this.sendAndWait(hash);
   }
 
   // ── TimeBased ─────────────────────────────────────────────────────────
@@ -118,7 +131,7 @@ export class ConditionManager {
   /** Register a vault with time-based access control. */
   async registerTimeBased(params: { uuid: number; startTime: bigint; endTime: bigint }): Promise<`0x${string}`> {
     const addresses = this.getConditionAddresses();
-    return this.walletClient.writeContract({
+    const hash = await this.walletClient.writeContract({
       chain: this.walletClient.chain ?? null,
       account: this.walletClient.account ?? null,
       address: addresses.timeBased,
@@ -126,5 +139,6 @@ export class ConditionManager {
       functionName: "register",
       args: [params.uuid, params.startTime, params.endTime],
     });
+    return this.sendAndWait(hash);
   }
 }
