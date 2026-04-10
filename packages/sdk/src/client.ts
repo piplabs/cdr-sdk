@@ -1,4 +1,4 @@
-import { createPublicClient, http, type PublicClient, type WalletClient } from "viem";
+import type { PublicClient, WalletClient } from "viem";
 import type { Network } from "@piplabs/cdr-contracts";
 import { Uploader } from "./uploader.js";
 import { Consumer } from "./consumer.js";
@@ -14,22 +14,18 @@ export class CDRClient {
     network: Network;
     publicClient: PublicClient;
     walletClient?: WalletClient;
-    /** Minimum threshold ratio override (0-1). The effective threshold is max(contract threshold, ceil(participants * minThresholdRatio)). */
+    /** Minimum threshold ratio override (0-1). The effective threshold is max(API threshold, ceil(participants * minThresholdRatio)). */
     minThresholdRatio?: number;
-    /** Additional RPC URLs for cross-validating critical on-chain reads (e.g., DKG global public key). */
-    validationRpcUrls?: string[];
+    /** Override the base path for DKG queries (defaults to "/api/dkg"). */
+    dkgApiBase?: string;
   }) {
-    const { network, publicClient, walletClient } = params;
-
-    const validationClients = params.validationRpcUrls?.map(url =>
-      createPublicClient({ transport: http(url) }),
-    );
+    const { network, publicClient, walletClient, dkgApiBase } = params;
 
     this.observer = new Observer({
       network,
       publicClient,
       minThresholdRatio: params.minThresholdRatio,
-      validationClients,
+      apiBase: dkgApiBase,
     });
 
     if (walletClient) {
