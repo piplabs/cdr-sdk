@@ -7,24 +7,19 @@ export type CIDParser = (cid: string) => any;
 export class HeliaProvider implements StorageProvider {
   private helia: any;
   private fs: any;
-  private parseCID: CIDParser;
+  private parseCID?: CIDParser;
 
   /**
    * @param params.helia - An initialized Helia node instance (used for pinning)
    * @param params.unixfs - A @helia/unixfs instance created from the Helia node
-   * @param params.CID - CID class from the **same** `multiformats` package that
-   *   helia depends on. Pass `CID` from `multiformats/cid` that is resolved in
-   *   the consumer's dependency tree (typically the one helia itself uses).
-   *   This avoids version-mismatch `instanceof` failures at runtime.
+   * @param params.CID - (Recommended) CID parser from the **same** `multiformats`
+   *   package that helia depends on. Avoids version-mismatch `instanceof` failures.
+   *   If omitted, falls back to dynamic `import("multiformats/cid")` which may
+   *   fail if multiple multiformats versions are installed.
    *
    * @example
    * ```ts
    * import { CID } from "multiformats/cid";
-   * import { createHelia } from "helia";
-   * import { unixfs } from "@helia/unixfs";
-   *
-   * const helia = await createHelia();
-   * const fs = unixfs(helia);
    * const provider = new HeliaProvider({
    *   helia,
    *   unixfs: fs,
@@ -32,7 +27,7 @@ export class HeliaProvider implements StorageProvider {
    * });
    * ```
    */
-  constructor(params: { helia: any; unixfs: any; CID: CIDParser }) {
+  constructor(params: { helia: any; unixfs: any; CID?: CIDParser }) {
     this.helia = params.helia;
     this.fs = params.unixfs;
     this.parseCID = params.CID;
@@ -48,9 +43,15 @@ export class HeliaProvider implements StorageProvider {
   }
 
   async download(cid: string): Promise<Uint8Array> {
-    // Use the caller-provided CID parser to ensure the CID object is from the
-    // same multiformats version that helia uses, avoiding instanceof mismatches.
-    const parsedCid = this.parseCID(cid);
+    // Use the caller-provided CID parser when available (recommended).
+    // Fall back to dynamic import for backward compatibility.
+    let parsedCid: any;
+    if (this.parseCID) {
+      parsedCid = this.parseCID(cid);
+    } else {
+      const { CID } = await import("multiformats/cid");
+      parsedCid = CID.parse(cid);
+    }
     const chunks: Uint8Array[] = [];
     for await (const chunk of this.fs.cat(parsedCid)) {
       chunks.push(chunk);
