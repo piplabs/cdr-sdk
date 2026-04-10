@@ -35,7 +35,10 @@ export class ConditionManager {
   private async sendAndWait(
     txHash: `0x${string}`,
   ): Promise<`0x${string}`> {
-    await this.publicClient.waitForTransactionReceipt({ hash: txHash });
+    const receipt = await this.publicClient.waitForTransactionReceipt({ hash: txHash });
+    if (receipt.status === "reverted") {
+      throw new Error(`Transaction reverted: ${txHash}`);
+    }
     return txHash;
   }
 
