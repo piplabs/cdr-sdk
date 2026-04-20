@@ -6,3 +6,6 @@ dist/
 .DS_Store
 docs/superpowers
 package-lock.json
+
+contracts/out/
+contracts/cache/
