@@ -16,6 +16,15 @@ export class Consumer {
   private network: Network;
   private observer: Observer | null;
 
+  /**
+   * Cached validator → commPubKey[] map. Built on first use and kept for the
+   * Consumer instance's lifetime. Registered events are immutable, so the
+   * only staleness risk is a new validator registering after the cache was
+   * built; that surfaces as "unknown validator" during verify, which triggers
+   * an automatic one-shot refresh (see collectPartialsFromEvents).
+   */
+  private commPubKeyMapCache: Map<string, Uint8Array[]> | null = null;
+
   /** Alias for {@link accessCDR} */
   readVault: Consumer["accessCDR"];
   /** Alias for {@link downloadFile} */
@@ -90,9 +99,17 @@ export class Consumer {
   /** Chunk size for historical getLogs scans. Kept well below typical RPC block-range limits. */
   private static readonly DKG_LOGS_BLOCK_CHUNK = 500_000n;
 
-  private async getCommPubKeyMap(): Promise<Map<string, Uint8Array[]>> {
+  /**
+   * Return the cached commPubKey map, building it on first call or when
+   * {@link forceRefresh} is true. Safe to call repeatedly.
+   */
+  private async getCommPubKeyMap(forceRefresh = false): Promise<Map<string, Uint8Array[]>> {
+    if (!forceRefresh && this.commPubKeyMapCache) {
+      return this.commPubKeyMapCache;
+    }
     const dkgAddress = contractAddresses[this.network].dkg;
-    return this.fetchRegisteredValidators(dkgAddress);
+    this.commPubKeyMapCache = await this.fetchRegisteredValidators(dkgAddress);
+    return this.commPubKeyMapCache;
   }
 
   private async fetchRegisteredValidators(
@@ -185,8 +202,11 @@ export class Consumer {
     const cdrAddress = contractAddresses[this.network].cdr;
     const deadline = Date.now() + timeoutMs;
 
-    // Build commPubKey map from DKG Registered events
-    const commPubKeyMap = await this.getCommPubKeyMap();
+    // Build commPubKey map from DKG Registered events (cached across calls).
+    let commPubKeyMap = await this.getCommPubKeyMap();
+    // Track which validators have already triggered a cache refresh this call,
+    // so a genuinely unknown validator can't force repeated re-scans.
+    const refreshedFor = new Set<string>();
 
     let lastScannedBlock = fromBlock;
     const collected = new Map<string, PartialDecryptionEvent>();
@@ -226,7 +246,15 @@ export class Consumer {
               // Verify signature — try all known commPubKeys for this validator
               // (DKG round rotation may cause the signing key to differ from the latest registration)
               const validatorAddr = log.args.validator.toLowerCase();
-              const commPubKeys = commPubKeyMap.get(validatorAddr);
+              let commPubKeys = commPubKeyMap.get(validatorAddr);
+
+              // Cache may be stale if a new validator registered after we
+              // built the map. Refresh once per unknown validator per call.
+              if ((!commPubKeys || commPubKeys.length === 0) && !refreshedFor.has(validatorAddr)) {
+                refreshedFor.add(validatorAddr);
+                commPubKeyMap = await this.getCommPubKeyMap(true);
+                commPubKeys = commPubKeyMap.get(validatorAddr);
+              }
 
               if (!commPubKeys || commPubKeys.length === 0) {
                 onInvalidPartial?.(event, new Error(`unknown validator: ${log.args.validator}`));
