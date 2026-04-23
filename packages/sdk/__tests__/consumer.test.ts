@@ -480,4 +480,307 @@ describe("Consumer", () => {
     expect(partials).toHaveLength(1);
     expect(partials[0].pid).toBe(2);
   });
+
+  describe("commPubKey map caching and chunked scan", () => {
+    const DKG_ADDR = "0xcccccc0000000000000000000000000000000004";
+    const CDR_ADDR = "0xcccccc0000000000000000000000000000000005";
+    const VALIDATOR_A = "0x0000000000000000000000000000000000000001" as `0x${string}`;
+    const VALIDATOR_B = "0x0000000000000000000000000000000000000002" as `0x${string}`;
+    const KEY_A = ("0x" + "aa".repeat(64)) as `0x${string}`;
+    const KEY_B = ("0x" + "bb".repeat(64)) as `0x${string}`;
+
+    /** Count how many times publicClient.getLogs was called against the DKG contract. */
+    function dkgScanCount(publicClient: any): number {
+      return publicClient.getLogs.mock.calls.filter(
+        (c: any[]) => c[0].address === DKG_ADDR,
+      ).length;
+    }
+
+    it("reuses the cached commPubKey map across back-to-back collectPartials calls", async () => {
+      const { publicClient, walletClient } = mockClients();
+      vi.mocked(verifyPartialSignature).mockReturnValue(true);
+
+      // Chain head stays at 100 so DKG scan is a single chunk.
+      publicClient.getBlockNumber.mockResolvedValue(100n);
+
+      // DKG scan response (call 1, shared by both collectPartials invocations)
+      const dkgRegistered = [
+        makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 }),
+      ];
+      // Each collectPartials call: 1 DKG scan (only on first) + CDR polls
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) return dkgRegistered;
+        // CDR: return one matching partial per uuid
+        const uuidFromCall = (publicClient.getLogs as any).mock.calls.length;
+        return [
+          makePartialDecryptionLog({
+            validator: VALIDATOR_A,
+            round: 1,
+            pid: 1,
+            uuid: uuidFromCall < 3 ? 10 : 11,
+          }),
+        ];
+      });
+
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
+
+      await consumer.collectPartials({
+        uuid: 10,
+        minPartials: 1,
+        fromBlock: 90n,
+        timeoutMs: 5_000,
+        pollIntervalMs: 10,
+      });
+      expect(dkgScanCount(publicClient)).toBe(1);
+
+      await consumer.collectPartials({
+        uuid: 11,
+        minPartials: 1,
+        fromBlock: 90n,
+        timeoutMs: 5_000,
+        pollIntervalMs: 10,
+      });
+      // Still 1 — cache hit on second call.
+      expect(dkgScanCount(publicClient)).toBe(1);
+    });
+
+    it("refreshes the cache once when a partial from an unknown validator appears", async () => {
+      const { publicClient, walletClient } = mockClients();
+      vi.mocked(verifyPartialSignature).mockReturnValue(true);
+      publicClient.getBlockNumber.mockResolvedValue(100n);
+
+      let dkgCallCount = 0;
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) {
+          dkgCallCount++;
+          // First scan: only validator A. Second scan (refresh): also validator B.
+          return dkgCallCount === 1
+            ? [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 })]
+            : [
+                makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 }),
+                makeRegisteredLog({ validatorAddr: VALIDATOR_B, enclaveCommKey: KEY_B, round: 1 }),
+              ];
+        }
+        // CDR scan: partial from validator B (unknown on first DKG scan).
+        return [makePartialDecryptionLog({ validator: VALIDATOR_B, round: 1, pid: 1, uuid: 7 })];
+      });
+
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
+      const partials = await consumer.collectPartials({
+        uuid: 7,
+        minPartials: 1,
+        fromBlock: 90n,
+        timeoutMs: 5_000,
+        pollIntervalMs: 10,
+      });
+
+      // Refresh happened exactly once.
+      expect(dkgCallCount).toBe(2);
+      // Validator B's partial was accepted after refresh.
+      expect(partials).toHaveLength(1);
+      expect(partials[0].validator.toLowerCase()).toBe(VALIDATOR_B.toLowerCase());
+    });
+
+    it("does not re-refresh for the same unknown validator within one call", async () => {
+      const { publicClient, walletClient } = mockClients();
+      vi.mocked(verifyPartialSignature).mockReturnValue(true);
+      publicClient.getBlockNumber.mockResolvedValue(100n);
+
+      let dkgCallCount = 0;
+      const onInvalidPartial = vi.fn();
+
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) {
+          dkgCallCount++;
+          // Validator B never appears — refresh cannot add it.
+          return [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 })];
+        }
+        // Three partials from the same unknown validator B.
+        return [
+          makePartialDecryptionLog({ validator: VALIDATOR_B, round: 1, pid: 1, uuid: 8 }),
+          makePartialDecryptionLog({ validator: VALIDATOR_B, round: 1, pid: 2, uuid: 8 }),
+          makePartialDecryptionLog({ validator: VALIDATOR_B, round: 1, pid: 3, uuid: 8 }),
+        ];
+      });
+
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
+      await expect(
+        consumer.collectPartials({
+          uuid: 8,
+          minPartials: 1,
+          fromBlock: 90n,
+          timeoutMs: 300,
+          pollIntervalMs: 50,
+          onInvalidPartial,
+        }),
+      ).rejects.toThrow();
+
+      // Exactly one refresh attempted (initial + 1), not three.
+      expect(dkgCallCount).toBe(2);
+      // All three partials reported as unknown validator.
+      expect(onInvalidPartial.mock.calls.length).toBeGreaterThanOrEqual(3);
+    });
+
+    it("scans DKG history in contiguous non-overlapping chunks covering [0, latestBlock]", async () => {
+      const { publicClient, walletClient } = mockClients();
+      vi.mocked(verifyPartialSignature).mockReturnValue(true);
+
+      // latestBlock = 1_250_000 → 3 chunks of size 500_000: [0,500000], [500001,1000001], [1000002,1250000]
+      publicClient.getBlockNumber.mockResolvedValue(1_250_000n);
+
+      const chunks: { from: bigint; to: bigint }[] = [];
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) {
+          chunks.push({ from: params.fromBlock, to: params.toBlock });
+          return [];
+        }
+        return [makePartialDecryptionLog({ validator: VALIDATOR_A, round: 1, pid: 1, uuid: 9 })];
+      });
+
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
+      // Force cache build by invoking the flow; collectPartials will throw since
+      // validator A isn't registered, but we only care about chunk coverage.
+      await expect(
+        consumer.collectPartials({
+          uuid: 9,
+          minPartials: 1,
+          fromBlock: 1_250_000n,
+          timeoutMs: 200,
+          pollIntervalMs: 50,
+        }),
+      ).rejects.toThrow();
+
+      // Verify contiguity: each chunk starts exactly one past the previous end,
+      // and the final chunk reaches latestBlock. Count accounts for both the
+      // initial build and the one-shot refresh triggered by the unknown validator,
+      // so we expect 6 total chunk calls (3 per scan × 2 scans).
+      expect(chunks.length).toBe(6);
+
+      const firstBuild = chunks.slice(0, 3);
+      expect(firstBuild[0].from).toBe(0n);
+      expect(firstBuild[0].to).toBe(500_000n);
+      expect(firstBuild[1].from).toBe(500_001n);
+      expect(firstBuild[1].to).toBe(1_000_001n);
+      expect(firstBuild[2].from).toBe(1_000_002n);
+      expect(firstBuild[2].to).toBe(1_250_000n);
+    });
+
+    it("deduplicates concurrent cache builds — only one scan runs", async () => {
+      const { publicClient, walletClient } = mockClients();
+      vi.mocked(verifyPartialSignature).mockReturnValue(true);
+      publicClient.getBlockNumber.mockResolvedValue(100n);
+
+      let dkgCallCount = 0;
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) {
+          dkgCallCount++;
+          // Simulate a slow scan so a concurrent caller arrives during the in-flight build.
+          await new Promise((r) => setTimeout(r, 50));
+          return [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 })];
+        }
+        return [makePartialDecryptionLog({ validator: VALIDATOR_A, round: 1, pid: 1, uuid: 20 })];
+      });
+
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
+      // Fire two collectPartials concurrently — both should observe one build.
+      await Promise.all([
+        consumer.collectPartials({ uuid: 20, minPartials: 1, fromBlock: 90n, timeoutMs: 5_000, pollIntervalMs: 10 }),
+        consumer.collectPartials({ uuid: 20, minPartials: 1, fromBlock: 90n, timeoutMs: 5_000, pollIntervalMs: 10 }),
+      ]);
+
+      expect(dkgCallCount).toBe(1);
+    });
+
+    it("retries a failing chunk with exponential backoff and succeeds on second attempt", async () => {
+      const { publicClient, walletClient } = mockClients();
+      vi.mocked(verifyPartialSignature).mockReturnValue(true);
+      publicClient.getBlockNumber.mockResolvedValue(100n);
+
+      let dkgAttempt = 0;
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) {
+          dkgAttempt++;
+          if (dkgAttempt === 1) {
+            throw new Error("invalid block range params");
+          }
+          return [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 })];
+        }
+        return [makePartialDecryptionLog({ validator: VALIDATOR_A, round: 1, pid: 1, uuid: 30 })];
+      });
+
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
+      const partials = await consumer.collectPartials({
+        uuid: 30,
+        minPartials: 1,
+        fromBlock: 90n,
+        timeoutMs: 5_000,
+        pollIntervalMs: 10,
+      });
+
+      expect(dkgAttempt).toBe(2);
+      expect(partials).toHaveLength(1);
+    });
+
+    it("propagates the error after exhausting getLogs retries", async () => {
+      const { publicClient, walletClient } = mockClients();
+      publicClient.getBlockNumber.mockResolvedValue(100n);
+
+      publicClient.getLogs.mockRejectedValue(new Error("persistent RPC failure"));
+
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
+      await expect(
+        consumer.collectPartials({
+          uuid: 40,
+          minPartials: 1,
+          fromBlock: 90n,
+          timeoutMs: 5_000,
+          pollIntervalMs: 10,
+        }),
+      ).rejects.toThrow("persistent RPC failure");
+
+      // 3 attempts (MAX_ATTEMPTS) for the first chunk, then give up.
+      expect(publicClient.getLogs.mock.calls.length).toBe(3);
+    });
+
+    it("clears the cached promise on build failure so the next call retries from scratch", async () => {
+      const { publicClient, walletClient } = mockClients();
+      vi.mocked(verifyPartialSignature).mockReturnValue(true);
+      publicClient.getBlockNumber.mockResolvedValue(100n);
+
+      let callCount = 0;
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) {
+          callCount++;
+          // First build: fail every retry. Second build: succeed immediately.
+          if (callCount <= 3) throw new Error("transient failure");
+          return [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 })];
+        }
+        return [makePartialDecryptionLog({ validator: VALIDATOR_A, round: 1, pid: 1, uuid: 50 })];
+      });
+
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
+
+      await expect(
+        consumer.collectPartials({
+          uuid: 50,
+          minPartials: 1,
+          fromBlock: 90n,
+          timeoutMs: 5_000,
+          pollIntervalMs: 10,
+        }),
+      ).rejects.toThrow();
+
+      // Second call must trigger a fresh build (not return the cached rejection).
+      const partials = await consumer.collectPartials({
+        uuid: 50,
+        minPartials: 1,
+        fromBlock: 90n,
+        timeoutMs: 5_000,
+        pollIntervalMs: 10,
+      });
+      expect(partials).toHaveLength(1);
+      // First build attempted 3 retries; second build succeeded on attempt 1. Total DKG calls = 4.
+      expect(callCount).toBe(4);
+    });
+  });
 });

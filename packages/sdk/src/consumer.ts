@@ -17,13 +17,16 @@ export class Consumer {
   private observer: Observer | null;
 
   /**
-   * Cached validator → commPubKey[] map. Built on first use and kept for the
-   * Consumer instance's lifetime. Registered events are immutable, so the
-   * only staleness risk is a new validator registering after the cache was
-   * built; that surfaces as "unknown validator" during verify, which triggers
-   * an automatic one-shot refresh (see collectPartialsFromEvents).
+   * In-flight (or settled) promise for the cached commPubKey map. Promise-
+   * level caching deduplicates concurrent calls: if two accessCDR invocations
+   * both trigger a build at the same time, only one scan runs.
+   *
+   * Registered events are immutable, so the only staleness risk is a new
+   * validator registering after the cache was built; that surfaces as
+   * "unknown validator" during verify, which triggers an automatic one-shot
+   * refresh (see collectPartialsFromEvents).
    */
-  private commPubKeyMapCache: Map<string, Uint8Array[]> | null = null;
+  private commPubKeyMapPromise: Promise<Map<string, Uint8Array[]>> | null = null;
 
   /** Alias for {@link accessCDR} */
   readVault: Consumer["accessCDR"];
@@ -98,18 +101,31 @@ export class Consumer {
    */
   /** Chunk size for historical getLogs scans. Kept well below typical RPC block-range limits. */
   private static readonly DKG_LOGS_BLOCK_CHUNK = 500_000n;
+  /** Max attempts per chunk getLogs call before propagating the error. */
+  private static readonly GETLOGS_MAX_ATTEMPTS = 3;
+  /** Base delay (ms) for exponential backoff between getLogs retries. */
+  private static readonly GETLOGS_BACKOFF_MS = 500;
 
   /**
    * Return the cached commPubKey map, building it on first call or when
-   * {@link forceRefresh} is true. Safe to call repeatedly.
+   * {@link forceRefresh} is true. Concurrent callers share the same in-flight
+   * build promise so we never scan the full history twice in parallel. If a
+   * build fails, the rejected promise is cleared so a subsequent call can
+   * retry from scratch instead of inheriting the failure.
    */
   private async getCommPubKeyMap(forceRefresh = false): Promise<Map<string, Uint8Array[]>> {
-    if (!forceRefresh && this.commPubKeyMapCache) {
-      return this.commPubKeyMapCache;
+    if (!forceRefresh && this.commPubKeyMapPromise) {
+      return this.commPubKeyMapPromise;
     }
     const dkgAddress = contractAddresses[this.network].dkg;
-    this.commPubKeyMapCache = await this.fetchRegisteredValidators(dkgAddress);
-    return this.commPubKeyMapCache;
+    const p = this.fetchRegisteredValidators(dkgAddress).catch((err) => {
+      if (this.commPubKeyMapPromise === p) {
+        this.commPubKeyMapPromise = null;
+      }
+      throw err;
+    });
+    this.commPubKeyMapPromise = p;
+    return p;
   }
 
   private async fetchRegisteredValidators(
@@ -122,11 +138,7 @@ export class Consumer {
     for (let from = 0n; from <= latestBlock; from = from + chunk + 1n) {
       const to = from + chunk > latestBlock ? latestBlock : from + chunk;
 
-      const rawLogs = await this.publicClient.getLogs({
-        address: dkgAddress,
-        fromBlock: from,
-        toBlock: to,
-      });
+      const rawLogs = await this.getLogsWithRetry(dkgAddress, from, to);
 
       const parsed = parseEventLogs({
         abi: dkgAbi,
@@ -143,6 +155,31 @@ export class Consumer {
     }
 
     return validators;
+  }
+
+  /**
+   * getLogs wrapper with exponential-backoff retry. Public RPCs can return
+   * transient errors for individual chunk ranges (observed as
+   * "invalid block range params" on Aeneid); a narrow retry loop keeps the
+   * full-history scan robust without swallowing persistent failures.
+   */
+  private async getLogsWithRetry(
+    address: `0x${string}`,
+    fromBlock: bigint,
+    toBlock: bigint,
+  ): Promise<Awaited<ReturnType<PublicClient["getLogs"]>>> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < Consumer.GETLOGS_MAX_ATTEMPTS; attempt++) {
+      try {
+        return await this.publicClient.getLogs({ address, fromBlock, toBlock });
+      } catch (err) {
+        lastError = err;
+        if (attempt === Consumer.GETLOGS_MAX_ATTEMPTS - 1) break;
+        const delay = Consumer.GETLOGS_BACKOFF_MS * 2 ** attempt;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+    throw lastError;
   }
 
   /**
