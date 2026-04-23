@@ -48,6 +48,35 @@ export class Consumer {
   }
 
   /**
+   * Warm the validator commPubKey cache in the background.
+   *
+   * The cache is normally built lazily on the first accessCDR / downloadFile
+   * call, which requires a full-history scan of DKG Registered events and
+   * can take tens of seconds on mature chains — long enough that a request
+   * triggered by a user click can appear to hang. Frontends that know a
+   * read is imminent (e.g. right after user login / wallet connection) can
+   * call prefetchRegistry() to start the scan early, so the subsequent
+   * accessCDR call hits a warm cache and returns immediately.
+   *
+   * Safe to call multiple times — concurrent callers share the same
+   * in-flight build via Promise-level dedupe, so repeated prefetches cost
+   * nothing. Errors propagate; callers doing best-effort warming should
+   * attach their own `.catch(() => {})` and let the real accessCDR call
+   * surface the failure later if it still occurs.
+   *
+   * @example
+   * ```ts
+   * // Right after user login / wallet connection, in a useEffect:
+   * cdrClient.consumer.prefetchRegistry().catch(() => {
+   *   // best-effort warm-up; real accessCDR call will retry if needed
+   * });
+   * ```
+   */
+  async prefetchRegistry(): Promise<void> {
+    await this.getCommPubKeyMap();
+  }
+
+  /**
    * Request a vault read. Auto-queries read fee. Emits VaultRead event for validators.
    * @example
    * ```ts

@@ -496,6 +496,55 @@ describe("Consumer", () => {
       ).length;
     }
 
+    it("prefetchRegistry warms the cache so subsequent collectPartials does not scan DKG again", async () => {
+      const { publicClient, walletClient } = mockClients();
+      vi.mocked(verifyPartialSignature).mockReturnValue(true);
+      publicClient.getBlockNumber.mockResolvedValue(100n);
+
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) {
+          return [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 })];
+        }
+        return [makePartialDecryptionLog({ validator: VALIDATOR_A, round: 1, pid: 1, uuid: 60 })];
+      });
+
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
+
+      await consumer.prefetchRegistry();
+      expect(dkgScanCount(publicClient)).toBe(1);
+
+      await consumer.collectPartials({
+        uuid: 60,
+        minPartials: 1,
+        fromBlock: 90n,
+        timeoutMs: 5_000,
+        pollIntervalMs: 10,
+      });
+      // Still 1 — prefetch primed the cache, collectPartials reused it.
+      expect(dkgScanCount(publicClient)).toBe(1);
+    });
+
+    it("prefetchRegistry is idempotent — concurrent calls share one scan", async () => {
+      const { publicClient, walletClient } = mockClients();
+      publicClient.getBlockNumber.mockResolvedValue(100n);
+
+      let dkgCallCount = 0;
+      publicClient.getLogs.mockImplementation(async () => {
+        dkgCallCount++;
+        await new Promise((r) => setTimeout(r, 30));
+        return [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 })];
+      });
+
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
+      await Promise.all([
+        consumer.prefetchRegistry(),
+        consumer.prefetchRegistry(),
+        consumer.prefetchRegistry(),
+      ]);
+
+      expect(dkgCallCount).toBe(1);
+    });
+
     it("reuses the cached commPubKey map across back-to-back collectPartials calls", async () => {
       const { publicClient, walletClient } = mockClients();
       vi.mocked(verifyPartialSignature).mockReturnValue(true);
