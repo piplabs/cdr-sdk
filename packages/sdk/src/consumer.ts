@@ -75,52 +75,54 @@ export class Consumer {
 
   /**
    * Fetch validator address → commPubKey[] map from DKG Registered events.
-   * Each validator may re-register with a new commPubKey in each DKG round,
-   * so we keep all keys (most recent first) to handle round mismatch during
-   * signature verification.
+   *
+   * Each validator may re-register with a new commPubKey in each DKG round.
+   * Partials are signed with the commPubKey active in the round that serviced
+   * the read request, which is not necessarily the most recent round. The
+   * signature-verify loop in collectPartialsFromEvents tries every key in the
+   * returned array, so we must supply keys from every historical round — a
+   * rolling lookback window can exclude the round a partial was signed under
+   * and cause every verification to fail.
+   *
+   * We therefore scan the full history from genesis using chunked getLogs
+   * calls to stay within RPC range limits.
    */
-  /** Default lookback window: ~7 days at ~2 s/block. Matches Observer.DEFAULT_LOOKBACK_BLOCKS. */
-  private static readonly DEFAULT_LOOKBACK_BLOCKS = 302_400n;
+  /** Chunk size for historical getLogs scans. Kept well below typical RPC block-range limits. */
+  private static readonly DKG_LOGS_BLOCK_CHUNK = 500_000n;
 
   private async getCommPubKeyMap(): Promise<Map<string, Uint8Array[]>> {
     const dkgAddress = contractAddresses[this.network].dkg;
-    const latestBlock = await this.publicClient.getBlockNumber();
-    const fromBlock = latestBlock > Consumer.DEFAULT_LOOKBACK_BLOCKS
-      ? latestBlock - Consumer.DEFAULT_LOOKBACK_BLOCKS
-      : 0n;
-
-    const validators = await this.fetchRegisteredValidators(dkgAddress, fromBlock);
-
-    // Fallback: if lookback window found no validators, scan from block 0
-    if (validators.size === 0 && fromBlock > 0n) {
-      return this.fetchRegisteredValidators(dkgAddress, 0n);
-    }
-
-    return validators;
+    return this.fetchRegisteredValidators(dkgAddress);
   }
 
   private async fetchRegisteredValidators(
     dkgAddress: `0x${string}`,
-    fromBlock: bigint,
   ): Promise<Map<string, Uint8Array[]>> {
-    const rawLogs = await this.publicClient.getLogs({
-      address: dkgAddress,
-      fromBlock,
-      toBlock: "latest",
-    });
-
-    const parsed = parseEventLogs({
-      abi: dkgAbi,
-      logs: rawLogs,
-      eventName: "Registered",
-    });
-
+    const latestBlock = await this.publicClient.getBlockNumber();
+    const chunk = Consumer.DKG_LOGS_BLOCK_CHUNK;
     const validators = new Map<string, Uint8Array[]>();
-    for (const log of parsed) {
-      const addr = log.args.validatorAddr.toLowerCase() as `0x${string}`;
-      const keys = validators.get(addr) ?? [];
-      keys.push(toBytes(log.args.enclaveCommKey));
-      validators.set(addr, keys);
+
+    for (let from = 0n; from <= latestBlock; from = from + chunk + 1n) {
+      const to = from + chunk > latestBlock ? latestBlock : from + chunk;
+
+      const rawLogs = await this.publicClient.getLogs({
+        address: dkgAddress,
+        fromBlock: from,
+        toBlock: to,
+      });
+
+      const parsed = parseEventLogs({
+        abi: dkgAbi,
+        logs: rawLogs,
+        eventName: "Registered",
+      });
+
+      for (const log of parsed) {
+        const addr = log.args.validatorAddr.toLowerCase() as `0x${string}`;
+        const keys = validators.get(addr) ?? [];
+        keys.push(toBytes(log.args.enclaveCommKey));
+        validators.set(addr, keys);
+      }
     }
 
     return validators;
