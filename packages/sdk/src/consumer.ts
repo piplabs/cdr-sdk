@@ -347,40 +347,49 @@ export class Consumer {
                 signature: log.args.signature,
               };
 
-              // Verify signature — try all known commPubKeys for this validator
-              // (DKG round rotation may cause the signing key to differ from the latest registration)
+              // Verify signature — try all known commPubKeys for this validator.
+              // In hybrid mode the cached map holds only the active-round keys,
+              // so a DKG rotation that happens after the cache is built leaves
+              // every validator with stale (old-round) keys. Refreshing on any
+              // verification failure — not just on an absent validator — lets
+              // the next round's partials recover without a process restart.
               const validatorAddr = log.args.validator.toLowerCase();
               let commPubKeys = commPubKeyMap.get(validatorAddr);
 
-              // Cache may be stale if a new validator registered after we
-              // built the map. Refresh once per unknown validator per call.
-              if ((!commPubKeys || commPubKeys.length === 0) && !refreshedFor.has(validatorAddr)) {
+              const tryVerifyWith = (keys: Uint8Array[] | undefined): boolean => {
+                if (!keys || keys.length === 0) return false;
+                for (let ki = keys.length - 1; ki >= 0; ki--) {
+                  if (verifyPartialSignature({
+                    round: event.round,
+                    ciphertext: toBytes(log.args.ciphertext),
+                    encryptedPartial: toBytes(event.encryptedPartial),
+                    ephemeralPubKey: toBytes(event.ephemeralPubKey),
+                    pubShare: toBytes(event.pubShare),
+                    signature: toBytes(log.args.signature),
+                    commPubKey: keys[ki],
+                  })) return true;
+                }
+                return false;
+              };
+
+              let valid = tryVerifyWith(commPubKeys);
+
+              // Refresh the cache once per validator per call on any verification
+              // failure (unknown validator OR all cached keys fail). Deduped by
+              // validator address so a genuinely bad signer can't force repeated
+              // full-history rescans within a single collectPartials invocation.
+              if (!valid && !refreshedFor.has(validatorAddr)) {
                 refreshedFor.add(validatorAddr);
                 commPubKeyMap = await this.getCommPubKeyMap(true);
                 commPubKeys = commPubKeyMap.get(validatorAddr);
-              }
-
-              if (!commPubKeys || commPubKeys.length === 0) {
-                onInvalidPartial?.(event, new Error(`unknown validator: ${log.args.validator}`));
-                continue;
-              }
-
-              let valid = false;
-              for (let ki = commPubKeys.length - 1; ki >= 0; ki--) {
-                valid = verifyPartialSignature({
-                  round: event.round,
-                  ciphertext: toBytes(log.args.ciphertext),
-                  encryptedPartial: toBytes(event.encryptedPartial),
-                  ephemeralPubKey: toBytes(event.ephemeralPubKey),
-                  pubShare: toBytes(event.pubShare),
-                  signature: toBytes(log.args.signature),
-                  commPubKey: commPubKeys[ki],
-                });
-                if (valid) break;
+                valid = tryVerifyWith(commPubKeys);
               }
 
               if (!valid) {
-                onInvalidPartial?.(event, new Error(`invalid signature from validator ${log.args.validator}`));
+                const reason = (!commPubKeys || commPubKeys.length === 0)
+                  ? `unknown validator: ${log.args.validator}`
+                  : `invalid signature from validator ${log.args.validator}`;
+                onInvalidPartial?.(event, new Error(reason));
                 continue;
               }
 
