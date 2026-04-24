@@ -374,30 +374,42 @@ describe("Consumer", () => {
 
   it("collectPartials rejects invalid signatures and invokes callback", async () => {
     const { publicClient, walletClient } = mockClients();
+    const KEY_A = ("0x" + "aa".repeat(64)) as `0x${string}`;
+    const KEY_B = ("0x" + "bb".repeat(64)) as `0x${string}`;
     const mockVerify = vi.mocked(verifyPartialSignature);
     mockVerify.mockReset();
-    mockVerify.mockReturnValueOnce(false).mockReturnValue(true);
+    // Deterministically accept only KEY_B; accept/reject follows the key, not call
+    // order, so the one-shot refresh on verification failure (for validator A)
+    // sees the same stable map and still rejects.
+    mockVerify.mockImplementation((args: any) => {
+      const kB = toBytes(KEY_B);
+      return args.commPubKey.length === kB.length && [...args.commPubKey].every((b, i) => b === kB[i]);
+    });
 
     publicClient.getBlockNumber.mockResolvedValueOnce(100n).mockResolvedValue(101n);
 
-    publicClient.getLogs
-      .mockResolvedValueOnce([
-        makeRegisteredLog({
-          validatorAddr: "0x0000000000000000000000000000000000000001",
-          enclaveCommKey: ("0x" + "aa".repeat(64)) as `0x${string}`,
-          round: 1,
-        }),
-        makeRegisteredLog({
-          validatorAddr: "0x0000000000000000000000000000000000000002",
-          enclaveCommKey: ("0x" + "bb".repeat(64)) as `0x${string}`,
-          round: 1,
-        }),
-      ])
-      .mockResolvedValueOnce([
-        makePartialDecryptionLog({ validator: "0x0000000000000000000000000000000000000001", round: 1, pid: 1, uuid: 1 }),
-        makePartialDecryptionLog({ validator: "0x0000000000000000000000000000000000000002", round: 1, pid: 2, uuid: 1 }),
-      ])
-      .mockResolvedValue([]);
+    const dkgLogs = [
+      makeRegisteredLog({
+        validatorAddr: "0x0000000000000000000000000000000000000001",
+        enclaveCommKey: KEY_A,
+        round: 1,
+      }),
+      makeRegisteredLog({
+        validatorAddr: "0x0000000000000000000000000000000000000002",
+        enclaveCommKey: KEY_B,
+        round: 1,
+      }),
+    ];
+    let cdrPoll = 0;
+    publicClient.getLogs.mockImplementation(async (params: any) => {
+      if (params.address === "0xcccccc0000000000000000000000000000000004") return dkgLogs;
+      return cdrPoll++ === 0
+        ? [
+            makePartialDecryptionLog({ validator: "0x0000000000000000000000000000000000000001", round: 1, pid: 1, uuid: 1 }),
+            makePartialDecryptionLog({ validator: "0x0000000000000000000000000000000000000002", round: 1, pid: 2, uuid: 1 }),
+          ]
+        : [];
+    });
 
     const onInvalidPartial = vi.fn();
     const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
@@ -452,30 +464,39 @@ describe("Consumer", () => {
 
   it("collectPartials silently skips invalid partials when no callback provided", async () => {
     const { publicClient, walletClient } = mockClients();
+    const KEY_A = ("0x" + "aa".repeat(64)) as `0x${string}`;
+    const KEY_B = ("0x" + "bb".repeat(64)) as `0x${string}`;
     const mockVerify = vi.mocked(verifyPartialSignature);
     mockVerify.mockReset();
-    mockVerify.mockReturnValueOnce(false).mockReturnValue(true);
+    mockVerify.mockImplementation((args: any) => {
+      const kB = toBytes(KEY_B);
+      return args.commPubKey.length === kB.length && [...args.commPubKey].every((b, i) => b === kB[i]);
+    });
 
     publicClient.getBlockNumber.mockResolvedValueOnce(100n).mockResolvedValue(101n);
 
-    publicClient.getLogs
-      .mockResolvedValueOnce([
-        makeRegisteredLog({
-          validatorAddr: "0x0000000000000000000000000000000000000001",
-          enclaveCommKey: ("0x" + "aa".repeat(64)) as `0x${string}`,
-          round: 1,
-        }),
-        makeRegisteredLog({
-          validatorAddr: "0x0000000000000000000000000000000000000002",
-          enclaveCommKey: ("0x" + "bb".repeat(64)) as `0x${string}`,
-          round: 1,
-        }),
-      ])
-      .mockResolvedValueOnce([
-        makePartialDecryptionLog({ validator: "0x0000000000000000000000000000000000000001", round: 1, pid: 1, uuid: 1 }),
-        makePartialDecryptionLog({ validator: "0x0000000000000000000000000000000000000002", round: 1, pid: 2, uuid: 1 }),
-      ])
-      .mockResolvedValue([]);
+    const dkgLogs = [
+      makeRegisteredLog({
+        validatorAddr: "0x0000000000000000000000000000000000000001",
+        enclaveCommKey: KEY_A,
+        round: 1,
+      }),
+      makeRegisteredLog({
+        validatorAddr: "0x0000000000000000000000000000000000000002",
+        enclaveCommKey: KEY_B,
+        round: 1,
+      }),
+    ];
+    let cdrPoll = 0;
+    publicClient.getLogs.mockImplementation(async (params: any) => {
+      if (params.address === "0xcccccc0000000000000000000000000000000004") return dkgLogs;
+      return cdrPoll++ === 0
+        ? [
+            makePartialDecryptionLog({ validator: "0x0000000000000000000000000000000000000001", round: 1, pid: 1, uuid: 1 }),
+            makePartialDecryptionLog({ validator: "0x0000000000000000000000000000000000000002", round: 1, pid: 2, uuid: 1 }),
+          ]
+        : [];
+    });
 
     const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
     const partials = await consumer.collectPartials({
@@ -790,6 +811,98 @@ describe("Consumer", () => {
       // Validator B's partial was accepted after refresh.
       expect(partials).toHaveLength(1);
       expect(partials[0].validator.toLowerCase()).toBe(VALIDATOR_B.toLowerCase());
+    });
+
+    it("refreshes once when a DKG rotation leaves every cached key stale", async () => {
+      // Scenario: cache built under round 5 (KEY_A), then rotation → active round 6
+      // (KEY_A_ROUND6). Partial comes in signed under round 6. The pre-fix code only
+      // refreshed when a validator was absent from the map, so stale-but-present keys
+      // silently dropped every partial. With the fix, verification failure against
+      // cached keys triggers a one-shot refresh, after which the round-6 key matches.
+      const { publicClient, walletClient } = mockClients();
+      publicClient.getBlockNumber.mockResolvedValue(100n);
+
+      // ABCI reports round 5 on first build, round 6 on refresh.
+      vi.mocked(queryLatestActiveDKGNetwork)
+        .mockResolvedValueOnce({ round: 5, globalPublicKey: new Uint8Array(), threshold: 3 } as any)
+        .mockResolvedValue({ round: 6, globalPublicKey: new Uint8Array(), threshold: 3 } as any);
+
+      let dkgScanNo = 0;
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) {
+          dkgScanNo++;
+          // First scan: only the round-5 registration is returned (hybrid filter keeps it).
+          // Second scan (refresh): chain now shows both rounds; hybrid filter keeps only round-6.
+          return dkgScanNo === 1
+            ? [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 5 })]
+            : [
+                makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 5 }),
+                makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A_ROUND6, round: 6 }),
+              ];
+        }
+        return [makePartialDecryptionLog({ validator: VALIDATOR_A, round: 6, pid: 1, uuid: 60 })];
+      });
+
+      // verifyPartialSignature returns true only for the round-6 key; false for anything else.
+      vi.mocked(verifyPartialSignature).mockImplementation((args: any) => {
+        const round6 = toBytes(KEY_A_ROUND6);
+        return args.commPubKey.length === round6.length &&
+          [...args.commPubKey].every((b, i) => b === round6[i]);
+      });
+
+      const observer = makeObserverWithComet(publicClient, "http://abci-mock:26657");
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient, observer });
+
+      const partials = await consumer.collectPartials({
+        uuid: 60,
+        minPartials: 1,
+        fromBlock: 90n,
+        timeoutMs: 5_000,
+        pollIntervalMs: 10,
+      });
+
+      // Refresh happened exactly once; partial accepted after refresh.
+      expect(dkgScanNo).toBe(2);
+      expect(partials).toHaveLength(1);
+    });
+
+    it("does not re-refresh for the same validator on repeated verification failure", async () => {
+      // Three partials from the same validator, all fail signature. The first failure
+      // triggers a refresh; the next two must reuse the refreshed cache without
+      // kicking off another full-history scan (refreshedFor deduplication).
+      const { publicClient, walletClient } = mockClients();
+      publicClient.getBlockNumber.mockResolvedValue(100n);
+      vi.mocked(verifyPartialSignature).mockReturnValue(false);
+
+      let dkgScanNo = 0;
+      const onInvalidPartial = vi.fn();
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) {
+          dkgScanNo++;
+          return [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 })];
+        }
+        return [
+          makePartialDecryptionLog({ validator: VALIDATOR_A, round: 1, pid: 1, uuid: 61 }),
+          makePartialDecryptionLog({ validator: VALIDATOR_A, round: 1, pid: 2, uuid: 61 }),
+          makePartialDecryptionLog({ validator: VALIDATOR_A, round: 1, pid: 3, uuid: 61 }),
+        ];
+      });
+
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
+      await expect(
+        consumer.collectPartials({
+          uuid: 61,
+          minPartials: 1,
+          fromBlock: 90n,
+          timeoutMs: 300,
+          pollIntervalMs: 50,
+          onInvalidPartial,
+        }),
+      ).rejects.toThrow();
+
+      // Initial build + 1 refresh (triggered by first failed verify). Not 4.
+      expect(dkgScanNo).toBe(2);
+      expect(onInvalidPartial.mock.calls.length).toBeGreaterThanOrEqual(3);
     });
 
     it("does not re-refresh for the same unknown validator within one call", async () => {
