@@ -7,7 +7,7 @@ import { uuidToLabel } from "./label.js";
 import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
 import type { AttestationConfig } from "./attestation.js";
-import { queryCDRPartials } from "./cosmos/abci-query.js";
+import { queryCDRPartials, queryLatestActiveDKGNetwork } from "./cosmos/abci-query.js";
 import { bytesToHex as cosmosBytesToHex } from "./cosmos/protobuf.js";
 
 export class Consumer {
@@ -117,19 +117,35 @@ export class Consumer {
   /**
    * Fetch validator address → commPubKey[] map from DKG Registered events.
    *
-   * Each validator may re-register with a new commPubKey in each DKG round.
-   * Partials are signed with the commPubKey active in the round that serviced
-   * the read request, which is not necessarily the most recent round. The
-   * signature-verify loop in collectPartialsFromEvents tries every key in the
-   * returned array, so we must supply keys from every historical round — a
-   * rolling lookback window can exclude the round a partial was signed under
-   * and cause every verification to fail.
+   * Hybrid mode (default): query `GetLatestActiveDKGNetwork` via CometBFT
+   * ABCI to identify the currently active DKG round, then scan EVM
+   * `Registered` events within a bounded window and keep only registrations
+   * for that round. The CometBFT RPC URL defaults to the SDK's
+   * network-specific `DEFAULT_COMET_RPC_URL`; callers can override it by
+   * passing `cometRpcUrl` when constructing `CDRClient`. If the ABCI query
+   * fails (network unreachable, URL misconfigured, etc.), we fall back to
+   * keeping every key in the window and letting the verify loop try each.
    *
-   * We therefore scan the full history from genesis using chunked getLogs
-   * calls to stay within RPC range limits.
+   * The bounded window (`DKG_LOOKBACK_BLOCKS`) is sized for Aeneid / mainnet
+   * where blocks are ~2 s and DKG rotates roughly weekly — 10 days covers
+   * the current active round plus one rotation of buffer.
    */
   /** Chunk size for historical getLogs scans. Kept well below typical RPC block-range limits. */
   private static readonly DKG_LOGS_BLOCK_CHUNK = 500_000n;
+  /**
+   * DKG Registered-event lookback window, in blocks. Sized for Aeneid /
+   * mainnet (≈2 s/block, ~weekly DKG rotation): 10 days = 432_000 blocks.
+   * Covers the currently active DKG round plus one rotation of buffer.
+   */
+  private static readonly DKG_LOOKBACK_BLOCKS = 432_000n;
+  /**
+   * Default CometBFT RPC URL for the hybrid active-round filter. Used when
+   * the caller has not explicitly configured `cometRpcUrl` on the Observer.
+   * Pinned to the Aeneid / mainnet CometBFT endpoint so the SDK is usable
+   * out of the box without any manual RPC configuration. Override by
+   * passing `cometRpcUrl` when constructing `CDRClient`.
+   */
+  private static readonly DEFAULT_COMET_RPC_URL = "http://172.192.41.96:26657";
   /** Max attempts per chunk getLogs call before propagating the error. */
   private static readonly GETLOGS_MAX_ATTEMPTS = 3;
   /** Base delay (ms) for exponential backoff between getLogs retries. */
@@ -162,9 +178,28 @@ export class Consumer {
   ): Promise<Map<string, Uint8Array[]>> {
     const latestBlock = await this.publicClient.getBlockNumber();
     const chunk = Consumer.DKG_LOGS_BLOCK_CHUNK;
+    const startBlock = latestBlock > Consumer.DKG_LOOKBACK_BLOCKS
+      ? latestBlock - Consumer.DKG_LOOKBACK_BLOCKS
+      : 0n;
+
+    // Hybrid mode (default): query CometBFT ABCI for the currently active DKG
+    // round so we can filter EVM Registered events to just that round's
+    // commPubKeys. Uses the Observer's cometRpcUrl if the caller set one,
+    // otherwise falls back to the SDK's network-specific default URL. If
+    // both are unreachable or the query fails, we leave activeRound
+    // undefined and keep every round in the window as a fallback.
+    let activeRound: number | undefined;
+    const cometRpcUrl = this.observer?.cometRpcUrl ?? Consumer.DEFAULT_COMET_RPC_URL;
+    try {
+      const network = await queryLatestActiveDKGNetwork(cometRpcUrl);
+      activeRound = network.round;
+    } catch {
+      // ABCI unreachable or query failed — fall back to unfiltered scan.
+    }
+
     const validators = new Map<string, Uint8Array[]>();
 
-    for (let from = 0n; from <= latestBlock; from = from + chunk + 1n) {
+    for (let from = startBlock; from <= latestBlock; from = from + chunk + 1n) {
       const to = from + chunk > latestBlock ? latestBlock : from + chunk;
 
       const rawLogs = await this.getLogsWithRetry(dkgAddress, from, to);
@@ -176,6 +211,9 @@ export class Consumer {
       });
 
       for (const log of parsed) {
+        if (activeRound !== undefined && log.args.round !== activeRound) {
+          continue; // Hybrid mode: skip non-active rounds.
+        }
         const addr = log.args.validatorAddr.toLowerCase() as `0x${string}`;
         const keys = validators.get(addr) ?? [];
         keys.push(toBytes(log.args.enclaveCommKey));
