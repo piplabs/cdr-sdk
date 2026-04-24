@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { encodeAbiParameters, keccak256, toBytes, padHex } from "viem";
 
 // Mock @piplabs/cdr-crypto before importing Consumer so the WASM loader is never executed.
@@ -8,8 +8,17 @@ vi.mock("@piplabs/cdr-crypto", () => ({
   verifyPartialSignature: vi.fn(),
 }));
 
+// Mock the cosmos ABCI query so the hybrid path is exercised without a live RPC.
+vi.mock("../src/cosmos/abci-query.js", () => ({
+  queryCDRPartials: vi.fn(),
+  queryLatestActiveDKGNetwork: vi.fn(),
+  queryVerifiedRegistrations: vi.fn(),
+}));
+
 import { Consumer } from "../src/consumer.js";
+import { Observer } from "../src/observer.js";
 import { verifyPartialSignature } from "@piplabs/cdr-crypto";
+import { queryLatestActiveDKGNetwork } from "../src/cosmos/abci-query.js";
 
 function makePartialDecryptionLog(opts: {
   validator: `0x${string}`;
@@ -482,12 +491,36 @@ describe("Consumer", () => {
   });
 
   describe("commPubKey map caching and chunked scan", () => {
+    // Reset the ABCI mock between tests so state from one hybrid-mode test
+    // (e.g. mockRejectedValue) doesn't leak into the next and hang it.
+    // Default behavior: reject so non-hybrid tests don't accidentally hit a
+    // live mock — they should continue working via the ABCI-failure fallback.
+    beforeEach(() => {
+      vi.mocked(queryLatestActiveDKGNetwork).mockReset();
+      vi.mocked(queryLatestActiveDKGNetwork).mockRejectedValue(
+        new Error("ABCI not mocked for this test — fallback expected"),
+      );
+    });
+
     const DKG_ADDR = "0xcccccc0000000000000000000000000000000004";
     const CDR_ADDR = "0xcccccc0000000000000000000000000000000005";
     const VALIDATOR_A = "0x0000000000000000000000000000000000000001" as `0x${string}`;
     const VALIDATOR_B = "0x0000000000000000000000000000000000000002" as `0x${string}`;
     const KEY_A = ("0x" + "aa".repeat(64)) as `0x${string}`;
     const KEY_B = ("0x" + "bb".repeat(64)) as `0x${string}`;
+    const KEY_A_ROUND6 = ("0x" + "a6".repeat(64)) as `0x${string}`;
+
+    function makeObserverWithComet(publicClient: any, cometRpcUrl: string): Observer {
+      // Observer constructor requires cometRpcUrl only when dkgSource === "cosmos-abci".
+      // We pass "evm-events" here so the Observer itself stays on EVM but still carries
+      // a non-empty cometRpcUrl that the Consumer's hybrid path can pick up.
+      return new Observer({
+        network: "testnet",
+        publicClient: publicClient as any,
+        dkgSource: "evm-events",
+        cometRpcUrl,
+      });
+    }
 
     /** Count how many times publicClient.getLogs was called against the DKG contract. */
     function dkgScanCount(publicClient: any): number {
@@ -543,6 +576,135 @@ describe("Consumer", () => {
       ]);
 
       expect(dkgCallCount).toBe(1);
+    });
+
+    it("hybrid mode: queries ABCI for active round and filters Registered events to that round", async () => {
+      const { publicClient, walletClient } = mockClients();
+      vi.mocked(verifyPartialSignature).mockReturnValue(true);
+      vi.mocked(queryLatestActiveDKGNetwork).mockClear();
+      publicClient.getBlockNumber.mockResolvedValue(1_000_000n);
+
+      // ABCI says active round is 6.
+      vi.mocked(queryLatestActiveDKGNetwork).mockResolvedValue({
+        round: 6,
+        globalPublicKey: new Uint8Array(),
+        threshold: 3,
+      } as any);
+
+      const dkgRegistered = [
+        // Round 5 registrations (should be filtered out in hybrid mode).
+        makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 5 }),
+        makeRegisteredLog({ validatorAddr: VALIDATOR_B, enclaveCommKey: KEY_B, round: 5 }),
+        // Round 6 registrations (active — these should be kept).
+        makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A_ROUND6, round: 6 }),
+      ];
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) return dkgRegistered;
+        // Partial signed under round 6 (matches active) — verify path runs through the map.
+        return [makePartialDecryptionLog({ validator: VALIDATOR_A, round: 6, pid: 1, uuid: 100 })];
+      });
+
+      const observer = makeObserverWithComet(publicClient, "http://172.192.41.96:26657");
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient, observer });
+
+      const partials = await consumer.collectPartials({
+        uuid: 100,
+        minPartials: 1,
+        fromBlock: 990_000n,
+        timeoutMs: 2_000,
+        pollIntervalMs: 10,
+      });
+
+      // ABCI was consulted exactly once per cache build.
+      expect(queryLatestActiveDKGNetwork).toHaveBeenCalledTimes(1);
+      expect(queryLatestActiveDKGNetwork).toHaveBeenCalledWith("http://172.192.41.96:26657");
+      // Partial from round 6 was accepted (signature mock returns true).
+      expect(partials).toHaveLength(1);
+      // verifyPartialSignature was called with the ROUND 6 key only.
+      const verifyCall = vi.mocked(verifyPartialSignature).mock.calls.find(
+        (c: any[]) => c[0].round === 6,
+      );
+      expect(verifyCall).toBeDefined();
+      // The commPubKey passed in must equal the round-6 key, not the round-5 one.
+      const passedKey = verifyCall![0].commPubKey;
+      const round6Bytes = toBytes(KEY_A_ROUND6);
+      expect(passedKey.length).toBe(round6Bytes.length);
+      expect([...passedKey]).toEqual([...round6Bytes]);
+    });
+
+    it("hybrid mode: when ABCI query fails, falls back to keeping all rounds (graceful degradation)", async () => {
+      const { publicClient, walletClient } = mockClients();
+      vi.mocked(verifyPartialSignature).mockReturnValue(true);
+      publicClient.getBlockNumber.mockResolvedValue(1_000_000n);
+
+      // ABCI rejects — hybrid path should swallow the error and scan without filtering.
+      vi.mocked(queryLatestActiveDKGNetwork).mockRejectedValue(new Error("ABCI unavailable"));
+
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) {
+          return [
+            makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 5 }),
+            makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A_ROUND6, round: 6 }),
+          ];
+        }
+        return [makePartialDecryptionLog({ validator: VALIDATOR_A, round: 5, pid: 1, uuid: 101 })];
+      });
+
+      const observer = makeObserverWithComet(publicClient, "http://bad-host:26657");
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient, observer });
+
+      const partials = await consumer.collectPartials({
+        uuid: 101,
+        minPartials: 1,
+        fromBlock: 990_000n,
+        timeoutMs: 2_000,
+        pollIntervalMs: 10,
+      });
+
+      // Even though ABCI failed, the partial (round 5) still verifies because we kept
+      // both rounds' keys — the verify loop finds the round-5 match.
+      expect(partials).toHaveLength(1);
+    });
+
+    it("hybrid mode default: no observer → SDK still consults the default CometBFT URL", async () => {
+      const { publicClient, walletClient } = mockClients();
+      vi.mocked(verifyPartialSignature).mockReturnValue(true);
+      vi.mocked(queryLatestActiveDKGNetwork).mockClear();
+      // Default ABCI URL is reachable and reports active round = 6.
+      vi.mocked(queryLatestActiveDKGNetwork).mockResolvedValue({
+        round: 6,
+        globalPublicKey: new Uint8Array(),
+        threshold: 3,
+      } as any);
+      publicClient.getBlockNumber.mockResolvedValue(1_000_000n);
+
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) {
+          return [
+            makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 5 }),
+            makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A_ROUND6, round: 6 }),
+          ];
+        }
+        return [makePartialDecryptionLog({ validator: VALIDATOR_A, round: 6, pid: 1, uuid: 102 })];
+      });
+
+      // No observer passed — SDK should fall back to the hardcoded default URL.
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
+
+      const partials = await consumer.collectPartials({
+        uuid: 102,
+        minPartials: 1,
+        fromBlock: 990_000n,
+        timeoutMs: 2_000,
+        pollIntervalMs: 10,
+      });
+
+      // ABCI was consulted once using the SDK's default URL (not user-supplied).
+      expect(queryLatestActiveDKGNetwork).toHaveBeenCalledTimes(1);
+      expect(queryLatestActiveDKGNetwork).toHaveBeenCalledWith(
+        "http://172.207.250.203:26657",
+      );
+      expect(partials).toHaveLength(1);
     });
 
     it("reuses the cached commPubKey map across back-to-back collectPartials calls", async () => {
@@ -670,12 +832,17 @@ describe("Consumer", () => {
       expect(onInvalidPartial.mock.calls.length).toBeGreaterThanOrEqual(3);
     });
 
-    it("scans DKG history in contiguous non-overlapping chunks covering [0, latestBlock]", async () => {
+    it("scans DKG history in contiguous non-overlapping chunks covering [latestBlock - lookback, latestBlock]", async () => {
+      // Must mirror Consumer.DKG_LOOKBACK_BLOCKS. Kept as a local const so the
+      // three assertions below read from one source of truth.
+      const LOOKBACK = 620n;
+      // Any value > LOOKBACK exercises the main path (no clamp-to-0).
+      const LATEST = 50_000n;
+      const EXPECTED_START = LATEST - LOOKBACK;
+
       const { publicClient, walletClient } = mockClients();
       vi.mocked(verifyPartialSignature).mockReturnValue(true);
-
-      // latestBlock = 1_250_000 → 3 chunks of size 500_000: [0,500000], [500001,1000001], [1000002,1250000]
-      publicClient.getBlockNumber.mockResolvedValue(1_250_000n);
+      publicClient.getBlockNumber.mockResolvedValue(LATEST);
 
       const chunks: { from: bigint; to: bigint }[] = [];
       publicClient.getLogs.mockImplementation(async (params: any) => {
@@ -693,25 +860,21 @@ describe("Consumer", () => {
         consumer.collectPartials({
           uuid: 9,
           minPartials: 1,
-          fromBlock: 1_250_000n,
+          fromBlock: LATEST,
           timeoutMs: 200,
           pollIntervalMs: 50,
         }),
       ).rejects.toThrow();
 
-      // Verify contiguity: each chunk starts exactly one past the previous end,
-      // and the final chunk reaches latestBlock. Count accounts for both the
-      // initial build and the one-shot refresh triggered by the unknown validator,
-      // so we expect 6 total chunk calls (3 per scan × 2 scans).
-      expect(chunks.length).toBe(6);
+      // LOOKBACK < DKG_LOGS_BLOCK_CHUNK (500_000n) → single chunk per scan.
+      // Initial build (1) + one-shot refresh on unknown validator (1) = 2 calls.
+      expect(chunks.length).toBe(2);
 
-      const firstBuild = chunks.slice(0, 3);
-      expect(firstBuild[0].from).toBe(0n);
-      expect(firstBuild[0].to).toBe(500_000n);
-      expect(firstBuild[1].from).toBe(500_001n);
-      expect(firstBuild[1].to).toBe(1_000_001n);
-      expect(firstBuild[2].from).toBe(1_000_002n);
-      expect(firstBuild[2].to).toBe(1_250_000n);
+      // Both calls must cover exactly [LATEST - LOOKBACK, LATEST].
+      for (const c of chunks) {
+        expect(c.from).toBe(EXPECTED_START);
+        expect(c.to).toBe(LATEST);
+      }
     });
 
     it("deduplicates concurrent cache builds — only one scan runs", async () => {
