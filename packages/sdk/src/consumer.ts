@@ -28,6 +28,14 @@ export class Consumer {
    */
   private commPubKeyMapPromise: Promise<Map<string, Uint8Array[]>> | null = null;
 
+  /**
+   * Flag tracking whether we've already warned about using the default
+   * (hardcoded, plaintext HTTP) CometBFT RPC URL on this Consumer instance.
+   * Keeps the warning to once per instance instead of spamming on every
+   * cache build / refresh.
+   */
+  private defaultCometUrlWarned = false;
+
   /** Alias for {@link accessCDR} */
   readVault: Consumer["accessCDR"];
   /** Alias for {@link downloadFile} */
@@ -143,8 +151,23 @@ export class Consumer {
    * Default CometBFT RPC URL for the hybrid active-round filter. Used when
    * the caller has not explicitly configured `cometRpcUrl` on the Observer.
    * Pinned to the DevNet CometBFT endpoint so the SDK is usable out of the
-   * box on DevNet without any manual RPC configuration. Override by
-   * passing `cometRpcUrl` when constructing `CDRClient`.
+   * box on DevNet without any manual RPC configuration.
+   *
+   * ⚠️ SECURITY WARNING — The default is a raw IP over plaintext HTTP. A
+   * network-level attacker able to intercept traffic between the SDK and
+   * this endpoint can forge the `activeRound` response, causing the hybrid
+   * filter to keep only the attacker's chosen round's keys. All legitimate
+   * partials will then fail verification and be dropped — a denial-of-
+   * service on `accessCDR`. Fallback-to-unfiltered-scan does not apply
+   * here because the MITM returns a valid-looking response.
+   *
+   * For production deployments, override this by passing `cometRpcUrl`
+   * when constructing `CDRClient`, pointing either at your own CometBFT
+   * node or at an HTTPS endpoint you control. This default exists only as
+   * a zero-config convenience for development and demos.
+   *
+   * When the SDK falls back to this default at runtime, it emits a
+   * one-time `console.warn` to surface the risk.
    */
   private static readonly DEFAULT_COMET_RPC_URL = "http://172.207.250.203:26657";
   /** Max attempts per chunk getLogs call before propagating the error. */
@@ -191,6 +214,16 @@ export class Consumer {
     // undefined and keep every round in the window as a fallback.
     let activeRound: number | undefined;
     const cometRpcUrl = this.observer?.cometRpcUrl ?? Consumer.DEFAULT_COMET_RPC_URL;
+    if (!this.observer?.cometRpcUrl && !this.defaultCometUrlWarned) {
+      this.defaultCometUrlWarned = true;
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[cdr-sdk] Using the default CometBFT RPC URL over plaintext HTTP " +
+          `(${Consumer.DEFAULT_COMET_RPC_URL}). A network-level attacker can forge the active DKG round ` +
+          "and cause every accessCDR call to fail. For production, pass `cometRpcUrl` to CDRClient " +
+          "pointing to your own CometBFT node or an HTTPS endpoint.",
+      );
+    }
     try {
       const network = await queryLatestActiveDKGNetwork(cometRpcUrl);
       activeRound = network.round;

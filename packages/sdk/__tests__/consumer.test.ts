@@ -687,6 +687,68 @@ describe("Consumer", () => {
       expect(partials).toHaveLength(1);
     });
 
+    it("warns exactly once per Consumer when falling back to the default CometBFT URL", async () => {
+      const { publicClient, walletClient } = mockClients();
+      vi.mocked(verifyPartialSignature).mockReturnValue(true);
+      vi.mocked(queryLatestActiveDKGNetwork).mockResolvedValue({
+        round: 1, globalPublicKey: new Uint8Array(), threshold: 3,
+      } as any);
+      publicClient.getBlockNumber.mockResolvedValue(100n);
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) {
+          return [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 })];
+        }
+        return [makePartialDecryptionLog({ validator: VALIDATOR_A, round: 1, pid: 1, uuid: 70 })];
+      });
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        // No observer → hybrid path uses the hardcoded default URL.
+        const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
+        // First accessCDR: warning fires.
+        await consumer.collectPartials({ uuid: 70, minPartials: 1, fromBlock: 90n, timeoutMs: 5_000, pollIntervalMs: 10 });
+        // Trigger an explicit refresh to force another default-URL consultation.
+        await consumer.prefetchRegistry();
+
+        const defaultWarnings = warnSpy.mock.calls.filter(
+          (c) => typeof c[0] === "string" && c[0].includes("default CometBFT RPC URL"),
+        );
+        expect(defaultWarnings).toHaveLength(1);
+        expect(defaultWarnings[0][0]).toContain("http://172.207.250.203:26657");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("does not warn when the caller supplies an explicit cometRpcUrl", async () => {
+      const { publicClient, walletClient } = mockClients();
+      vi.mocked(verifyPartialSignature).mockReturnValue(true);
+      vi.mocked(queryLatestActiveDKGNetwork).mockResolvedValue({
+        round: 1, globalPublicKey: new Uint8Array(), threshold: 3,
+      } as any);
+      publicClient.getBlockNumber.mockResolvedValue(100n);
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) {
+          return [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 })];
+        }
+        return [makePartialDecryptionLog({ validator: VALIDATOR_A, round: 1, pid: 1, uuid: 71 })];
+      });
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const observer = makeObserverWithComet(publicClient, "https://my-own-cometbft.example:26657");
+        const consumer = new Consumer({ network: "testnet", publicClient, walletClient, observer });
+        await consumer.collectPartials({ uuid: 71, minPartials: 1, fromBlock: 90n, timeoutMs: 5_000, pollIntervalMs: 10 });
+
+        const defaultWarnings = warnSpy.mock.calls.filter(
+          (c) => typeof c[0] === "string" && c[0].includes("default CometBFT RPC URL"),
+        );
+        expect(defaultWarnings).toHaveLength(0);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
     it("hybrid mode default: no observer → SDK still consults the default CometBFT URL", async () => {
       const { publicClient, walletClient } = mockClients();
       vi.mocked(verifyPartialSignature).mockReturnValue(true);
