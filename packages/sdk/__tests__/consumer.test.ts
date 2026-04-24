@@ -1078,6 +1078,43 @@ describe("Consumer", () => {
       expect(dkgCallCount).toBe(1);
     });
 
+    it("retries a transient CDR-poll getLogs failure and still collects partials", async () => {
+      // Regression for PERF-05 flake: the partial-polling getLogs call used to
+      // bypass the retry wrapper, so a single transient "invalid block range
+      // params" from the public RPC would propagate all the way up as an
+      // accessCDR failure. With the wrapper, one bad attempt is absorbed and
+      // the poll loop keeps going.
+      const { publicClient, walletClient } = mockClients();
+      vi.mocked(verifyPartialSignature).mockReturnValue(true);
+      publicClient.getBlockNumber.mockResolvedValue(100n);
+
+      let cdrAttempt = 0;
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) {
+          return [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 })];
+        }
+        // CDR scan: first attempt fails with the exact error observed in e2e.
+        cdrAttempt++;
+        if (cdrAttempt === 1) {
+          throw new Error("invalid block range params");
+        }
+        return [makePartialDecryptionLog({ validator: VALIDATOR_A, round: 1, pid: 1, uuid: 80 })];
+      });
+
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
+      const partials = await consumer.collectPartials({
+        uuid: 80,
+        minPartials: 1,
+        fromBlock: 90n,
+        timeoutMs: 5_000,
+        pollIntervalMs: 10,
+      });
+
+      // 1 transient failure + 1 successful retry.
+      expect(cdrAttempt).toBe(2);
+      expect(partials).toHaveLength(1);
+    });
+
     it("retries a failing chunk with exponential backoff and succeeds on second attempt", async () => {
       const { publicClient, walletClient } = mockClients();
       vi.mocked(verifyPartialSignature).mockReturnValue(true);

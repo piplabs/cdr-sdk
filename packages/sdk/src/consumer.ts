@@ -351,11 +351,12 @@ export class Consumer {
     while (Date.now() < deadline) {
       const currentBlock = await this.publicClient.getBlockNumber();
       if (currentBlock >= lastScannedBlock) {
-        const rawLogs = await this.publicClient.getLogs({
-          address: cdrAddress,
-          fromBlock: lastScannedBlock,
-          toBlock: currentBlock,
-        });
+        // Same retry wrapper used for the DKG scan: public RPCs (notably
+        // aeneid.storyrpc.io) occasionally return "invalid block range params"
+        // for tiny ranges — a transient error we should not let surface as an
+        // accessCDR failure in the middle of the poll loop. See PERF-05 flake
+        // observed in https://github.com/piplabs/story-cdr-e2e/actions/runs/24884251274.
+        const rawLogs = await this.getLogsWithRetry(cdrAddress, lastScannedBlock, currentBlock);
         lastScannedBlock = currentBlock + BigInt(1);
 
         const parsed = parseEventLogs({
