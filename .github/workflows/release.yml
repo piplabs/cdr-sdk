@@ -37,6 +37,26 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # Supply-chain gate. Audit production dependencies (the deps that ship
+      # to consumers) for high+ severity vulnerabilities. devDependencies are
+      # excluded — they don't make it into the published tarball.
+      #
+      # `pnpm audit` exits 0 even when vulnerabilities exist (the
+      # --audit-level flag is a print filter, not a failure threshold), so
+      # we parse JSON and explicitly fail on any high or critical advisory.
+      # Suppress specific transitive vulns by adding a pnpm.overrides entry
+      # in the root package.json once a fixed version is available.
+      - name: Audit production dependencies
+        run: |
+          pnpm audit --json --prod > /tmp/audit.json || true
+          COUNT=$(jq '[.advisories | to_entries[] | select(.value.severity == "high" or .value.severity == "critical")] | length' /tmp/audit.json)
+          if [ "${COUNT:-0}" -gt 0 ]; then
+            echo "::error::Found $COUNT high+ severity vulnerabilities in production deps"
+            jq '[.advisories | to_entries[] | select(.value.severity == "high" or .value.severity == "critical") | .value | {severity, title, module: .module_name, vulnerable: .vulnerable_versions, patched: .patched_versions}]' /tmp/audit.json
+            exit 1
+          fi
+          echo "No high+ severity vulnerabilities in production deps."
+
       - run: pnpm -r run build
 
       # Vitest unit tests across all packages that declare a `test` script.
@@ -92,6 +112,15 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - run: pnpm -r run build
+
+      # Pre-publish dry-run. Validates tarball contents (file list, package.json
+      # shape, workspace:* substitution) without contacting the registry to
+      # write. Catches regressions in `files` whitelists or workspace dep
+      # resolution before any tarball is irrevocably uploaded.
+      - name: Verify publish tarballs (dry-run)
+        run: pnpm -r publish --dry-run --no-git-checks
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish to npm
         run: pnpm changeset publish
