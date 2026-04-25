@@ -11,10 +11,11 @@ import { CURVE_ED25519 } from "@piplabs/cdr-crypto";
 import type { Vault } from "./types.js";
 import { RpcConsensusError } from "./errors.js";
 import {
+  queryDKGParams,
   queryLatestActiveDKGNetwork,
   queryVerifiedRegistrations,
 } from "./cosmos/abci-query.js";
-import type { DKGNetwork } from "./cosmos/dkg-proto.js";
+import type { DKGNetwork, DKGParams } from "./cosmos/dkg-proto.js";
 
 /**
  * Which backend to use for DKG queries.
@@ -43,8 +44,24 @@ export class Observer {
   /** Many RPCs reject or time out on wide eth_getLogs ranges; chunk to stay under typical caps. */
   private static readonly DKG_LOGS_BLOCK_CHUNK = 8192n;
 
-  /** Default lookback window: ~7 days at ~2 s/block. Avoids scanning from block 0 on long chains. */
+  /**
+   * Fallback lookback window when DKG params can't be fetched from any
+   * CometBFT RPC. When params are reachable, the window is computed as
+   * `2 × (registrationPeriod + dealingPeriod + finalizationPeriod) + activePeriod`,
+   * which spans the current epoch plus a buffer of one prior DKG protocol pass.
+   */
   private static readonly DEFAULT_LOOKBACK_BLOCKS = 302_400n;
+
+  /**
+   * Default CometBFT RPC URL used to fetch DKG params when the caller has not
+   * configured `cometRpcUrl`. Pinned to the Aeneid / mainnet endpoint so the
+   * SDK works zero-config for development and demos.
+   *
+   * ⚠️ Plaintext HTTP — a network-level attacker could forge params /
+   * activeRound responses. Production deployments should always pass an
+   * explicit `cometRpcUrl` (own node, or HTTPS).
+   */
+  static readonly DEFAULT_COMET_RPC_URL = "http://172.192.41.96:26657";
 
   private publicClient: PublicClient;
   private network: Network;
@@ -52,6 +69,8 @@ export class Observer {
   readonly cometRpcUrl: string | undefined;
   private minThresholdRatio?: number;
   private validationClients?: PublicClient[];
+  private dkgParamsPromise: Promise<DKGParams> | null = null;
+  private defaultCometUrlWarned = false;
 
   constructor(params: {
     network: Network;
@@ -269,10 +288,9 @@ export class Observer {
     round?: number;
   }): Promise<Map<string, Uint8Array>> {
     const toBlock = await this.publicClient.getBlockNumber();
+    const lookback = await this.getLookbackBlocks();
     const fromBlock = params?.fromBlock ??
-      (toBlock > Observer.DEFAULT_LOOKBACK_BLOCKS
-        ? toBlock - Observer.DEFAULT_LOOKBACK_BLOCKS
-        : 0n);
+      (toBlock > lookback ? toBlock - lookback : 0n);
 
     const rawLogs = await this.fetchDkgEventLogs(
       this.publicClient,
@@ -342,10 +360,9 @@ export class Observer {
   private async getFinalizedEvents(params?: { fromBlock?: bigint; toBlock?: bigint }): Promise<Array<{ args: { round: number; globalPubKey: `0x${string}`; validatorAddr: `0x${string}` } }>> {
     const toBlock =
       params?.toBlock ?? (await this.publicClient.getBlockNumber());
+    const lookback = await this.getLookbackBlocks();
     const fromBlock = params?.fromBlock ??
-      (toBlock > Observer.DEFAULT_LOOKBACK_BLOCKS
-        ? toBlock - Observer.DEFAULT_LOOKBACK_BLOCKS
-        : 0n);
+      (toBlock > lookback ? toBlock - lookback : 0n);
 
     const rawLogs = await this.fetchDkgEventLogs(
       this.publicClient,
@@ -428,10 +445,9 @@ export class Observer {
     // Cross-validate against additional RPCs if configured
     if (this.validationClients?.length) {
       const primaryHex = toHex(rawPoint);
+      const lookback = await this.getLookbackBlocks();
       const fromBlock = params?.fromBlock ??
-        (toBlock > Observer.DEFAULT_LOOKBACK_BLOCKS
-          ? toBlock - Observer.DEFAULT_LOOKBACK_BLOCKS
-          : 0n);
+        (toBlock > lookback ? toBlock - lookback : 0n);
 
       const settled = await Promise.allSettled(
         this.validationClients.map(async (client) => {
@@ -463,10 +479,9 @@ export class Observer {
     round?: number;
   }): Promise<Map<string, Uint8Array>> {
     const toBlock = await this.publicClient.getBlockNumber();
+    const lookback = await this.getLookbackBlocks();
     const fromBlock = params?.fromBlock ??
-      (toBlock > Observer.DEFAULT_LOOKBACK_BLOCKS
-        ? toBlock - Observer.DEFAULT_LOOKBACK_BLOCKS
-        : 0n);
+      (toBlock > lookback ? toBlock - lookback : 0n);
 
     const rawLogs = await this.fetchDkgEventLogs(
       this.publicClient,
@@ -507,6 +522,51 @@ export class Observer {
 
   private async getLatestActiveNetwork(): Promise<DKGNetwork> {
     return queryLatestActiveDKGNetwork(this.requireCometRpcUrl());
+  }
+
+  /**
+   * Fetch x/dkg module Params, cached for the lifetime of this Observer.
+   * Uses the configured `cometRpcUrl`; falls back to
+   * {@link Observer.DEFAULT_COMET_RPC_URL} with a one-time warning when none
+   * is set.
+   */
+  async getDKGParams(): Promise<DKGParams> {
+    if (!this.dkgParamsPromise) {
+      const url = this.cometRpcUrl ?? Observer.DEFAULT_COMET_RPC_URL;
+      if (!this.cometRpcUrl && !this.defaultCometUrlWarned) {
+        this.defaultCometUrlWarned = true;
+        // eslint-disable-next-line no-console
+        console.warn(
+          "[cdr-sdk] Using the default CometBFT RPC URL over plaintext HTTP " +
+            `(${Observer.DEFAULT_COMET_RPC_URL}) to fetch DKG params for the event-scan lookback. ` +
+            "A network-level attacker can forge params and shrink/expand the scan window. " +
+            "For production, pass `cometRpcUrl` to CDRClient pointing to your own CometBFT node " +
+            "or an HTTPS endpoint.",
+        );
+      }
+      this.dkgParamsPromise = queryDKGParams(url).catch((e) => {
+        this.dkgParamsPromise = null;
+        throw e;
+      });
+    }
+    return this.dkgParamsPromise;
+  }
+
+  /**
+   * Lookback window for EVM event scans, in blocks:
+   *   2 × (registrationPeriod + dealingPeriod + finalizationPeriod) + activePeriod
+   *
+   * Falls back to {@link Observer.DEFAULT_LOOKBACK_BLOCKS} when DKG params
+   * are unreachable on every CometBFT URL.
+   */
+  async getLookbackBlocks(): Promise<bigint> {
+    try {
+      const p = await this.getDKGParams();
+      return 2n * (p.registrationPeriod + p.dealingPeriod + p.finalizationPeriod)
+        + p.activePeriod;
+    } catch {
+      return Observer.DEFAULT_LOOKBACK_BLOCKS;
+    }
   }
 
   private async getGlobalPubKeyFromCosmos(): Promise<Uint8Array> {
