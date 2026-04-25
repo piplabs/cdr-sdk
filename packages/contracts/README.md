@@ -15,7 +15,7 @@ npm install @piplabs/cdr-contracts viem
 - `cdrAbi`, `dkgAbi` — viem-compatible ABIs
 - `contractAddresses` — `{ mainnet: { dkg, cdr }, testnet: { dkg, cdr } }`
 - `type Network` — `"mainnet" | "testnet"`
-- `getCdrContract`, `getDkgContract` — viem contract helpers
+- `getCDRContract`, `getDKGContract` — viem `getContract` helpers
 
 ## Usage
 
