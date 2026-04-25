@@ -28,6 +28,24 @@ export class Consumer {
    */
   private commPubKeyMapPromise: Promise<Map<string, Uint8Array[]>> | null = null;
 
+  /**
+   * Whether a scan is currently in progress. Used to deduplicate concurrent
+   * force-refresh requests: without this flag, two collectPartials calls that
+   * both encounter a verification failure at the same time would each call
+   * getCommPubKeyMap(true) and fan out into two parallel full-history scans.
+   * With it, the second caller joins the first refresh's in-flight promise.
+   */
+  private commPubKeyMapBuildInFlight = false;
+
+  /**
+   * Cached "fallback" Observer used by getEventLookback when the Consumer
+   * was constructed without one. Reusing the same instance preserves its
+   * `defaultCometUrlWarned` flag, so the plaintext-HTTP warning fires
+   * exactly once per Consumer instead of once per getEventLookback call
+   * (which would re-fire after every cache refresh).
+   */
+  private fallbackObserver: Observer | null = null;
+
   /** Alias for {@link accessCDR} */
   readVault: Consumer["accessCDR"];
   /** Alias for {@link downloadFile} */
@@ -140,22 +158,36 @@ export class Consumer {
 
   /**
    * Return the cached commPubKey map, building it on first call or when
-   * {@link forceRefresh} is true. Concurrent callers share the same in-flight
-   * build promise so we never scan the full history twice in parallel. If a
-   * build fails, the rejected promise is cleared so a subsequent call can
-   * retry from scratch instead of inheriting the failure.
+   * {@link forceRefresh} is true.
+   *
+   * Concurrent callers share the same in-flight build promise so we never
+   * scan the full history twice in parallel — this dedup applies to the
+   * force-refresh path as well, so two collectPartials calls that both
+   * hit a verification failure at the same time only trigger one rescan.
+   * On build failure the rejected promise is cleared so a subsequent
+   * call can retry from scratch instead of inheriting the rejection.
    */
   private async getCommPubKeyMap(forceRefresh = false): Promise<Map<string, Uint8Array[]>> {
+    // Any build currently in flight is shared with all callers, refresh or not.
+    if (this.commPubKeyMapBuildInFlight && this.commPubKeyMapPromise) {
+      return this.commPubKeyMapPromise;
+    }
+    // No build in flight: a non-refresh caller can reuse a settled cache.
     if (!forceRefresh && this.commPubKeyMapPromise) {
       return this.commPubKeyMapPromise;
     }
+    this.commPubKeyMapBuildInFlight = true;
     const dkgAddress = contractAddresses[this.network].dkg;
-    const p = this.fetchRegisteredValidators(dkgAddress).catch((err) => {
-      if (this.commPubKeyMapPromise === p) {
-        this.commPubKeyMapPromise = null;
-      }
-      throw err;
-    });
+    const p = this.fetchRegisteredValidators(dkgAddress)
+      .catch((err) => {
+        if (this.commPubKeyMapPromise === p) {
+          this.commPubKeyMapPromise = null;
+        }
+        throw err;
+      })
+      .finally(() => {
+        this.commPubKeyMapBuildInFlight = false;
+      });
     this.commPubKeyMapPromise = p;
     return p;
   }
@@ -165,16 +197,20 @@ export class Consumer {
    *   2 × (registrationPeriod + dealingPeriod + finalizationPeriod) + activePeriod
    *
    * Delegates to the configured Observer (which caches DKG params). When no
-   * Observer is wired, builds a temporary one bound to this Consumer's
-   * cometRpcUrl resolution so the same fallback URL + warning apply.
+   * Observer is wired, lazily builds a single temporary one bound to this
+   * Consumer's cometRpcUrl resolution and reuses it across calls — reusing
+   * preserves the Observer's `defaultCometUrlWarned` flag so the plaintext-
+   * HTTP warning fires once per Consumer rather than once per refresh.
    */
   private async getEventLookback(): Promise<bigint> {
     if (this.observer) return this.observer.getLookbackBlocks();
-    const tmp = new Observer({
-      network: this.network,
-      publicClient: this.publicClient,
-    });
-    return tmp.getLookbackBlocks();
+    if (!this.fallbackObserver) {
+      this.fallbackObserver = new Observer({
+        network: this.network,
+        publicClient: this.publicClient,
+      });
+    }
+    return this.fallbackObserver.getLookbackBlocks();
   }
 
   private async fetchRegisteredValidators(

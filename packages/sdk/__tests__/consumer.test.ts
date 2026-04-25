@@ -9,16 +9,22 @@ vi.mock("@piplabs/cdr-crypto", () => ({
 }));
 
 // Mock the cosmos ABCI query so the hybrid path is exercised without a live RPC.
+// queryDKGParams must be in the factory too: Observer.getLookbackBlocks()
+// invokes it to derive the EVM event-scan window. If it is absent, the import
+// resolves to undefined at runtime, the catch in getLookbackBlocks silently
+// swallows the error, and every test transparently falls back to
+// Observer.DEFAULT_LOOKBACK_BLOCKS instead of exercising the dynamic formula.
 vi.mock("../src/cosmos/abci-query.js", () => ({
   queryCDRPartials: vi.fn(),
   queryLatestActiveDKGNetwork: vi.fn(),
   queryVerifiedRegistrations: vi.fn(),
+  queryDKGParams: vi.fn(),
 }));
 
 import { Consumer } from "../src/consumer.js";
 import { Observer } from "../src/observer.js";
 import { verifyPartialSignature } from "@piplabs/cdr-crypto";
-import { queryLatestActiveDKGNetwork } from "../src/cosmos/abci-query.js";
+import { queryLatestActiveDKGNetwork, queryDKGParams } from "../src/cosmos/abci-query.js";
 
 function makePartialDecryptionLog(opts: {
   validator: `0x${string}`;
@@ -1208,6 +1214,137 @@ describe("Consumer", () => {
       expect(partials).toHaveLength(1);
       // First build attempted 3 retries; second build succeeded on attempt 1. Total DKG calls = 4.
       expect(callCount).toBe(4);
+    });
+
+    it("derives the event-scan lookback from queryDKGParams (dynamic formula)", async () => {
+      // Direct test of the dynamic-lookback formula (separate from the
+      // chunk-coverage test which intentionally exercises the fallback).
+      // Mock queryDKGParams with concrete values and assert the chunked DKG
+      // scan starts at exactly latestBlock - lookback, where:
+      //   lookback = 2 × (registration + dealing + finalization) + active
+      const REG = 100n, DEAL = 200n, FIN = 200n, ACTIVE = 1000n;
+      const EXPECTED_LOOKBACK = 2n * (REG + DEAL + FIN) + ACTIVE; // = 2000n
+      const LATEST = 1_000_000n;
+      const EXPECTED_START = LATEST - EXPECTED_LOOKBACK;
+
+      const { publicClient, walletClient } = mockClients();
+      vi.mocked(verifyPartialSignature).mockReturnValue(true);
+      vi.mocked(queryDKGParams).mockResolvedValue({
+        registrationPeriod: REG,
+        dealingPeriod: DEAL,
+        finalizationPeriod: FIN,
+        activePeriod: ACTIVE,
+      });
+      publicClient.getBlockNumber.mockResolvedValue(LATEST);
+
+      const chunks: { from: bigint; to: bigint }[] = [];
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) {
+          chunks.push({ from: params.fromBlock, to: params.toBlock });
+          return [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 })];
+        }
+        return [makePartialDecryptionLog({ validator: VALIDATOR_A, round: 1, pid: 1, uuid: 200 })];
+      });
+
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
+      await consumer.collectPartials({ uuid: 200, minPartials: 1, fromBlock: 990_000n, timeoutMs: 5_000, pollIntervalMs: 10 });
+
+      // Lookback (2000) ≪ DKG_LOGS_BLOCK_CHUNK (500_000) → exactly one DKG-scan call.
+      expect(chunks.length).toBe(1);
+      expect(chunks[0].from).toBe(EXPECTED_START);
+      expect(chunks[0].to).toBe(LATEST);
+      expect(queryDKGParams).toHaveBeenCalled();
+    });
+
+    it("dedups concurrent force-refresh requests into a single rescan", async () => {
+      // Two collectPartials calls both hit a verification failure for the
+      // same validator at the same time. Without the buildInFlight guard,
+      // both would call getCommPubKeyMap(true) and fan out into two parallel
+      // full-history scans. With the guard, the second caller joins the
+      // first refresh's in-flight promise.
+      const { publicClient, walletClient } = mockClients();
+      publicClient.getBlockNumber.mockResolvedValue(100n);
+      // First verify call fails (forces refresh on both concurrent paths);
+      // post-refresh verifies all succeed.
+      let verifyCount = 0;
+      vi.mocked(verifyPartialSignature).mockImplementation(() => {
+        verifyCount++;
+        return verifyCount > 2; // first 2 calls (one per concurrent caller) fail
+      });
+
+      let dkgScanCount = 0;
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) {
+          dkgScanCount++;
+          // Slow scan so concurrent callers definitely overlap.
+          await new Promise((r) => setTimeout(r, 80));
+          return [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 })];
+        }
+        return [makePartialDecryptionLog({ validator: VALIDATOR_A, round: 1, pid: 1, uuid: 201 })];
+      });
+
+      const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
+      // Pre-warm cache so both concurrent callers go straight to verify (then both fail-then-refresh in parallel).
+      await consumer.prefetchRegistry();
+      const dkgScansAfterPrewarm = dkgScanCount;
+
+      await Promise.all([
+        consumer.collectPartials({ uuid: 201, minPartials: 1, fromBlock: 90n, timeoutMs: 5_000, pollIntervalMs: 10 }),
+        consumer.collectPartials({ uuid: 201, minPartials: 1, fromBlock: 90n, timeoutMs: 5_000, pollIntervalMs: 10 }),
+      ]);
+
+      // Exactly one refresh scan in addition to the prefetch.
+      expect(dkgScanCount - dkgScansAfterPrewarm).toBe(1);
+    });
+
+    it("emits the default-CometBFT-URL warning exactly once even after a force-refresh", async () => {
+      // When no Observer is wired into the Consumer, getEventLookback used
+      // to construct a fresh Observer on every call. Each new Observer had
+      // its own defaultCometUrlWarned=false, so a force-refresh would re-fire
+      // the plaintext-HTTP warning. The fix caches the fallback Observer on
+      // the Consumer instance, so the flag persists across refreshes.
+      const { publicClient, walletClient } = mockClients();
+      vi.mocked(verifyPartialSignature).mockReturnValue(true);
+      // Force the params query to fail so getLookbackBlocks falls back AND
+      // the warning path runs (the warning fires regardless of whether the
+      // params query succeeds or fails — it's about *consulting* the URL).
+      vi.mocked(queryDKGParams).mockRejectedValue(new Error("ABCI unreachable"));
+      publicClient.getBlockNumber.mockResolvedValue(100n);
+
+      let dkgScanCount = 0;
+      publicClient.getLogs.mockImplementation(async (params: any) => {
+        if (params.address === DKG_ADDR) {
+          dkgScanCount++;
+          // First scan: only validator A. Refresh: validator B also.
+          return dkgScanCount === 1
+            ? [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 })]
+            : [
+                makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 }),
+                makeRegisteredLog({ validatorAddr: VALIDATOR_B, enclaveCommKey: KEY_B, round: 1 }),
+              ];
+        }
+        // Partial from validator B forces a refresh on the first call.
+        return [makePartialDecryptionLog({ validator: VALIDATOR_B, round: 1, pid: 1, uuid: 202 })];
+      });
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        // No observer wired → fallback Observer path exercised.
+        const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
+        await consumer.collectPartials({ uuid: 202, minPartials: 1, fromBlock: 90n, timeoutMs: 5_000, pollIntervalMs: 10 });
+
+        // Exactly one default-URL warning, even though the cache was built
+        // (initial scan) and refreshed (after the unknown-validator failure).
+        const defaultUrlWarnings = warnSpy.mock.calls.filter(
+          (c) => typeof c[0] === "string" && c[0].includes("default CometBFT RPC URL"),
+        );
+        expect(defaultUrlWarnings).toHaveLength(1);
+        // Sanity: the refresh actually happened — otherwise we wouldn't be
+        // testing the post-refresh case at all.
+        expect(dkgScanCount).toBeGreaterThanOrEqual(2);
+      } finally {
+        warnSpy.mockRestore();
+      }
     });
   });
 });
