@@ -10,7 +10,13 @@ concurrency: ${{ github.workflow }}-${{ github.ref }}
 jobs:
   release:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Environment gate. Configure required reviewers + main-only deployment
+    # branch in repo Settings → Environments → npm-publish so that a human
+    # must click "Approve and deploy" in the GH Actions UI before either
+    # the Version Packages PR is opened or any npm publish is executed.
+    # See PR description for setup instructions.
+    environment: npm-publish
+    timeout-minutes: 20
     permissions:
       contents: write       # commit version bumps + create git tags
       pull-requests: write  # open / update the "Version Packages" PR
@@ -31,6 +37,13 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - run: pnpm -r run build
+
+      # Run vitest unit tests across all packages that declare a `test`
+      # script. Currently: packages/crypto (17 tests) + packages/sdk
+      # (81 tests passed, 23 integration tests skipped — they require a
+      # live chain RPC and cannot run on a stock CI runner).
+      # Failure here aborts the release before any npm publish.
+      - run: pnpm -r run test
 
       - name: Create Release Pull Request or Publish
         uses: changesets/action@v1
