@@ -8,23 +8,98 @@ on:
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 jobs:
-  release:
+  # ---------------------------------------------------------------------------
+  # Stage 1: Version Packages PR management. Runs on every main push, no
+  # environment gate, no npm contact. If unreleased `.changeset/*.md` files
+  # exist, opens or updates a "Version Packages" PR. Otherwise no-op. This
+  # stage never publishes — chore / docs / bug-fix-without-release commits
+  # land here and exit cleanly without requesting reviewer approval.
+  # ---------------------------------------------------------------------------
+  changesets:
     runs-on: ubuntu-latest
-    # Environment gate. Configure required reviewers + main-only deployment
-    # branch in repo Settings → Environments → npm-publish so that a human
-    # must click "Approve and deploy" in the GH Actions UI before either
-    # the Version Packages PR is opened or any npm publish is executed.
-    # See PR description for setup instructions.
-    environment: npm-publish
-    timeout-minutes: 20
+    timeout-minutes: 15
     permissions:
-      contents: write       # commit version bumps + create git tags
+      contents: write       # commit version bumps for the auto-PR
       pull-requests: write  # open / update the "Version Packages" PR
-      id-token: write       # mint OIDC token for npm provenance
+    outputs:
+      hasChangesets: ${{ steps.changesets.outputs.hasChangesets }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0    # full history needed for changelog generation
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Supply-chain gate. Audit production dependencies (the deps that ship
+      # to consumers) for high+ severity vulnerabilities. devDependencies are
+      # excluded — they don't make it into the published tarball.
+      #
+      # `pnpm audit` exits 0 even when vulnerabilities exist (the
+      # --audit-level flag is a print filter, not a failure threshold), so
+      # we parse JSON and explicitly fail on any high or critical advisory.
+      # Suppress specific transitive vulns by adding a pnpm.overrides entry
+      # in the root package.json once a fixed version is available.
+      - name: Audit production dependencies
+        run: |
+          pnpm audit --json --prod > /tmp/audit.json || true
+          COUNT=$(jq '[.advisories | to_entries[] | select(.value.severity == "high" or .value.severity == "critical")] | length' /tmp/audit.json)
+          if [ "${COUNT:-0}" -gt 0 ]; then
+            echo "::error::Found $COUNT high+ severity vulnerabilities in production deps"
+            jq '[.advisories | to_entries[] | select(.value.severity == "high" or .value.severity == "critical") | .value | {severity, title, module: .module_name, vulnerable: .vulnerable_versions, patched: .patched_versions}]' /tmp/audit.json
+            exit 1
+          fi
+          echo "No high+ severity vulnerabilities in production deps."
+
+      - run: pnpm -r run build
+
+      # Vitest unit tests across all packages that declare a `test` script.
+      # Failure aborts the release pipeline before any publish.
+      - run: pnpm -r run test
+
+      - name: Open / update Version Packages PR
+        id: changesets
+        uses: changesets/action@v1
+        with:
+          # Intentionally NO `publish` input. This stage only opens PRs;
+          # publishing is gated by the separate `publish` job below.
+          version: pnpm changeset version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: Publish to npm. Runs only when:
+  #   1. The previous stage saw no unreleased changesets (hasChangesets=false),
+  #      AND
+  #   2. The merge commit message contains "chore: release packages" — the
+  #      default title of the auto-generated Version Packages PR
+  #      (changesets/action input `title`, default value).
+  # Both conditions are required so that ordinary chore / docs / fix commits
+  # to main never trigger publish, only the merge of an actual release PR
+  # does. If a maintainer manually renames the auto-PR title, this guard
+  # fails closed — RELEASING.md documents this constraint.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: changesets
+    if: |
+      needs.changesets.outputs.hasChangesets == 'false' &&
+      contains(github.event.head_commit.message, 'chore: release packages')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm-publish
+    permissions:
+      contents: write   # push git tags
+      id-token: write   # mint OIDC token for npm provenance
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: pnpm/action-setup@v4
 
@@ -38,25 +113,20 @@ jobs:
 
       - run: pnpm -r run build
 
-      # Run vitest unit tests across all packages that declare a `test`
-      # script. Currently: packages/crypto (17 tests) + packages/sdk
-      # (81 tests passed, 23 integration tests skipped — they require a
-      # live chain RPC and cannot run on a stock CI runner).
-      # Failure here aborts the release before any npm publish.
-      - run: pnpm -r run test
+      # Pre-publish dry-run. Validates tarball contents (file list, package.json
+      # shape, workspace:* substitution) without contacting the registry to
+      # write. Catches regressions in `files` whitelists or workspace dep
+      # resolution before any tarball is irrevocably uploaded.
+      - name: Verify publish tarballs (dry-run)
+        run: pnpm -r publish --dry-run --no-git-checks
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Create Release Pull Request or Publish
-        uses: changesets/action@v1
-        with:
-          # When unreleased changesets exist on main: opens / updates a
-          # "Version Packages" PR that bumps versions + writes CHANGELOGs.
-          # When that PR merges: this job runs again, no changesets remain,
-          # so changesets/action runs the publish command below.
-          version: pnpm changeset version
-          publish: pnpm changeset publish
+      - name: Publish to npm
+        run: pnpm changeset publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          # Adds OIDC-signed provenance attestation to the published tarball
-          # so consumers can verify the build originated from this workflow.
+          # Emit OIDC-signed provenance so consumers can verify the tarball
+          # was produced by this workflow.
           NPM_CONFIG_PROVENANCE: "true"

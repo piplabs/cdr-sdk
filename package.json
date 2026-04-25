@@ -14,5 +14,13 @@
     "turbo": "^2",
     "typescript": "^5.5"
   },
-  "packageManager": "pnpm@9.15.0"
+  "packageManager": "pnpm@9.15.0",
+  "pnpm": {
+    "overrides": {
+      "protobufjs@<7.5.5": ">=7.5.5 <8",
+      "brace-expansion@<1.1.13": ">=1.1.13 <2",
+      "follow-redirects@<=1.15.11": ">=1.16.0 <2",
+      "axios@<1.15.0": ">=1.15.0 <2"
+    }
+  }
 }

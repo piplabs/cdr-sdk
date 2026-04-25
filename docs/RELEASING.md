@@ -6,17 +6,24 @@ Maintainer-facing guide for cutting a new version of `@piplabs/cdr-contracts`, `
 
 ## Pipeline gates
 
-Every push to `main` triggers `.github/workflows/release.yml`. The job is gated by:
+Every push to `main` triggers `.github/workflows/release.yml`, which runs in two stages:
 
-| Gate | Where it lives | What it checks |
-|---|---|---|
-| 1. `pnpm install --frozen-lockfile` | release.yml step | `pnpm-lock.yaml` matches `package.json` deps; reproducible install |
-| 2. `pnpm -r run build` | release.yml step | TypeScript compiles for every package |
-| 3. `pnpm -r run test` | release.yml step | vitest unit suites pass for every package that declares a `test` script |
-| 4. `environment: npm-publish` | repo Settings → Environments | A required reviewer must click **Approve and deploy** in the Actions UI before any step runs. Reviewer list and main-only branch restriction live in the environment config. |
-| 5. Changesets two-stage flow | `.changeset/` files in repo | Action opens a "Version Packages" PR when `.changeset/*.md` files exist; only publishes when those files are absent (i.e. after the version PR merges). |
+**Stage 1 — `changesets` job** (always runs, no approval gate, no npm contact)
+- `pnpm install --frozen-lockfile` — reproducible install
+- `pnpm -r run build` — TypeScript compiles
+- `pnpm -r run test` — vitest unit suites pass
+- `changesets/action@v1` — opens / updates the "Version Packages" PR when unreleased changesets exist; otherwise no-op
 
-For exact action behaviour see the upstream [`changesets/action` README](https://github.com/changesets/action#readme). The combination of gates 4 and 5 ensures publishes only happen via merged Version Packages PRs that have passed both human review and the environment approval.
+**Stage 2 — `publish` job** (runs only on actual release commits)
+- Conditional `if`: `hasChangesets == 'false' && contains(commit message, 'chore: release packages')`
+- `environment: npm-publish` — required reviewer must click **Approve and deploy** before any step runs
+- `pnpm install --frozen-lockfile` + `pnpm -r run build` + `pnpm changeset publish` (with OIDC provenance)
+
+The two-stage split means ordinary chore / docs / fix commits never request reviewer approval — they finish in stage 1 and never reach the publish job. Approval is requested only when the merged commit is the auto-generated Version Packages PR (default title `chore: release packages`).
+
+> **Important constraint**: do not rename the Version Packages PR title before merging. The publish guard checks the merge commit message contains `"chore: release packages"`. A renamed title fails the guard closed → the publish job is skipped → no release.
+
+For exact action behaviour see the upstream [`changesets/action` README](https://github.com/changesets/action#readme).
 
 ## Day-to-day: shipping a code change
 
@@ -44,22 +51,19 @@ A PR with no `.changeset/*.md` is fine for pure docs / chore work that should no
 
 After your PR merges to `main`:
 
-1. release.yml triggers, pauses at the `npm-publish` environment gate.
-2. A reviewer (someone in the environment's required reviewers list, not yourself due to **Prevent self-review**) approves in the Actions UI.
-3. Job runs install / build / test.
-4. `changesets/action` sees your `.md` file, opens (or updates) a PR titled **"chore: release packages"** that:
+1. release.yml `changesets` job runs install / build / test, then `changesets/action` sees your `.md` file and opens (or updates) a PR titled **"chore: release packages"** that:
    - Bumps the affected packages' `version` fields in `package.json`
    - Appends a CHANGELOG entry per package using `@changesets/changelog-github` (auto-links your PR + handle)
    - Deletes the consumed `.changeset/*.md`
-   - Does **not** publish anything yet
-5. Maintainer reviews the "chore: release packages" PR (see [Reviewing the Version Packages PR](#reviewing-the-version-packages-pr) below) and merges it.
-6. release.yml triggers again, pauses at the `npm-publish` environment gate.
-7. Reviewer approves.
-8. `changesets/action` sees no remaining `.md` files, runs `pnpm changeset publish`, which:
+2. The `publish` job's `if` guard evaluates false on this commit (the merge commit message is your feature PR's title, not `chore: release packages`), so the job is skipped and no environment approval is requested.
+3. Maintainer reviews the "chore: release packages" PR (see [Reviewing the Version Packages PR](#reviewing-the-version-packages-pr) below) and merges it. **Do not rename the PR title** — the publish guard depends on it.
+4. release.yml runs again. `changesets` job no-ops (no `.md` files left). `publish` job's `if` guard evaluates true → reaches the `environment: npm-publish` gate.
+5. A reviewer (someone in the environment's required reviewers list, not yourself due to **Prevent self-review**) approves in the Actions UI.
+6. `pnpm changeset publish` runs, which:
    - Publishes each bumped package (whose `package.json.version > npm dist-tags.latest`)
-   - Adds OIDC-signed npm provenance attestation (configured via `NPM_CONFIG_PROVENANCE=true` in the workflow env)
+   - Adds OIDC-signed npm provenance attestation
    - Creates per-package git tags like `@piplabs/cdr-sdk@0.1.3`
-   - Creates a GitHub Release per tag (`createGithubReleases` defaults to true on the action)
+   - Creates a GitHub Release per tag (`createGithubReleases` defaults to true)
 
 ## First-time release of an unpublished package
 
@@ -77,18 +81,16 @@ pnpm changeset
 
 The Version Packages PR will bump all three to 0.1.2. After it merges + final approval, `pnpm changeset publish` publishes all three. From then on, packages can version independently — only mention the ones you changed in subsequent changesets.
 
-## Reviewing approvals (what each gate means)
+## Reviewing the approval
 
-The `npm-publish` environment gate fires on **every push to `main`**, including merges that don't trigger a release. Reviewer should check the Actions run page before approving:
+The `npm-publish` environment gate is reached **only when the publish job runs**, which happens only on the merge of an auto-generated Version Packages PR. Reviewer responsibility at approval time:
 
-| Workflow run is for | How to tell from the run page | What approval means |
-|---|---|---|
-| A merged feature PR with a changeset | The triggering commit message is the feature PR's title; `.changeset/` has new `.md` files (visible in commit diff) | Approve to let action open the Version Packages PR. No npm publish in this run. |
-| A merged "chore: release packages" PR | The triggering commit message is `Version Packages` or `chore: release packages`; `.changeset/` has only `README.md` + `config.json` | Approve to publish to npm. **This is the irreversible step.** |
-| A merged docs / chore PR (no changeset) | No `.md` files in `.changeset/`; `package.json.version` matches what's already on npm | `pnpm changeset publish` will be a no-op. Safe to approve, but you can also let it sit. |
-| A merged PR that bumped `package.json.version` manually | `package.json` diff shows version change; `.changeset/` has no related `.md` | **DO NOT APPROVE.** This bypasses Changesets and would publish an unintended version. Reject and investigate. |
+| The Actions run is for | What approval means |
+|---|---|
+| A merged "chore: release packages" PR (Version Packages PR) | Approve to publish to npm. **This is the irreversible step.** Confirm the package versions in the merge commit's `package.json` diffs match what you expect to ship. |
+| Anything else (chore / docs / fix / feature PR with changeset) | The publish job's `if` guard skips this run — no approval is requested in the first place. If you do see an unexpected approval request, **DO NOT APPROVE.** Investigate the merge commit; the only way the publish job runs is if its commit message contains `chore: release packages`, which should mean the Version Packages PR was merged.
 
-If unsure, click into the Actions run, scroll to the "Create Release Pull Request or Publish" step pre-execution, and check the commit diff that triggered it.
+Before clicking Approve, click into the run, expand the `publish` job, and verify the diff that triggered it actually bumps versions you intend to release.
 
 ## Reviewing the Version Packages PR
 
