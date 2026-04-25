@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+# Avoid two release jobs racing on rapid main commits.
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Environment gate. Configure required reviewers + main-only deployment
+    # branch in repo Settings → Environments → npm-publish so that a human
+    # must click "Approve and deploy" in the GH Actions UI before either
+    # the Version Packages PR is opened or any npm publish is executed.
+    # See PR description for setup instructions.
+    environment: npm-publish
+    timeout-minutes: 20
+    permissions:
+      contents: write       # commit version bumps + create git tags
+      pull-requests: write  # open / update the "Version Packages" PR
+      id-token: write       # mint OIDC token for npm provenance
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # full history needed for changelog generation
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+          registry-url: 'https://registry.npmjs.org'
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm -r run build
+
+      # Run vitest unit tests across all packages that declare a `test`
+      # script. Currently: packages/crypto (17 tests) + packages/sdk
+      # (81 tests passed, 23 integration tests skipped — they require a
+      # live chain RPC and cannot run on a stock CI runner).
+      # Failure here aborts the release before any npm publish.
+      - run: pnpm -r run test
+
+      - name: Create Release Pull Request or Publish
+        uses: changesets/action@v1
+        with:
+          # When unreleased changesets exist on main: opens / updates a
+          # "Version Packages" PR that bumps versions + writes CHANGELOGs.
+          # When that PR merges: this job runs again, no changesets remain,
+          # so changesets/action runs the publish command below.
+          version: pnpm changeset version
+          publish: pnpm changeset publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Adds OIDC-signed provenance attestation to the published tarball
+          # so consumers can verify the build originated from this workflow.
+          NPM_CONFIG_PROVENANCE: "true"
