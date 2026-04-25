@@ -79,8 +79,22 @@ export class Consumer {
    * so we keep all keys (most recent first) to handle round mismatch during
    * signature verification.
    */
-  /** Default lookback window: ~7 days at ~2 s/block. Matches Observer.DEFAULT_LOOKBACK_BLOCKS. */
-  private static readonly DEFAULT_LOOKBACK_BLOCKS = 302_400n;
+  /**
+   * INTENTIONALLY SHRUNK to reproduce issue #53 on DevNet.
+   *
+   * DevNet rotates DKG every 410 blocks (~17 min at 2.5 s/block). With the
+   * normal 302_400-block window, the active round's `Registered` event is
+   * always inside the window and the bug never surfaces — exactly the same
+   * code path that fails on Aeneid (where rounds are ~5.5 days apart and
+   * the 302_400-block window naturally misses the active round).
+   *
+   * Shrinking to 100 blocks forces the active round's registration to fall
+   * outside the lookback window on DevNet. accessCDR will then time out
+   * with `got 0/N` partials — same failure mode as production Aeneid pre-fix.
+   *
+   * REVERT TO 302_400n BEFORE ANY MERGE.
+   */
+  private static readonly DEFAULT_LOOKBACK_BLOCKS = 100n;
 
   private async getCommPubKeyMap(): Promise<Map<string, Uint8Array[]>> {
     const dkgAddress = contractAddresses[this.network].dkg;
