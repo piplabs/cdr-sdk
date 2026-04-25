@@ -150,16 +150,18 @@ This catches: malformed `package.json`, missing `dist/`, `workspace:*` not subst
 
 ## Rotating NPM_TOKEN
 
-The `NPM_TOKEN` environment secret has a 90-day expiration by default. Rotate it before expiry:
+The `NPM_TOKEN` environment secret has a 90-day expiration by default. Rotate it before expiry. Any maintainer with publish rights to the `@piplabs` npm org can perform the rotation; the token belongs to whoever generated it, not to a fixed individual.
 
-1. Generate a new granular access token at https://www.npmjs.com/settings/lucas2brh/tokens
-   - Same scope as before: `@piplabs` org scope, `Read and write` permission
+1. Generate a new granular access token at https://www.npmjs.com/settings/<your-npm-handle>/tokens (the npmjs.com Account → Access Tokens page for your own npm user)
+   - Scope: `@piplabs` org, `Read and write` permission
    - 90-day expiration
 2. Repo Settings → Environments → `npm-publish` → Environment secrets → `NPM_TOKEN` → **Update**
 3. Trigger a no-op release (push any commit to main) and watch the publish step succeed
-4. Revoke the old token at https://www.npmjs.com/settings/lucas2brh/tokens
+4. Revoke the old token in the previous owner's npmjs.com Access Tokens page (the maintainer who issued it; check the Audit log → "publishing user" on the most recent published package version if unsure)
 
 If the token expires before rotation, releases fail at the publish step with a 401. The npm CLI logs `npm error code E401 npm error 401 Unauthorized`. Rotate then re-run the failed workflow.
+
+**Recommendation**: long-term, switch to an `@piplabs` org-owned npm bot account dedicated to CI publishing, so rotation isn't tied to any individual maintainer's npm session. Until then, the rotating maintainer's personal granular token is acceptable but creates a soft dependency on that person staying with the team.
 
 ## When something goes wrong
 
