@@ -7,7 +7,7 @@ import { uuidToLabel } from "./label.js";
 import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
 import type { AttestationConfig } from "./attestation.js";
-import { queryCDRPartials } from "./cosmos/abci-query.js";
+import { queryCDRPartials, queryLatestActiveDKGNetwork } from "./cosmos/abci-query.js";
 import { bytesToHex as cosmosBytesToHex } from "./cosmos/protobuf.js";
 
 export class Consumer {
@@ -15,6 +15,26 @@ export class Consumer {
   private walletClient: WalletClient;
   private network: Network;
   private observer: Observer | null;
+
+  /**
+   * In-flight (or settled) promise for the cached commPubKey map. Promise-
+   * level caching deduplicates concurrent calls: if two accessCDR invocations
+   * both trigger a build at the same time, only one scan runs.
+   *
+   * Registered events are immutable, so the only staleness risk is a new
+   * validator registering after the cache was built; that surfaces as
+   * "unknown validator" during verify, which triggers an automatic one-shot
+   * refresh (see collectPartialsFromEvents).
+   */
+  private commPubKeyMapPromise: Promise<Map<string, Uint8Array[]>> | null = null;
+
+  /**
+   * Flag tracking whether we've already warned about using the default
+   * (hardcoded, plaintext HTTP) CometBFT RPC URL on this Consumer instance.
+   * Keeps the warning to once per instance instead of spamming on every
+   * cache build / refresh.
+   */
+  private defaultCometUrlWarned = false;
 
   /** Alias for {@link accessCDR} */
   readVault: Consumer["accessCDR"];
@@ -33,6 +53,35 @@ export class Consumer {
     this.observer = params.observer ?? null;
     this.readVault = this.accessCDR.bind(this);
     this.readFileVault = this.downloadFile.bind(this);
+  }
+
+  /**
+   * Warm the validator commPubKey cache in the background.
+   *
+   * The cache is normally built lazily on the first accessCDR / downloadFile
+   * call, which requires a full-history scan of DKG Registered events and
+   * can take tens of seconds on mature chains — long enough that a request
+   * triggered by a user click can appear to hang. Frontends that know a
+   * read is imminent (e.g. right after user login / wallet connection) can
+   * call prefetchRegistry() to start the scan early, so the subsequent
+   * accessCDR call hits a warm cache and returns immediately.
+   *
+   * Safe to call multiple times — concurrent callers share the same
+   * in-flight build via Promise-level dedupe, so repeated prefetches cost
+   * nothing. Errors propagate; callers doing best-effort warming should
+   * attach their own `.catch(() => {})` and let the real accessCDR call
+   * surface the failure later if it still occurs.
+   *
+   * @example
+   * ```ts
+   * // Right after user login / wallet connection, in a useEffect:
+   * cdrClient.consumer.prefetchRegistry().catch(() => {
+   *   // best-effort warm-up; real accessCDR call will retry if needed
+   * });
+   * ```
+   */
+  async prefetchRegistry(): Promise<void> {
+    await this.getCommPubKeyMap();
   }
 
   /**
@@ -75,55 +124,162 @@ export class Consumer {
 
   /**
    * Fetch validator address → commPubKey[] map from DKG Registered events.
-   * Each validator may re-register with a new commPubKey in each DKG round,
-   * so we keep all keys (most recent first) to handle round mismatch during
-   * signature verification.
+   *
+   * Hybrid mode (default): query `GetLatestActiveDKGNetwork` via CometBFT
+   * ABCI to identify the currently active DKG round, then scan EVM
+   * `Registered` events within a bounded window and keep only registrations
+   * for that round. The CometBFT RPC URL defaults to the SDK's
+   * network-specific `DEFAULT_COMET_RPC_URL`; callers can override it by
+   * passing `cometRpcUrl` when constructing `CDRClient`. If the ABCI query
+   * fails (network unreachable, URL misconfigured, etc.), we fall back to
+   * keeping every key in the window and letting the verify loop try each.
+   *
+   * The bounded window (`DKG_LOOKBACK_BLOCKS`) is sized for Aeneid / mainnet
+   * where blocks are ~2 s and DKG rotates roughly weekly — 10 days covers
+   * the current active round plus one rotation of buffer.
    */
-  /** Default lookback window: ~7 days at ~2 s/block. Matches Observer.DEFAULT_LOOKBACK_BLOCKS. */
-  private static readonly DEFAULT_LOOKBACK_BLOCKS = 302_400n;
+  /** Chunk size for historical getLogs scans. Kept well below typical RPC block-range limits. */
+  private static readonly DKG_LOGS_BLOCK_CHUNK = 500_000n;
+  /**
+   * DKG Registered-event lookback window, in blocks. Sized for Aeneid /
+   * mainnet (≈2 s/block, ~weekly DKG rotation): 10 days = 432_000 blocks.
+   * Covers the currently active DKG round plus one rotation of buffer.
+   */
+  private static readonly DKG_LOOKBACK_BLOCKS = 432_000n;
+  /**
+   * Default CometBFT RPC URL for the hybrid active-round filter. Used when
+   * the caller has not explicitly configured `cometRpcUrl` on the Observer.
+   * Pinned to the Aeneid / mainnet CometBFT endpoint so the SDK is usable
+   * out of the box without any manual RPC configuration.
+   *
+   * ⚠️ SECURITY WARNING — The default is a raw IP over plaintext HTTP. A
+   * network-level attacker able to intercept traffic between the SDK and
+   * this endpoint can forge the `activeRound` response, causing the hybrid
+   * filter to keep only the attacker's chosen round's keys. All legitimate
+   * partials will then fail verification and be dropped — a denial-of-
+   * service on `accessCDR`. Fallback-to-unfiltered-scan does not apply
+   * here because the MITM returns a valid-looking response.
+   *
+   * For production deployments, override this by passing `cometRpcUrl`
+   * when constructing `CDRClient`, pointing either at your own CometBFT
+   * node or at an HTTPS endpoint you control. This default exists only as
+   * a zero-config convenience for development and demos.
+   *
+   * When the SDK falls back to this default at runtime, it emits a
+   * one-time `console.warn` to surface the risk.
+   */
+  private static readonly DEFAULT_COMET_RPC_URL = "http://172.192.41.96:26657";
+  /** Max attempts per chunk getLogs call before propagating the error. */
+  private static readonly GETLOGS_MAX_ATTEMPTS = 3;
+  /** Base delay (ms) for exponential backoff between getLogs retries. */
+  private static readonly GETLOGS_BACKOFF_MS = 500;
 
-  private async getCommPubKeyMap(): Promise<Map<string, Uint8Array[]>> {
+  /**
+   * Return the cached commPubKey map, building it on first call or when
+   * {@link forceRefresh} is true. Concurrent callers share the same in-flight
+   * build promise so we never scan the full history twice in parallel. If a
+   * build fails, the rejected promise is cleared so a subsequent call can
+   * retry from scratch instead of inheriting the failure.
+   */
+  private async getCommPubKeyMap(forceRefresh = false): Promise<Map<string, Uint8Array[]>> {
+    if (!forceRefresh && this.commPubKeyMapPromise) {
+      return this.commPubKeyMapPromise;
+    }
     const dkgAddress = contractAddresses[this.network].dkg;
+    const p = this.fetchRegisteredValidators(dkgAddress).catch((err) => {
+      if (this.commPubKeyMapPromise === p) {
+        this.commPubKeyMapPromise = null;
+      }
+      throw err;
+    });
+    this.commPubKeyMapPromise = p;
+    return p;
+  }
+
+  private async fetchRegisteredValidators(
+    dkgAddress: `0x${string}`,
+  ): Promise<Map<string, Uint8Array[]>> {
     const latestBlock = await this.publicClient.getBlockNumber();
-    const fromBlock = latestBlock > Consumer.DEFAULT_LOOKBACK_BLOCKS
-      ? latestBlock - Consumer.DEFAULT_LOOKBACK_BLOCKS
+    const chunk = Consumer.DKG_LOGS_BLOCK_CHUNK;
+    const startBlock = latestBlock > Consumer.DKG_LOOKBACK_BLOCKS
+      ? latestBlock - Consumer.DKG_LOOKBACK_BLOCKS
       : 0n;
 
-    const validators = await this.fetchRegisteredValidators(dkgAddress, fromBlock);
+    // Hybrid mode (default): query CometBFT ABCI for the currently active DKG
+    // round so we can filter EVM Registered events to just that round's
+    // commPubKeys. Uses the Observer's cometRpcUrl if the caller set one,
+    // otherwise falls back to the SDK's network-specific default URL. If
+    // both are unreachable or the query fails, we leave activeRound
+    // undefined and keep every round in the window as a fallback.
+    let activeRound: number | undefined;
+    const cometRpcUrl = this.observer?.cometRpcUrl ?? Consumer.DEFAULT_COMET_RPC_URL;
+    if (!this.observer?.cometRpcUrl && !this.defaultCometUrlWarned) {
+      this.defaultCometUrlWarned = true;
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[cdr-sdk] Using the default CometBFT RPC URL over plaintext HTTP " +
+          `(${Consumer.DEFAULT_COMET_RPC_URL}). A network-level attacker can forge the active DKG round ` +
+          "and cause every accessCDR call to fail. For production, pass `cometRpcUrl` to CDRClient " +
+          "pointing to your own CometBFT node or an HTTPS endpoint.",
+      );
+    }
+    try {
+      const network = await queryLatestActiveDKGNetwork(cometRpcUrl);
+      activeRound = network.round;
+    } catch {
+      // ABCI unreachable or query failed — fall back to unfiltered scan.
+    }
 
-    // Fallback: if lookback window found no validators, scan from block 0
-    if (validators.size === 0 && fromBlock > 0n) {
-      return this.fetchRegisteredValidators(dkgAddress, 0n);
+    const validators = new Map<string, Uint8Array[]>();
+
+    for (let from = startBlock; from <= latestBlock; from = from + chunk + 1n) {
+      const to = from + chunk > latestBlock ? latestBlock : from + chunk;
+
+      const rawLogs = await this.getLogsWithRetry(dkgAddress, from, to);
+
+      const parsed = parseEventLogs({
+        abi: dkgAbi,
+        logs: rawLogs,
+        eventName: "Registered",
+      });
+
+      for (const log of parsed) {
+        if (activeRound !== undefined && log.args.round !== activeRound) {
+          continue; // Hybrid mode: skip non-active rounds.
+        }
+        const addr = log.args.validatorAddr.toLowerCase() as `0x${string}`;
+        const keys = validators.get(addr) ?? [];
+        keys.push(toBytes(log.args.enclaveCommKey));
+        validators.set(addr, keys);
+      }
     }
 
     return validators;
   }
 
-  private async fetchRegisteredValidators(
-    dkgAddress: `0x${string}`,
+  /**
+   * getLogs wrapper with exponential-backoff retry. Public RPCs can return
+   * transient errors for individual chunk ranges (observed as
+   * "invalid block range params" on Aeneid); a narrow retry loop keeps the
+   * full-history scan robust without swallowing persistent failures.
+   */
+  private async getLogsWithRetry(
+    address: `0x${string}`,
     fromBlock: bigint,
-  ): Promise<Map<string, Uint8Array[]>> {
-    const rawLogs = await this.publicClient.getLogs({
-      address: dkgAddress,
-      fromBlock,
-      toBlock: "latest",
-    });
-
-    const parsed = parseEventLogs({
-      abi: dkgAbi,
-      logs: rawLogs,
-      eventName: "Registered",
-    });
-
-    const validators = new Map<string, Uint8Array[]>();
-    for (const log of parsed) {
-      const addr = log.args.validatorAddr.toLowerCase() as `0x${string}`;
-      const keys = validators.get(addr) ?? [];
-      keys.push(toBytes(log.args.enclaveCommKey));
-      validators.set(addr, keys);
+    toBlock: bigint,
+  ): Promise<Awaited<ReturnType<PublicClient["getLogs"]>>> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < Consumer.GETLOGS_MAX_ATTEMPTS; attempt++) {
+      try {
+        return await this.publicClient.getLogs({ address, fromBlock, toBlock });
+      } catch (err) {
+        lastError = err;
+        if (attempt === Consumer.GETLOGS_MAX_ATTEMPTS - 1) break;
+        const delay = Consumer.GETLOGS_BACKOFF_MS * 2 ** attempt;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
     }
-
-    return validators;
+    throw lastError;
   }
 
   /**
@@ -183,8 +339,11 @@ export class Consumer {
     const cdrAddress = contractAddresses[this.network].cdr;
     const deadline = Date.now() + timeoutMs;
 
-    // Build commPubKey map from DKG Registered events
-    const commPubKeyMap = await this.getCommPubKeyMap();
+    // Build commPubKey map from DKG Registered events (cached across calls).
+    let commPubKeyMap = await this.getCommPubKeyMap();
+    // Track which validators have already triggered a cache refresh this call,
+    // so a genuinely unknown validator can't force repeated re-scans.
+    const refreshedFor = new Set<string>();
 
     let lastScannedBlock = fromBlock;
     const collected = new Map<string, PartialDecryptionEvent>();
@@ -192,11 +351,12 @@ export class Consumer {
     while (Date.now() < deadline) {
       const currentBlock = await this.publicClient.getBlockNumber();
       if (currentBlock >= lastScannedBlock) {
-        const rawLogs = await this.publicClient.getLogs({
-          address: cdrAddress,
-          fromBlock: lastScannedBlock,
-          toBlock: currentBlock,
-        });
+        // Same retry wrapper used for the DKG scan: public RPCs (notably
+        // aeneid.storyrpc.io) occasionally return "invalid block range params"
+        // for tiny ranges — a transient error we should not let surface as an
+        // accessCDR failure in the middle of the poll loop. See PERF-05 flake
+        // observed in https://github.com/piplabs/story-cdr-e2e/actions/runs/24884251274.
+        const rawLogs = await this.getLogsWithRetry(cdrAddress, lastScannedBlock, currentBlock);
         lastScannedBlock = currentBlock + BigInt(1);
 
         const parsed = parseEventLogs({
@@ -221,32 +381,49 @@ export class Consumer {
                 signature: log.args.signature,
               };
 
-              // Verify signature — try all known commPubKeys for this validator
-              // (DKG round rotation may cause the signing key to differ from the latest registration)
+              // Verify signature — try all known commPubKeys for this validator.
+              // In hybrid mode the cached map holds only the active-round keys,
+              // so a DKG rotation that happens after the cache is built leaves
+              // every validator with stale (old-round) keys. Refreshing on any
+              // verification failure — not just on an absent validator — lets
+              // the next round's partials recover without a process restart.
               const validatorAddr = log.args.validator.toLowerCase();
-              const commPubKeys = commPubKeyMap.get(validatorAddr);
+              let commPubKeys = commPubKeyMap.get(validatorAddr);
 
-              if (!commPubKeys || commPubKeys.length === 0) {
-                onInvalidPartial?.(event, new Error(`unknown validator: ${log.args.validator}`));
-                continue;
-              }
+              const tryVerifyWith = (keys: Uint8Array[] | undefined): boolean => {
+                if (!keys || keys.length === 0) return false;
+                for (let ki = keys.length - 1; ki >= 0; ki--) {
+                  if (verifyPartialSignature({
+                    round: event.round,
+                    ciphertext: toBytes(log.args.ciphertext),
+                    encryptedPartial: toBytes(event.encryptedPartial),
+                    ephemeralPubKey: toBytes(event.ephemeralPubKey),
+                    pubShare: toBytes(event.pubShare),
+                    signature: toBytes(log.args.signature),
+                    commPubKey: keys[ki],
+                  })) return true;
+                }
+                return false;
+              };
 
-              let valid = false;
-              for (let ki = commPubKeys.length - 1; ki >= 0; ki--) {
-                valid = verifyPartialSignature({
-                  round: event.round,
-                  ciphertext: toBytes(log.args.ciphertext),
-                  encryptedPartial: toBytes(event.encryptedPartial),
-                  ephemeralPubKey: toBytes(event.ephemeralPubKey),
-                  pubShare: toBytes(event.pubShare),
-                  signature: toBytes(log.args.signature),
-                  commPubKey: commPubKeys[ki],
-                });
-                if (valid) break;
+              let valid = tryVerifyWith(commPubKeys);
+
+              // Refresh the cache once per validator per call on any verification
+              // failure (unknown validator OR all cached keys fail). Deduped by
+              // validator address so a genuinely bad signer can't force repeated
+              // full-history rescans within a single collectPartials invocation.
+              if (!valid && !refreshedFor.has(validatorAddr)) {
+                refreshedFor.add(validatorAddr);
+                commPubKeyMap = await this.getCommPubKeyMap(true);
+                commPubKeys = commPubKeyMap.get(validatorAddr);
+                valid = tryVerifyWith(commPubKeys);
               }
 
               if (!valid) {
-                onInvalidPartial?.(event, new Error(`invalid signature from validator ${log.args.validator}`));
+                const reason = (!commPubKeys || commPubKeys.length === 0)
+                  ? `unknown validator: ${log.args.validator}`
+                  : `invalid signature from validator ${log.args.validator}`;
+                onInvalidPartial?.(event, new Error(reason));
                 continue;
               }
 
