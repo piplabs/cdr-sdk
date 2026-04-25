@@ -155,9 +155,28 @@ The `NPM_TOKEN` environment secret has a 90-day expiration by default. Rotate it
 1. Generate a new granular access token at https://www.npmjs.com/settings/<your-npm-handle>/tokens (the npmjs.com Account → Access Tokens page for your own npm user)
    - Scope: `@piplabs` org, `Read and write` permission
    - 90-day expiration
-2. Repo Settings → Environments → `npm-publish` → Environment secrets → `NPM_TOKEN` → **Update**
-3. Trigger a no-op release (push any commit to main) and watch the publish step succeed
-4. Revoke the old token in the previous owner's npmjs.com Access Tokens page (the maintainer who issued it; check the Audit log → "publishing user" on the most recent published package version if unsure)
+2. **Verify the new token works against the real npm registry, locally**, before touching the secret. Pushing a no-op commit to `main` does **not** exercise the token because `pnpm changeset publish` exits 0 without contacting the registry when no packages need publishing.
+
+   ```sh
+   # Replace <new-token> with the value just generated.
+   # Single-line, no shell history (don't quote the token in a way that lands in ~/.zsh_history).
+   NPM_TOKEN_TEST=<new-token>; \
+     curl -fsS -H "Authorization: Bearer $NPM_TOKEN_TEST" https://registry.npmjs.org/-/whoami; \
+     unset NPM_TOKEN_TEST
+   # Expected: {"username":"<your-npm-handle>"}.  401 → token bad / wrong scope.
+   ```
+
+   Or via npm CLI without altering your default config:
+
+   ```sh
+   npm --registry https://registry.npmjs.org/ \
+       --//registry.npmjs.org/:_authToken=<new-token> \
+       whoami
+   ```
+
+3. Repo Settings → Environments → `npm-publish` → Environment secrets → `NPM_TOKEN` → **Update**
+4. Confirm the GitHub side picked up the new value by running a one-shot verification workflow (or wait for the next real release to surface it). One option is a tiny `workflow_dispatch`-only workflow that runs `npm whoami` against the registry using `secrets.NPM_TOKEN`; until that's added, the next real release is the GitHub-side check.
+5. Revoke the old token in the previous owner's npmjs.com Access Tokens page (the maintainer who issued it; check the npm package's "publisher" / Audit log on the most recent published version if unsure who that is)
 
 If the token expires before rotation, releases fail at the publish step with a 401. The npm CLI logs `npm error code E401 npm error 401 Unauthorized`. Rotate then re-run the failed workflow.
 
