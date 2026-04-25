@@ -2,9 +2,18 @@
   "name": "@piplabs/cdr-cli",
   "version": "0.1.1",
   "type": "module",
+  "license": "MIT",
   "bin": {
     "cdr-cli": "dist/index.js"
   },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
