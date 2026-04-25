@@ -45,18 +45,20 @@ export CDR_PRIVATE_KEY=0x...
 # 1. See current fees (no key needed for read-only queries)
 cdr-cli --network testnet status fees
 
-# 2. Allocate a vault (open-access conditions for demo only)
-cdr-cli --network testnet allocate \
-  --write-condition 0x... --read-condition 0x...
+# 2. Allocate a vault and capture the assigned UUID from the JSON output.
+#    `allocate` returns { txHash, uuid }.
+UUID=$(cdr-cli --network testnet --json allocate \
+  --write-condition 0x... --read-condition 0x... | jq -r '.uuid')
 
-# 3. Encrypt a 32-byte data key against the DKG global pubkey
-cdr-cli encrypt --data-key 0x...32-bytes... --global-pub-key 0x... --uuid 42
+# 3. Encrypt a 32-byte data key against the DKG global pubkey, scoped to this
+#    vault's UUID (used to derive the TDH2 label).
+cdr-cli encrypt --data-key 0x...32-bytes... --global-pub-key 0x... --uuid "$UUID"
 
-# 4. Write the resulting ciphertext into the vault
-cdr-cli --network testnet write --uuid 42 --encrypted-data 0x...
+# 4. Write the resulting ciphertext into the vault.
+cdr-cli --network testnet write --uuid "$UUID" --encrypted-data 0x...
 
-# 5. Request a read; collect partials off-chain
-cdr-cli --network testnet read --uuid 42 --requester-pub-key 0x...
+# 5. Request a read; collect partials off-chain.
+cdr-cli --network testnet read --uuid "$UUID" --requester-pub-key 0x...
 ```
 
 For the full upload/read flow including `collectPartials` and `tdh2Combine`, use the SDK directly — the CLI exposes the contract-facing primitives but does not orchestrate validator-partial collection.
