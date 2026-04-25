@@ -12,11 +12,11 @@ Every push to `main` triggers `.github/workflows/release.yml`. The job is gated 
 |---|---|---|
 | 1. `pnpm install --frozen-lockfile` | release.yml step | `pnpm-lock.yaml` matches `package.json` deps; reproducible install |
 | 2. `pnpm -r run build` | release.yml step | TypeScript compiles for every package |
-| 3. `pnpm -r run test` | release.yml step | vitest unit suites pass: `packages/crypto` (17 tests) + `packages/sdk` (81 passed, 23 integration skipped on CI) |
+| 3. `pnpm -r run test` | release.yml step | vitest unit suites pass for every package that declares a `test` script |
 | 4. `environment: npm-publish` | repo Settings → Environments | A required reviewer must click **Approve and deploy** in the Actions UI before any step runs. Reviewer list and main-only branch restriction live in the environment config. |
 | 5. Changesets two-stage flow | `.changeset/` files in repo | Action opens a "Version Packages" PR when `.changeset/*.md` files exist; only publishes when those files are absent (i.e. after the version PR merges). |
 
-Source for gate 5 (verbatim from [changesets/action README](https://github.com/changesets/action#readme)): *"a commit without any new changesets can always land on your base branch after a successful publish. In such a case you need to figure out on your own how to skip over the actual publishing logic or handle errors gracefully as most package registries won't allow you to publish over already published version."* — meaning **any push to main where `package.json` versions are higher than what's on npm will publish those versions**. This is by design; the gates above ensure such pushes only happen via merged Version Packages PRs.
+For exact action behaviour see the upstream [`changesets/action` README](https://github.com/changesets/action#readme). The combination of gates 4 and 5 ensures publishes only happen via merged Version Packages PRs that have passed both human review and the environment approval.
 
 ## Day-to-day: shipping a code change
 
@@ -155,7 +155,7 @@ The `NPM_TOKEN` environment secret has a 90-day expiration by default. Rotate it
 1. Generate a new granular access token at https://www.npmjs.com/settings/<your-npm-handle>/tokens (the npmjs.com Account → Access Tokens page for your own npm user)
    - Scope: `@piplabs` org, `Read and write` permission
    - 90-day expiration
-2. **Verify the new token works against the real npm registry, locally**, before touching the secret. Pushing a no-op commit to `main` does **not** exercise the token because `pnpm changeset publish` exits 0 without contacting the registry when no packages need publishing.
+2. **Verify the new token works against the real npm registry, locally**, before touching the secret:
 
    ```sh
    # Replace <new-token> with the value just generated.
@@ -166,21 +166,10 @@ The `NPM_TOKEN` environment secret has a 90-day expiration by default. Rotate it
    # Expected: {"username":"<your-npm-handle>"}.  401 → token bad / wrong scope.
    ```
 
-   Or via npm CLI without altering your default config:
-
-   ```sh
-   npm --registry https://registry.npmjs.org/ \
-       --//registry.npmjs.org/:_authToken=<new-token> \
-       whoami
-   ```
-
 3. Repo Settings → Environments → `npm-publish` → Environment secrets → `NPM_TOKEN` → **Update**
-4. Confirm the GitHub side picked up the new value by running a one-shot verification workflow (or wait for the next real release to surface it). One option is a tiny `workflow_dispatch`-only workflow that runs `npm whoami` against the registry using `secrets.NPM_TOKEN`; until that's added, the next real release is the GitHub-side check.
-5. Revoke the old token in the previous owner's npmjs.com Access Tokens page (the maintainer who issued it; check the npm package's "publisher" / Audit log on the most recent published version if unsure who that is)
+4. Revoke the old token in the previous owner's npmjs.com Access Tokens page
 
-If the token expires before rotation, releases fail at the publish step with a 401. The npm CLI logs `npm error code E401 npm error 401 Unauthorized`. Rotate then re-run the failed workflow.
-
-**Recommendation**: long-term, switch to an `@piplabs` org-owned npm bot account dedicated to CI publishing, so rotation isn't tied to any individual maintainer's npm session. Until then, the rotating maintainer's personal granular token is acceptable but creates a soft dependency on that person staying with the team.
+If the token expires before rotation, releases fail at the publish step with a 401. Rotate, then re-run the failed workflow.
 
 ## When something goes wrong
 
