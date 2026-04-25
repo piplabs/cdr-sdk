@@ -10,13 +10,16 @@
 import { base64ToBytes } from "./protobuf.js";
 import {
   type DKGNetwork,
+  type DKGParams,
   type DKGRegistration,
   type DKGPartialDecryptionSubmissionsByRound,
   decodeCDRPartialsResponse,
   decodeLatestActiveResponse,
+  decodeParamsResponse,
   decodeVerifiedRegistrationsResponse,
   encodeCDRPartialsRequest,
   encodeLatestActiveRequest,
+  encodeParamsRequest,
   encodeVerifiedRegistrationsRequest,
 } from "./dkg-proto.js";
 
@@ -83,6 +86,20 @@ export async function queryLatestActiveDKGNetwork(
     encodeLatestActiveRequest(),
   );
   return decodeLatestActiveResponse(bytes);
+}
+
+/**
+ * Query x/dkg module parameters. All `*Period` fields are durations in BLOCKS
+ * (not seconds). One full DKG epoch =
+ *   registrationPeriod + dealingPeriod + finalizationPeriod + activePeriod.
+ */
+export async function queryDKGParams(rpcUrl: string): Promise<DKGParams> {
+  const bytes = await abciQuery(
+    rpcUrl,
+    `${SERVICE}/Params`,
+    encodeParamsRequest(),
+  );
+  return decodeParamsResponse(bytes);
 }
 
 export async function queryVerifiedRegistrations(

@@ -63,6 +63,17 @@ export interface DKGPartialDecryptionSubmissionsByRound {
   thresholdMet: boolean;
 }
 
+/**
+ * x/dkg module parameters. All `*Period` fields are durations in BLOCKS.
+ * One full DKG epoch = registrationPeriod + dealingPeriod + finalizationPeriod + activePeriod.
+ */
+export interface DKGParams {
+  registrationPeriod: bigint;
+  dealingPeriod: bigint;
+  finalizationPeriod: bigint;
+  activePeriod: bigint;
+}
+
 // ---------------------------------------------------------------------------
 // Decoders
 // ---------------------------------------------------------------------------
@@ -228,6 +239,43 @@ export function decodeVerifiedRegistrationsResponse(
   return out;
 }
 
+/** QueryParamsResponse { Params params = 1; } */
+export function decodeParamsResponse(bytes: Uint8Array): DKGParams {
+  const r = new Reader(bytes);
+  let inner: Uint8Array | null = null;
+  while (!r.eof) {
+    const { field, wireType } = r.readTag();
+    if (field === 1 && wireType === 2) {
+      inner = r.readLenDelim();
+    } else {
+      r.skipField(wireType);
+    }
+  }
+  if (!inner) throw new Error("params: missing params field");
+  return decodeDKGParams(inner);
+}
+
+export function decodeDKGParams(bytes: Uint8Array): DKGParams {
+  const r = new Reader(bytes);
+  const out: DKGParams = {
+    registrationPeriod: 0n,
+    dealingPeriod: 0n,
+    finalizationPeriod: 0n,
+    activePeriod: 0n,
+  };
+  while (!r.eof) {
+    const { field, wireType } = r.readTag();
+    switch (field) {
+      case 1: out.registrationPeriod = r.readVarint(); break;
+      case 2: out.dealingPeriod = r.readVarint(); break;
+      case 3: out.finalizationPeriod = r.readVarint(); break;
+      case 4: out.activePeriod = r.readVarint(); break;
+      default: r.skipField(wireType);
+    }
+  }
+  return out;
+}
+
 /** QueryGetCDRPartialsResponse { repeated DKGPartialDecryptionSubmissionsByRound submissions = 1; } */
 export function decodeCDRPartialsResponse(
   bytes: Uint8Array,
@@ -251,6 +299,11 @@ export function decodeCDRPartialsResponse(
 
 /** QueryGetLatestActiveDKGNetworkRequest (empty) */
 export function encodeLatestActiveRequest(): Uint8Array {
+  return new Uint8Array();
+}
+
+/** QueryParamsRequest (empty) */
+export function encodeParamsRequest(): Uint8Array {
   return new Uint8Array();
 }
 
@@ -344,6 +397,19 @@ export function encodePartialsByRound(
 
 export function encodeLatestActiveResponse(n: DKGNetwork): Uint8Array {
   return new Writer().writeMessage(1, encodeDKGNetwork(n)).finish();
+}
+
+export function encodeDKGParams(p: DKGParams): Uint8Array {
+  const w = new Writer();
+  if (p.registrationPeriod !== 0n) w.writeTag(1, 0).writeVarint(p.registrationPeriod);
+  if (p.dealingPeriod !== 0n) w.writeTag(2, 0).writeVarint(p.dealingPeriod);
+  if (p.finalizationPeriod !== 0n) w.writeTag(3, 0).writeVarint(p.finalizationPeriod);
+  if (p.activePeriod !== 0n) w.writeTag(4, 0).writeVarint(p.activePeriod);
+  return w.finish();
+}
+
+export function encodeParamsResponse(p: DKGParams): Uint8Array {
+  return new Writer().writeMessage(1, encodeDKGParams(p)).finish();
 }
 
 export function encodeVerifiedRegistrationsResponse(
