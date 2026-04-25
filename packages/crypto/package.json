@@ -2,8 +2,17 @@
   "name": "@piplabs/cdr-crypto",
   "version": "0.1.1",
   "type": "module",
+  "license": "MIT",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc && cp src/wasm/cb-mpc-tdh2.js src/wasm/cb-mpc-tdh2.wasm dist/wasm/",
     "test": "vitest run",

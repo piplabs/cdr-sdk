@@ -2,8 +2,17 @@
   "name": "@piplabs/cdr-contracts",
   "version": "0.1.1",
   "type": "module",
+  "license": "MIT",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "clean": "rm -rf dist",
