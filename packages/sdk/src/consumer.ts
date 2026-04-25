@@ -7,6 +7,7 @@ import { uuidToLabel } from "./label.js";
 import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
 import type { AttestationConfig } from "./attestation.js";
+import { resolveLookbackBlocks } from "./defaults.js";
 import { queryCDRPartials } from "./cosmos/abci-query.js";
 import { bytesToHex as cosmosBytesToHex } from "./cosmos/protobuf.js";
 
@@ -15,6 +16,7 @@ export class Consumer {
   private walletClient: WalletClient;
   private network: Network;
   private observer: Observer | null;
+  private lookbackBlocks: bigint;
 
   /** Alias for {@link accessCDR} */
   readVault: Consumer["accessCDR"];
@@ -26,11 +28,19 @@ export class Consumer {
     publicClient: PublicClient;
     walletClient: WalletClient;
     observer?: Observer;
+    /**
+     * Block range to scan back from `latest` when looking up DKG
+     * `Registered` events. Defaults to the per-network value in
+     * `defaults.ts` (~7 days at 2 s/block on Story). Override for chains
+     * with different block time or DKG cadence.
+     */
+    lookbackBlocks?: bigint;
   }) {
     this.publicClient = params.publicClient;
     this.walletClient = params.walletClient;
     this.network = params.network;
     this.observer = params.observer ?? null;
+    this.lookbackBlocks = resolveLookbackBlocks(params.network, params.lookbackBlocks);
     this.readVault = this.accessCDR.bind(this);
     this.readFileVault = this.downloadFile.bind(this);
   }
@@ -79,14 +89,11 @@ export class Consumer {
    * so we keep all keys (most recent first) to handle round mismatch during
    * signature verification.
    */
-  /** Default lookback window: ~7 days at ~2 s/block. Matches Observer.DEFAULT_LOOKBACK_BLOCKS. */
-  private static readonly DEFAULT_LOOKBACK_BLOCKS = 302_400n;
-
   private async getCommPubKeyMap(): Promise<Map<string, Uint8Array[]>> {
     const dkgAddress = contractAddresses[this.network].dkg;
     const latestBlock = await this.publicClient.getBlockNumber();
-    const fromBlock = latestBlock > Consumer.DEFAULT_LOOKBACK_BLOCKS
-      ? latestBlock - Consumer.DEFAULT_LOOKBACK_BLOCKS
+    const fromBlock = latestBlock > this.lookbackBlocks
+      ? latestBlock - this.lookbackBlocks
       : 0n;
 
     const validators = await this.fetchRegisteredValidators(dkgAddress, fromBlock);

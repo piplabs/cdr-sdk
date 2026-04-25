@@ -15,6 +15,7 @@ import {
   queryVerifiedRegistrations,
 } from "./cosmos/abci-query.js";
 import type { DKGNetwork } from "./cosmos/dkg-proto.js";
+import { resolveLookbackBlocks } from "./defaults.js";
 
 /**
  * Which backend to use for DKG queries.
@@ -43,15 +44,13 @@ export class Observer {
   /** Many RPCs reject or time out on wide eth_getLogs ranges; chunk to stay under typical caps. */
   private static readonly DKG_LOGS_BLOCK_CHUNK = 8192n;
 
-  /** Default lookback window: ~7 days at ~2 s/block. Avoids scanning from block 0 on long chains. */
-  private static readonly DEFAULT_LOOKBACK_BLOCKS = 302_400n;
-
   private publicClient: PublicClient;
   private network: Network;
   readonly dkgSource: DkgSource;
   readonly cometRpcUrl: string | undefined;
   private minThresholdRatio?: number;
   private validationClients?: PublicClient[];
+  private lookbackBlocks: bigint;
 
   constructor(params: {
     network: Network;
@@ -67,6 +66,13 @@ export class Observer {
     minThresholdRatio?: number;
     /** Additional RPC clients for cross-validating critical on-chain reads (evm-events mode only). */
     validationClients?: PublicClient[];
+    /**
+     * Block range to scan back from `latest` when looking up DKG events
+     * (`Registered` / `Finalized`) in `evm-events` mode. Defaults to the
+     * per-network value in `defaults.ts` (~7 days at 2 s/block on Story).
+     * Override for chains with different block time or DKG cadence.
+     */
+    lookbackBlocks?: bigint;
   }) {
     this.publicClient = params.publicClient;
     this.network = params.network;
@@ -74,6 +80,7 @@ export class Observer {
     this.cometRpcUrl = params.cometRpcUrl;
     this.minThresholdRatio = params.minThresholdRatio;
     this.validationClients = params.validationClients;
+    this.lookbackBlocks = resolveLookbackBlocks(params.network, params.lookbackBlocks);
 
     if (this.dkgSource === "cosmos-abci" && !this.cometRpcUrl) {
       throw new Error(
@@ -270,8 +277,8 @@ export class Observer {
   }): Promise<Map<string, Uint8Array>> {
     const toBlock = await this.publicClient.getBlockNumber();
     const fromBlock = params?.fromBlock ??
-      (toBlock > Observer.DEFAULT_LOOKBACK_BLOCKS
-        ? toBlock - Observer.DEFAULT_LOOKBACK_BLOCKS
+      (toBlock > this.lookbackBlocks
+        ? toBlock - this.lookbackBlocks
         : 0n);
 
     const rawLogs = await this.fetchDkgEventLogs(
@@ -343,8 +350,8 @@ export class Observer {
     const toBlock =
       params?.toBlock ?? (await this.publicClient.getBlockNumber());
     const fromBlock = params?.fromBlock ??
-      (toBlock > Observer.DEFAULT_LOOKBACK_BLOCKS
-        ? toBlock - Observer.DEFAULT_LOOKBACK_BLOCKS
+      (toBlock > this.lookbackBlocks
+        ? toBlock - this.lookbackBlocks
         : 0n);
 
     const rawLogs = await this.fetchDkgEventLogs(
@@ -429,8 +436,8 @@ export class Observer {
     if (this.validationClients?.length) {
       const primaryHex = toHex(rawPoint);
       const fromBlock = params?.fromBlock ??
-        (toBlock > Observer.DEFAULT_LOOKBACK_BLOCKS
-          ? toBlock - Observer.DEFAULT_LOOKBACK_BLOCKS
+        (toBlock > this.lookbackBlocks
+          ? toBlock - this.lookbackBlocks
           : 0n);
 
       const settled = await Promise.allSettled(
@@ -464,8 +471,8 @@ export class Observer {
   }): Promise<Map<string, Uint8Array>> {
     const toBlock = await this.publicClient.getBlockNumber();
     const fromBlock = params?.fromBlock ??
-      (toBlock > Observer.DEFAULT_LOOKBACK_BLOCKS
-        ? toBlock - Observer.DEFAULT_LOOKBACK_BLOCKS
+      (toBlock > this.lookbackBlocks
+        ? toBlock - this.lookbackBlocks
         : 0n);
 
     const rawLogs = await this.fetchDkgEventLogs(

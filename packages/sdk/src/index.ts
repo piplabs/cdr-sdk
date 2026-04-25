@@ -8,6 +8,7 @@ export * from "./label.js";
 export * from "./conditions.js";
 export * from "./attestation.js";
 export * from "./storage/index.js";
+export * from "./defaults.js";
 
 // Re-export from sub-packages for convenience
 export * from "@piplabs/cdr-contracts";
