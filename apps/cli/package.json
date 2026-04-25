@@ -18,7 +18,8 @@
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "pnpm run build"
   },
   "dependencies": {
     "@piplabs/cdr-sdk": "workspace:*",

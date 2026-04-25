@@ -18,7 +18,7 @@ Available on every subcommand:
 |---|---|---|
 | `--network <name>` | `mainnet` or `testnet` | `testnet` |
 | `--rpc-url <url>` | Override the chain RPC URL | (network default) |
-| `--private-key <hex>` | Wallet private key. May also be set via `CDR_PRIVATE_KEY` environment variable. | — |
+| `--private-key <hex>` | Wallet private key. **Prefer the `CDR_PRIVATE_KEY` environment variable** — passing secrets as CLI flags exposes them to `ps`, shell history, and CI logs. | — |
 | `--json` | Output structured JSON instead of human-readable text | off |
 
 ## Subcommands
@@ -38,23 +38,25 @@ Run `cdr-cli <subcommand> --help` for the live flag set.
 ## Quick example
 
 ```sh
-# 1. See current fees
+# Set the wallet key once via env var so it doesn't land in shell history
+# or `ps` output. Use a secret manager in production environments.
+export CDR_PRIVATE_KEY=0x...
+
+# 1. See current fees (no key needed for read-only queries)
 cdr-cli --network testnet status fees
 
 # 2. Allocate a vault (open-access conditions for demo only)
-cdr-cli --network testnet --private-key 0x... allocate \
+cdr-cli --network testnet allocate \
   --write-condition 0x... --read-condition 0x...
 
 # 3. Encrypt a 32-byte data key against the DKG global pubkey
 cdr-cli encrypt --data-key 0x...32-bytes... --global-pub-key 0x... --uuid 42
 
 # 4. Write the resulting ciphertext into the vault
-cdr-cli --network testnet --private-key 0x... write \
-  --uuid 42 --encrypted-data 0x...
+cdr-cli --network testnet write --uuid 42 --encrypted-data 0x...
 
 # 5. Request a read; collect partials off-chain
-cdr-cli --network testnet --private-key 0x... read \
-  --uuid 42 --requester-pub-key 0x...
+cdr-cli --network testnet read --uuid 42 --requester-pub-key 0x...
 ```
 
 For the full upload/read flow including `collectPartials` and `tdh2Combine`, use the SDK directly — the CLI exposes the contract-facing primitives but does not orchestrate validator-partial collection.
