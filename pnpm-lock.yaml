@@ -5,10 +5,10 @@ settings:
   excludeLinksFromLockfile: false
 
 overrides:
-  protobufjs@<7.5.5: '>=7.5.5'
-  brace-expansion@<1.1.13: '>=1.1.13'
-  follow-redirects@<=1.15.11: '>=1.16.0'
-  axios@<1.15.0: '>=1.15.0'
+  protobufjs@<7.5.5: '>=7.5.5 <8'
+  brace-expansion@<1.1.13: '>=1.1.13 <2'
+  follow-redirects@<=1.15.11: '>=1.16.0 <2'
+  axios@<1.15.0: '>=1.15.0 <2'
 
 importers:
 
@@ -1602,6 +1602,9 @@ packages:
   blockstore-core@6.1.2:
     resolution: {integrity: sha512-yWU38RM8DJ6C7Y2shIeTNVgGiJX/ko2RXqDyNlxMakOc+aVS7k1SCiakMlh6ix0juRNPtj0ySMTXU8UBDXXRCQ==}
 
+  brace-expansion@1.1.14:
+    resolution: {integrity: sha512-MWPGfDxnyzKU7rNOW9SP/c50vi3xrmrua/+6hfPbCS2ABNWfx24vPidzvC7krjU/RTo235sV776ymlsMtGKj8g==}
+
   brace-expansion@2.0.3:
     resolution: {integrity: sha512-MCV/fYJEbqx68aE58kv2cA/kiky1G8vux3OR6/jbS+jIMe/6fJWa0DTzJU7dqijOWYwHi1t29FlfYI9uytqlpA==}
 
@@ -1724,6 +1727,9 @@ packages:
 
   commander@2.20.3:
     resolution: {integrity: sha512-GpVkmM8vF2vQUkj2LvZmD35JxeJOLCwJ9cUkugyk2nuhbv3+mJvpLYYt+0+USMxE+oj+ey/lJEnhZw75x/OMcQ==}
+
+  concat-map@0.0.1:
+    resolution: {integrity: sha512-/Srv4dswyQNBfohGpz9o6Yb3Gz3SrUDqBH5rTuhGR7ahtlbYKnVxw2bCFMRljaA7EXHaXZ8wsHdodFvbkhKmqg==}
 
   conf@11.0.2:
     resolution: {integrity: sha512-jjyhlQ0ew/iwmtwsS2RaB6s8DBifcE2GYBEaw2SJDUY/slJJbNfY4GlDVzOs/ff8cM/Wua5CikqXgbFl5eu85A==}
@@ -3025,8 +3031,8 @@ packages:
   promise@8.3.0:
     resolution: {integrity: sha512-rZPNPKTOYVNEEKFaq1HqTgOwZD+4/YHS5ukLzQCypkj+OkYx7iv0mA91lJlpPPZ8vMau3IIGj5Qlwrx+8iiSmg==}
 
-  protobufjs@8.0.1:
-    resolution: {integrity: sha512-NWWCCscLjs+cOKF/s/XVNFRW7Yih0fdH+9brffR5NZCy8k42yRdl5KlWKMVXuI1vfCoy4o1z80XR/W/QUb3V3w==}
+  protobufjs@7.5.5:
+    resolution: {integrity: sha512-3wY1AxV+VBNW8Yypfd1yQY9pXnqTAN+KwQxL8iYm3/BjKYMNg4i0owhEe26PWDOMaIrzeeF98Lqd5NGz4omiIg==}
     engines: {node: '>=12.0.0'}
 
   protons-runtime@5.6.0:
@@ -4506,7 +4512,7 @@ snapshots:
       '@perma/map': 1.0.3
       actor: 2.3.1
       multiformats: 13.4.2
-      protobufjs: 8.0.1
+      protobufjs: 7.5.5
       rabin-rs: 2.1.0
 
   '@ipshipyard/libp2p-auto-tls@2.0.1':
@@ -5913,6 +5919,11 @@ snapshots:
       it-merge: 3.0.12
       multiformats: 13.4.2
 
+  brace-expansion@1.1.14:
+    dependencies:
+      balanced-match: 1.0.2
+      concat-map: 0.0.1
+
   brace-expansion@2.0.3:
     dependencies:
       balanced-match: 1.0.2
@@ -6042,6 +6053,8 @@ snapshots:
   commander@14.0.3: {}
 
   commander@2.20.3: {}
+
+  concat-map@0.0.1: {}
 
   conf@11.0.2:
     dependencies:
@@ -7343,7 +7356,7 @@ snapshots:
 
   minimatch@3.1.5:
     dependencies:
-      brace-expansion: 5.0.5
+      brace-expansion: 1.1.14
 
   minimatch@9.0.9:
     dependencies:
@@ -7589,7 +7602,7 @@ snapshots:
     dependencies:
       asap: 2.0.6
 
-  protobufjs@8.0.1:
+  protobufjs@7.5.5:
     dependencies:
       '@protobufjs/aspromise': 1.1.2
       '@protobufjs/base64': 1.1.2
