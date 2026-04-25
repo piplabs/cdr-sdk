@@ -2,14 +2,24 @@
   "name": "@piplabs/cdr-cli",
   "version": "0.1.1",
   "type": "module",
+  "license": "MIT",
   "bin": {
     "cdr-cli": "dist/index.js"
   },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "pnpm run build"
   },
   "dependencies": {
     "@piplabs/cdr-sdk": "workspace:*",
