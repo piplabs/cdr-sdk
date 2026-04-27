@@ -3,6 +3,7 @@ dist/
 .turbo/
 *.tsbuildinfo
 .env*
+!.env.local.example
 .DS_Store
 docs/superpowers
 package-lock.json

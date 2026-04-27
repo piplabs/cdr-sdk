@@ -4,6 +4,7 @@
   "scripts": {
     "build": "turbo build",
     "test": "turbo test",
+    "test:integration": "turbo test:integration",
     "test:coverage": "turbo test:coverage",
     "lint": "turbo lint",
     "clean": "turbo clean"
