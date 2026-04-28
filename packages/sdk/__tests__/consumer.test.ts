@@ -693,38 +693,11 @@ describe("Consumer", () => {
       expect(partials).toHaveLength(1);
     });
 
-    it("warns exactly once per Consumer when falling back to the default CometBFT URL", async () => {
-      const { publicClient, walletClient } = mockClients();
-      vi.mocked(verifyPartialSignature).mockReturnValue(true);
-      vi.mocked(queryLatestActiveDKGNetwork).mockResolvedValue({
-        round: 1, globalPublicKey: new Uint8Array(), threshold: 3,
-      } as any);
-      publicClient.getBlockNumber.mockResolvedValue(100n);
-      publicClient.getLogs.mockImplementation(async (params: any) => {
-        if (params.address === DKG_ADDR) {
-          return [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 })];
-        }
-        return [makePartialDecryptionLog({ validator: VALIDATOR_A, round: 1, pid: 1, uuid: 70 })];
-      });
-
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-      try {
-        // No observer → hybrid path uses the hardcoded default URL.
-        const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
-        // First accessCDR: warning fires.
-        await consumer.collectPartials({ uuid: 70, minPartials: 1, fromBlock: 90n, timeoutMs: 5_000, pollIntervalMs: 10 });
-        // Trigger an explicit refresh to force another default-URL consultation.
-        await consumer.prefetchRegistry();
-
-        const defaultWarnings = warnSpy.mock.calls.filter(
-          (c) => typeof c[0] === "string" && c[0].includes("default CometBFT RPC URL"),
-        );
-        expect(defaultWarnings).toHaveLength(1);
-        expect(defaultWarnings[0][0]).toContain("http://172.192.41.96:26657");
-      } finally {
-        warnSpy.mockRestore();
-      }
-    });
+    // TODO(Step 2 — REST migration): the "default CometBFT URL warning" tests
+    // were removed when Observer dropped getDKGParams/getLookbackBlocks. The
+    // plaintext-HTTP warning lived in Observer.getDKGParams; both are gone in
+    // the REST cut-over. Reinstate equivalent warnings (or assert their
+    // absence) once Step 2 fully replaces consumer's cosmos-abci paths.
 
     it("does not warn when the caller supplies an explicit cometRpcUrl", async () => {
       const { publicClient, walletClient } = mockClients();
@@ -1216,45 +1189,10 @@ describe("Consumer", () => {
       expect(callCount).toBe(4);
     });
 
-    it("derives the event-scan lookback from queryDKGParams (dynamic formula)", async () => {
-      // Direct test of the dynamic-lookback formula (separate from the
-      // chunk-coverage test which intentionally exercises the fallback).
-      // Mock queryDKGParams with concrete values and assert the chunked DKG
-      // scan starts at exactly latestBlock - lookback, where:
-      //   lookback = 2 × (registration + dealing + finalization) + active
-      const REG = 100n, DEAL = 200n, FIN = 200n, ACTIVE = 1000n;
-      const EXPECTED_LOOKBACK = 2n * (REG + DEAL + FIN) + ACTIVE; // = 2000n
-      const LATEST = 1_000_000n;
-      const EXPECTED_START = LATEST - EXPECTED_LOOKBACK;
-
-      const { publicClient, walletClient } = mockClients();
-      vi.mocked(verifyPartialSignature).mockReturnValue(true);
-      vi.mocked(queryDKGParams).mockResolvedValue({
-        registrationPeriod: REG,
-        dealingPeriod: DEAL,
-        finalizationPeriod: FIN,
-        activePeriod: ACTIVE,
-      });
-      publicClient.getBlockNumber.mockResolvedValue(LATEST);
-
-      const chunks: { from: bigint; to: bigint }[] = [];
-      publicClient.getLogs.mockImplementation(async (params: any) => {
-        if (params.address === DKG_ADDR) {
-          chunks.push({ from: params.fromBlock, to: params.toBlock });
-          return [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 })];
-        }
-        return [makePartialDecryptionLog({ validator: VALIDATOR_A, round: 1, pid: 1, uuid: 200 })];
-      });
-
-      const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
-      await consumer.collectPartials({ uuid: 200, minPartials: 1, fromBlock: 990_000n, timeoutMs: 5_000, pollIntervalMs: 10 });
-
-      // Lookback (2000) ≪ DKG_LOGS_BLOCK_CHUNK (500_000) → exactly one DKG-scan call.
-      expect(chunks.length).toBe(1);
-      expect(chunks[0].from).toBe(EXPECTED_START);
-      expect(chunks[0].to).toBe(LATEST);
-      expect(queryDKGParams).toHaveBeenCalled();
-    });
+    // TODO(Step 2 — REST migration): the dynamic-lookback test exercised
+    // queryDKGParams + Observer.getLookbackBlocks. Both were removed in the
+    // REST cut-over (consumer now uses a static 302_400n fallback until
+    // Step 2 rewrites its EVM-event scan). Reinstate when Step 2 lands.
 
     it("dedups concurrent force-refresh requests into a single rescan", async () => {
       // Two collectPartials calls both hit a verification failure for the
@@ -1297,54 +1235,8 @@ describe("Consumer", () => {
       expect(dkgScanCount - dkgScansAfterPrewarm).toBe(1);
     });
 
-    it("emits the default-CometBFT-URL warning exactly once even after a force-refresh", async () => {
-      // When no Observer is wired into the Consumer, getEventLookback used
-      // to construct a fresh Observer on every call. Each new Observer had
-      // its own defaultCometUrlWarned=false, so a force-refresh would re-fire
-      // the plaintext-HTTP warning. The fix caches the fallback Observer on
-      // the Consumer instance, so the flag persists across refreshes.
-      const { publicClient, walletClient } = mockClients();
-      vi.mocked(verifyPartialSignature).mockReturnValue(true);
-      // Force the params query to fail so getLookbackBlocks falls back AND
-      // the warning path runs (the warning fires regardless of whether the
-      // params query succeeds or fails — it's about *consulting* the URL).
-      vi.mocked(queryDKGParams).mockRejectedValue(new Error("ABCI unreachable"));
-      publicClient.getBlockNumber.mockResolvedValue(100n);
-
-      let dkgScanCount = 0;
-      publicClient.getLogs.mockImplementation(async (params: any) => {
-        if (params.address === DKG_ADDR) {
-          dkgScanCount++;
-          // First scan: only validator A. Refresh: validator B also.
-          return dkgScanCount === 1
-            ? [makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 })]
-            : [
-                makeRegisteredLog({ validatorAddr: VALIDATOR_A, enclaveCommKey: KEY_A, round: 1 }),
-                makeRegisteredLog({ validatorAddr: VALIDATOR_B, enclaveCommKey: KEY_B, round: 1 }),
-              ];
-        }
-        // Partial from validator B forces a refresh on the first call.
-        return [makePartialDecryptionLog({ validator: VALIDATOR_B, round: 1, pid: 1, uuid: 202 })];
-      });
-
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-      try {
-        // No observer wired → fallback Observer path exercised.
-        const consumer = new Consumer({ network: "testnet", publicClient, walletClient });
-        await consumer.collectPartials({ uuid: 202, minPartials: 1, fromBlock: 90n, timeoutMs: 5_000, pollIntervalMs: 10 });
-
-        // Exactly one default-URL warning, even though the cache was built
-        // (initial scan) and refreshed (after the unknown-validator failure).
-        const defaultUrlWarnings = warnSpy.mock.calls.filter(
-          (c) => typeof c[0] === "string" && c[0].includes("default CometBFT RPC URL"),
-        );
-        expect(defaultUrlWarnings).toHaveLength(1);
-        // Sanity: the refresh actually happened — otherwise we wouldn't be
-        // testing the post-refresh case at all.
-        expect(dkgScanCount).toBeGreaterThanOrEqual(2);
-      } finally {
-        warnSpy.mockRestore();
-      }
-    });
+    // TODO(Step 2 — REST migration): "default-CometBFT-URL warning across
+    // refresh" test removed alongside the Observer.getDKGParams warning path.
+    // Reinstate (or replace with a story-api equivalent) when Step 2 lands.
   });
 });

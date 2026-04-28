@@ -37,15 +37,6 @@ export class Consumer {
    */
   private commPubKeyMapBuildInFlight = false;
 
-  /**
-   * Cached "fallback" Observer used by getEventLookback when the Consumer
-   * was constructed without one. Reusing the same instance preserves its
-   * `defaultCometUrlWarned` flag, so the plaintext-HTTP warning fires
-   * exactly once per Consumer instead of once per getEventLookback call
-   * (which would re-fire after every cache refresh).
-   */
-  private fallbackObserver: Observer | null = null;
-
   /** Alias for {@link accessCDR} */
   readVault: Consumer["accessCDR"];
   /** Alias for {@link downloadFile} */
@@ -193,24 +184,16 @@ export class Consumer {
   }
 
   /**
-   * Resolve the event-scan lookback window in blocks:
-   *   2 × (registrationPeriod + dealingPeriod + finalizationPeriod) + activePeriod
+   * Event-scan lookback window in blocks.
    *
-   * Delegates to the configured Observer (which caches DKG params). When no
-   * Observer is wired, lazily builds a single temporary one bound to this
-   * Consumer's cometRpcUrl resolution and reuses it across calls — reusing
-   * preserves the Observer's `defaultCometUrlWarned` flag so the plaintext-
-   * HTTP warning fires once per Consumer rather than once per refresh.
+   * TODO(Step 2 — REST migration): this whole module is being rewritten to
+   * fetch registrations and partials from Story-API REST. Until then, we
+   * return the v0.1.x static fallback (302_400 blocks ≈ 1 prior DKG epoch
+   * on Aeneid) because Observer no longer exposes `getLookbackBlocks()`
+   * after the REST cut-over.
    */
   private async getEventLookback(): Promise<bigint> {
-    if (this.observer) return this.observer.getLookbackBlocks();
-    if (!this.fallbackObserver) {
-      this.fallbackObserver = new Observer({
-        network: this.network,
-        publicClient: this.publicClient,
-      });
-    }
-    return this.fallbackObserver.getLookbackBlocks();
+    return 302_400n;
   }
 
   private async fetchRegisteredValidators(
@@ -228,7 +211,11 @@ export class Consumer {
     // one-time plaintext-HTTP warning is emitted by Observer.getDKGParams,
     // which getEventLookback() already invoked above).
     let activeRound: number | undefined;
-    const cometRpcUrl = this.observer?.cometRpcUrl ?? Observer.DEFAULT_COMET_RPC_URL;
+    // TODO(Step 2 — REST migration): replace with `this.observer.getActiveRound()`.
+    // Observer no longer carries `cometRpcUrl`, so we hardcode the prior
+    // public CometBFT default URL to keep hybrid-mode filtering working
+    // until Step 2 cuts this whole module over to story-api.
+    const cometRpcUrl = "http://172.192.41.96:26657";
     try {
       const network = await queryLatestActiveDKGNetwork(cometRpcUrl);
       activeRound = network.round;
@@ -326,9 +313,10 @@ export class Consumer {
     /** If provided, verify each validator's attestation report. Invalid attestations trigger onInvalidPartial. */
     attestationConfig?: AttestationConfig;
   }): Promise<PartialDecryptionEvent[]> {
-    if (this.observer?.dkgSource === "cosmos-abci") {
-      return this.collectPartialsFromCosmos(params);
-    }
+    // TODO(Step 2 — REST migration): replace with story-api `queryCDRPartials`.
+    // Observer no longer carries `dkgSource`, so we always take the EVM-events
+    // path here. `collectPartialsFromCosmos` below is unreachable in Step 1
+    // and will be deleted along with `cosmos/` when Step 2 lands.
     return this.collectPartialsFromEvents(params);
   }
 
@@ -462,10 +450,13 @@ export class Consumer {
         'collectPartials: requesterPubKey is required when observer is configured with dkgSource: "cosmos-abci"',
       );
     }
-    const rpcUrl = this.observer?.cometRpcUrl;
+    // TODO(Step 2 — REST migration): this whole method is unreachable in
+    // Step 1 (collectPartials always dispatches to the EVM-events path now)
+    // and gets deleted when Step 2 cuts over to story-api `queryCDRPartials`.
+    const rpcUrl: string | undefined = undefined;
     if (!rpcUrl) {
       throw new InvalidParamsError(
-        'collectPartials: observer.cometRpcUrl is required when observer is configured with dkgSource: "cosmos-abci"',
+        'collectPartials: cosmos-abci mode is removed in Step 1 of the v0.2.0 REST migration',
       );
     }
     const requesterPubKeyHex = requesterPubKey.replace(/^0x/i, "");

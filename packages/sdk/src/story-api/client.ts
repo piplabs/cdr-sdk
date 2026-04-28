@@ -71,7 +71,17 @@ export async function queryAllRegistrations(
 
 /**
  * GET /dkg/registrations/verified?round=N — only `Verified`-status entries.
- * Returns `[]` once the round has finalized.
+ *
+ * ⚠️ Caveat: this endpoint is empty for most usable rounds. `Verified`
+ * (status=1) is only a transient state during the Dealing stage; once a round
+ * reaches Active or Ended, the keeper has transitioned all entries to
+ * `Finalized` (status=2), and this endpoint returns `null`/`[]`. Verified
+ * empirically against DevNet on 2026-04-28: for the currently-active round 4
+ * `/registrations` returned 3 entries with `status=[2,2,2]` while
+ * `/registrations/verified` returned `null`.
+ *
+ * For most callers, prefer {@link queryAllRegistrations} and filter on the
+ * SDK side by `status === 2` (Finalized).
  */
 export async function queryVerifiedRegistrations(
   opts: QueryOptions & { round: number },

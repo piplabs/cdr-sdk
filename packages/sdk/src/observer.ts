@@ -1,109 +1,90 @@
-import {
-  getAbiItem,
-  parseEventLogs,
-  toBytes,
-  toHex,
-  type Log,
-  type PublicClient,
-} from "viem";
+import { type PublicClient } from "viem";
 import { cdrAbi, dkgAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
 import { CURVE_ED25519 } from "@piplabs/cdr-crypto";
 import type { Vault } from "./types.js";
-import { RpcConsensusError } from "./errors.js";
+import { InvalidParamsError } from "./errors.js";
 import {
-  queryDKGParams,
   queryLatestActiveDKGNetwork,
-  queryVerifiedRegistrations,
-} from "./cosmos/abci-query.js";
-import type { DKGNetwork, DKGParams } from "./cosmos/dkg-proto.js";
+  queryDKGNetwork,
+  queryAllRegistrations,
+} from "./story-api/client.js";
+import type { DKGNetwork, DKGRegistration } from "./story-api/types.js";
+
+/** DKG round stage values from `story.dkg.v1.types.Stage`. */
+const STAGE_ACTIVE = 4;
+const STAGE_ENDED = 6;
+
+/** DKG registration status values from `story.dkg.v1.types.RegistrationStatus`. */
+const STATUS_FINALIZED = 2;
 
 /**
- * Which backend to use for DKG queries.
+ * Observer queries CDR contract state (EVM) and DKG state via the Story-API
+ * REST endpoint.
  *
- * - `evm-events`: scan DKG contract Finalized/Registered events via the
- *   provided publicClient. Works against any EVM RPC.
- * - `cosmos-abci`: query the x/dkg keeper directly via CometBFT abci_query
- *   (port 26657). Avoids wide eth_getLogs ranges and requires only one
- *   non-EVM endpoint.
- */
-export type DkgSource = "evm-events" | "cosmos-abci";
-
-// ---------------------------------------------------------------------------
-
-/**
- * Observer queries CDR contract state (EVM) and DKG module state.
+ * Two backends are used:
+ * - **EVM** via `publicClient` for CDR contract reads (vault, fees,
+ *   maxEncryptedDataSize, operationalThreshold) and the DKG contract's
+ *   `operationalThreshold`.
+ * - **Story-API REST** via `apiUrl` for all DKG state (active round, global
+ *   public key, threshold, participant count, registered validators,
+ *   validator attestations).
  *
- * DKG state can come from two sources, selected via the `dkgSource` option:
- *   - `evm-events` (default): scans DKG contract events via viem
- *   - `cosmos-abci`: queries the x/dkg keeper via CometBFT abci_query
+ * ## Caching
  *
- * CDR reads (vault, fees, maxEncryptedDataSize) and validator attestation
- * reports always come from EVM — the x/dkg keeper does not expose SGX quotes.
+ * - `getActiveRound()` always hits REST — active round can change at any time
+ *   and a stale value would silently desync downstream reads.
+ * - Round-keyed network and registration snapshots are cached for the
+ *   lifetime of the Observer, with in-flight Promise dedup so concurrent
+ *   callers share a single REST request.
+ * - The cache only retains entries for rounds in stage Active (4) or
+ *   Ended (6) — these are the immutable, post-DKG-protocol states. Earlier
+ *   stages (Registration / Dealing / Finalization / Failed) may still
+ *   mutate, so we re-fetch on subsequent reads.
+ * - `getRegisteredValidators` and `getValidatorAttestations` share a single
+ *   per-round registrations cache, so calling both for the same round is a
+ *   single round-trip.
  */
 export class Observer {
-  /** Many RPCs reject or time out on wide eth_getLogs ranges; chunk to stay under typical caps. */
-  private static readonly DKG_LOGS_BLOCK_CHUNK = 8192n;
-
-  /**
-   * Fallback lookback window when DKG params can't be fetched from any
-   * CometBFT RPC. When params are reachable, the window is computed as
-   * `2 × (registrationPeriod + dealingPeriod + finalizationPeriod) + activePeriod`,
-   * which spans the current epoch plus a buffer of one prior DKG protocol pass.
-   */
-  private static readonly DEFAULT_LOOKBACK_BLOCKS = 302_400n;
-
-  /**
-   * Default CometBFT RPC URL used to fetch DKG params when the caller has not
-   * configured `cometRpcUrl`. Pinned to the Aeneid / mainnet endpoint so the
-   * SDK works zero-config for development and demos.
-   *
-   * ⚠️ Plaintext HTTP — a network-level attacker could forge params /
-   * activeRound responses. Production deployments should always pass an
-   * explicit `cometRpcUrl` (own node, or HTTPS).
-   */
-  static readonly DEFAULT_COMET_RPC_URL = "http://172.192.41.96:26657";
-
   private publicClient: PublicClient;
   private network: Network;
-  readonly dkgSource: DkgSource;
-  readonly cometRpcUrl: string | undefined;
+  private apiUrl: string;
   private minThresholdRatio?: number;
-  private validationClients?: PublicClient[];
-  private dkgParamsPromise: Promise<DKGParams> | null = null;
-  private defaultCometUrlWarned = false;
+
+  /** Per-round network snapshot cache (Promise-valued for in-flight dedup). */
+  private networkSnapshots = new Map<number, Promise<DKGNetwork>>();
+  /** Per-round registrations cache (status===Finalized only). */
+  private registrationSnapshots = new Map<number, Promise<Map<string, DKGRegistration>>>();
 
   constructor(params: {
     network: Network;
     publicClient: PublicClient;
-    /** DKG query backend. Defaults to `"evm-events"`. */
-    dkgSource?: DkgSource;
+    /** Story-API REST base URL, e.g. `"http://node:1317"`. */
+    apiUrl: string;
     /**
-     * CometBFT RPC base URL (e.g. `"http://node:26657"`). Required when
-     * `dkgSource === "cosmos-abci"`.
+     * Minimum threshold ratio override, in `[0, 1]`. The effective threshold
+     * is `max(network.threshold, ceil(participants * minThresholdRatio))`.
+     * Values > 1 would demand more partials than there are participants and
+     * make `collectPartials` time out forever, so they are rejected.
      */
-    cometRpcUrl?: string;
-    /** Minimum threshold ratio override (0-1). */
     minThresholdRatio?: number;
-    /** Additional RPC clients for cross-validating critical on-chain reads (evm-events mode only). */
-    validationClients?: PublicClient[];
   }) {
+    if (params.minThresholdRatio !== undefined) {
+      const r = params.minThresholdRatio;
+      if (!Number.isFinite(r) || r < 0 || r > 1) {
+        throw new InvalidParamsError(
+          `Observer: minThresholdRatio must be a finite number in [0, 1], got ${r}`,
+        );
+      }
+    }
     this.publicClient = params.publicClient;
     this.network = params.network;
-    this.dkgSource = params.dkgSource ?? "evm-events";
-    this.cometRpcUrl = params.cometRpcUrl;
+    this.apiUrl = params.apiUrl;
     this.minThresholdRatio = params.minThresholdRatio;
-    this.validationClients = params.validationClients;
-
-    if (this.dkgSource === "cosmos-abci" && !this.cometRpcUrl) {
-      throw new Error(
-        'Observer: cometRpcUrl is required when dkgSource is "cosmos-abci"',
-      );
-    }
   }
 
-  // =======================================================================
-  // CDR contract reads (always EVM)
-  // =======================================================================
+  // =========================================================================
+  // CDR contract reads (EVM)
+  // =========================================================================
 
   /**
    * Get a vault's details by UUID.
@@ -168,432 +149,189 @@ export class Observer {
     });
   }
 
-  // =======================================================================
-  // DKG queries — dispatched to either EVM events or cosmos REST API
-  // =======================================================================
+  // =========================================================================
+  // DKG queries via Story-API REST
+  // =========================================================================
+
+  /**
+   * Get the currently active DKG round number.
+   *
+   * Always hits REST. The active round can transition at any time and a
+   * stale value would silently desync downstream reads, so this method
+   * never returns a cached round number. As a side-effect, the response's
+   * network snapshot is cached under its round number, so subsequent
+   * reads for the same round are served from cache.
+   */
+  async getActiveRound(): Promise<number> {
+    const network = await this.fetchLatestActive();
+    return network.round;
+  }
 
   /**
    * Get the DKG global public key from the active round.
-   * Returns the raw bytes of the globalPubKey (Ed25519 point with curve-code prefix).
-   * @example
-   * ```ts
-   * const globalPubKey = await observer.getGlobalPubKey();
-   * ```
+   * Returns the Ed25519 point with a 2-byte curve-code prefix (0x043f) so it
+   * can be passed directly to the WASM TDH2 functions.
    */
-  async getGlobalPubKey(params?: { fromBlock?: bigint }): Promise<Uint8Array> {
-    const rawPoint =
-      this.dkgSource === "cosmos-abci"
-        ? await this.getGlobalPubKeyFromCosmos()
-        : await this.getGlobalPubKeyFromEvents(params);
+  async getGlobalPubKey(): Promise<Uint8Array> {
+    const net = await this.fetchLatestActive();
+    return prefixEd25519Point(net.globalPublicKey);
+  }
 
-    // Both sources return the raw 32-byte Ed25519 point. The WASM TDH2
-    // functions expect a 2-byte curve-code prefix (0x043f for Ed25519).
-    if (rawPoint.length === 32) {
-      const prefixed = new Uint8Array(34);
-      prefixed[0] = (CURVE_ED25519 >> 8) & 0xff; // 0x04
-      prefixed[1] = CURVE_ED25519 & 0xff;         // 0x3f
-      prefixed.set(rawPoint, 2);
-      return prefixed;
-    }
-
-    return rawPoint;
+  /** Get the number of participants in the active DKG round. */
+  async getParticipantCount(): Promise<number> {
+    const net = await this.fetchLatestActive();
+    return net.total;
   }
 
   /**
-   * Get the number of participants in the active DKG round.
-   * @example
-   * ```ts
-   * const count = await observer.getParticipantCount();
-   * ```
+   * Get the absolute threshold (minimum number of partial decryptions needed)
+   * for the active round. If `minThresholdRatio` was set on the Observer,
+   * returns `max(network.threshold, ceil(participants * minThresholdRatio))`.
    */
-  async getParticipantCount(params?: { fromBlock?: bigint }): Promise<number> {
-    if (this.dkgSource === "cosmos-abci") {
-      const network = await this.getLatestActiveNetwork();
-      return network.total;
-    }
-    const parsed = await this.getFinalizedEvents(params);
-    const { events } = await this.getActiveRound(parsed);
-    return events.length;
-  }
-
-  /**
-   * Get the absolute threshold (minimum number of partial decryptions needed).
-   * - In `evm-events` mode: computes `ceil(participants * operationalThreshold / 1000)`.
-   * - In `cosmos-abci` mode: reads `threshold` directly from DKG network state.
-   * If `minThresholdRatio` was set, returns `max(sourceThreshold, ceil(participants * minThresholdRatio))`.
-   */
-  async getThreshold(params?: { fromBlock?: bigint }): Promise<number> {
-    let sourceThreshold: number;
-    let participantCount: number;
-
-    if (this.dkgSource === "cosmos-abci") {
-      const network = await this.getLatestActiveNetwork();
-      sourceThreshold = network.threshold;
-      participantCount = network.total;
-    } else {
-      const [operationalThreshold, count] = await Promise.all([
-        this.getOperationalThreshold(),
-        this.getParticipantCount(params),
-      ]);
-      participantCount = count;
-      sourceThreshold = Math.ceil(
-        participantCount * Number(operationalThreshold) / 1000,
-      );
-    }
-
+  async getThreshold(): Promise<number> {
+    const net = await this.fetchLatestActive();
     if (this.minThresholdRatio !== undefined) {
-      const overrideThreshold = Math.ceil(participantCount * this.minThresholdRatio);
-      return Math.max(sourceThreshold, overrideThreshold);
+      const overrideThreshold = Math.ceil(net.total * this.minThresholdRatio);
+      return Math.max(net.threshold, overrideThreshold);
     }
-    return sourceThreshold;
+    return net.threshold;
   }
 
   /**
-   * Get a map of validator address → commPubKey bytes for the active round.
-   * The commPubKey is the uncompressed secp256k1 public key used by the
-   * validator's TEE to sign partial decryption responses.
+   * Get a map of validator address → commPubKey bytes for the given DKG
+   * round (defaults to active round). Only includes validators with
+   * status=Finalized (2). Shares per-round cache with
+   * {@link getValidatorAttestations}, so calling both for the same round
+   * is a single REST round-trip.
    *
-   * In `evm-events` mode, reads DKG `Registered` events; `fromBlock` controls
-   * the lookback window and `round` filters events. In `cosmos-abci` mode,
-   * queries the x/dkg keeper's GetAllVerifiedDKGRegistrations via abci_query;
-   * `codeCommitmentHex` narrows the result to a specific enclave code commitment.
+   * The commPubKey is the secp256k1 public key used by the validator's TEE
+   * to sign partial decryption responses.
    */
-  async getRegisteredValidators(params?: {
-    fromBlock?: bigint;
-    round?: number;
-    codeCommitmentHex?: string;
-  }): Promise<Map<string, Uint8Array>> {
-    if (this.dkgSource === "cosmos-abci") {
-      return this.getRegisteredValidatorsFromCosmos(params);
-    }
-    return this.getRegisteredValidatorsFromEvents(params);
+  async getRegisteredValidators(params?: { round?: number }): Promise<Map<string, Uint8Array>> {
+    const round = params?.round ?? (await this.getActiveRound());
+    const regs = await this.loadRegistrations(round);
+    return new Map([...regs].map(([addr, reg]) => [addr, reg.commPubKey]));
   }
 
-  // =======================================================================
-  // Validator attestations — always EVM (cosmos API does not expose quotes)
-  // =======================================================================
-
   /**
-   * Get validator attestation reports (raw SGX quotes) from DKG Registered events.
-   * Returns a map of validator address → enclaveReport bytes (most recent per validator).
+   * Get a map of validator address → enclaveReport (raw SGX quote bytes)
+   * for the given DKG round (defaults to active round). Only includes
+   * validators with status=Finalized (2). Shares per-round cache with
+   * {@link getRegisteredValidators}.
    *
    * Use with `verifyAttestation()` to verify each validator's TEE enclave
    * before trusting their partial decryptions.
-   *
-   * Note: sourced from EVM events regardless of `dkgSource`, because the
-   * x/dkg keeper does not expose raw SGX quotes.
    */
-  async getValidatorAttestations(params?: {
-    fromBlock?: bigint;
-    round?: number;
-  }): Promise<Map<string, Uint8Array>> {
-    const toBlock = await this.publicClient.getBlockNumber();
-    const lookback = await this.getLookbackBlocks();
-    const fromBlock = params?.fromBlock ??
-      (toBlock > lookback ? toBlock - lookback : 0n);
-
-    const rawLogs = await this.fetchDkgEventLogs(
-      this.publicClient,
-      "Registered",
-      fromBlock,
-      toBlock,
-    );
-
-    const parsed = parseEventLogs({
-      abi: dkgAbi,
-      logs: rawLogs,
-      eventName: "Registered",
-    });
-
-    const attestations = new Map<string, Uint8Array>();
-    for (const log of parsed) {
-      if (params?.round !== undefined && log.args.round !== params.round) {
-        continue;
-      }
-      const addr = log.args.validatorAddr.toLowerCase() as `0x${string}`;
-      attestations.set(addr, toBytes(log.args.enclaveReport));
-    }
-
-    // Fallback: if lookback window found nothing and the caller did NOT
-    // explicitly provide fromBlock, scan from block 0.
-    if (attestations.size === 0 && !params?.fromBlock && fromBlock > 0n) {
-      return this.getValidatorAttestations({ fromBlock: 0n, round: params?.round });
-    }
-
-    return attestations;
+  async getValidatorAttestations(params?: { round?: number }): Promise<Map<string, Uint8Array>> {
+    const round = params?.round ?? (await this.getActiveRound());
+    const regs = await this.loadRegistrations(round);
+    return new Map([...regs].map(([addr, reg]) => [addr, reg.enclaveReport]));
   }
 
-  // =======================================================================
-  // Private: EVM event-scanning implementation
-  // =======================================================================
+  // =========================================================================
+  // Private cache layer
+  //
+  // TODO(Step 2 — Consumer rewrite): if Consumer ends up needing the same
+  // round-keyed network/registrations snapshot, extract this layer into
+  // `observer/cache.ts` (or a top-level `cache.ts`) so both modules share
+  // a single cache instance. Don't pre-extract — wait for the real reuse
+  // signal so the abstraction is shaped by an actual second caller.
+  // =========================================================================
 
-  /** Fetch DKG logs for a single event type in block chunks. */
-  private async fetchDkgEventLogs(
-    client: PublicClient,
-    eventName: "Finalized" | "Registered",
-    fromBlock: bigint,
-    toBlock: bigint,
-  ): Promise<Log[]> {
-    const dkgAddress = contractAddresses[this.network].dkg;
-    const event = getAbiItem({ abi: dkgAbi, name: eventName });
-    const chunk = Observer.DKG_LOGS_BLOCK_CHUNK;
-    const logs: Log[] = [];
-    let start = fromBlock;
-
-    while (start <= toBlock) {
-      const end = start + chunk - 1n <= toBlock ? start + chunk - 1n : toBlock;
-      const chunkLogs = await client.getLogs({
-        address: dkgAddress,
-        event,
-        fromBlock: start,
-        toBlock: end,
-      });
-      logs.push(...chunkLogs);
-      start = end + 1n;
+  /**
+   * Fetch `/dkg/latest_active`. Always hits REST. As a side-effect, caches
+   * the network under its round number — `latest_active` is by definition
+   * stage=Active (4), so the snapshot is safe to retain.
+   */
+  private async fetchLatestActive(): Promise<DKGNetwork> {
+    const network = await queryLatestActiveDKGNetwork({ apiUrl: this.apiUrl });
+    if (!this.networkSnapshots.has(network.round)) {
+      this.networkSnapshots.set(network.round, Promise.resolve(network));
     }
-
-    return logs;
-  }
-
-  /** Get parsed Finalized events from the DKG contract. */
-  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
-  private async getFinalizedEvents(params?: { fromBlock?: bigint; toBlock?: bigint }): Promise<Array<{ args: { round: number; globalPubKey: `0x${string}`; validatorAddr: `0x${string}` } }>> {
-    const toBlock =
-      params?.toBlock ?? (await this.publicClient.getBlockNumber());
-    const lookback = await this.getLookbackBlocks();
-    const fromBlock = params?.fromBlock ??
-      (toBlock > lookback ? toBlock - lookback : 0n);
-
-    const rawLogs = await this.fetchDkgEventLogs(
-      this.publicClient,
-      "Finalized",
-      fromBlock,
-      toBlock,
-    );
-
-    const parsed = parseEventLogs({
-      abi: dkgAbi,
-      logs: rawLogs,
-      eventName: "Finalized",
-    });
-
-    if (parsed.length === 0) {
-      // Fallback: if no events in lookback window, try from block 0
-      if (!params?.fromBlock && fromBlock > 0n) {
-        return this.getFinalizedEvents({ fromBlock: 0n, toBlock });
-      }
-      throw new Error("No Finalized event found — DKG may not have completed yet");
-    }
-
-    return parsed;
+    return network;
   }
 
   /**
-   * Find the highest DKG round that has enough finalized participants to be
-   * considered "active" — i.e. count >= minReqFinalizedParticipants.
-   * Fixes issue #36: the previous logic used the latest Finalized event which
-   * could be from a failed round.
+   * Fetch network state for a specific round, or hit cache. Used by
+   * {@link loadRegistrations} for its stage check; not directly exposed.
+   * The returned Promise is cached for in-flight dedup; the entry is
+   * evicted after resolution if the round is in a non-stable stage so
+   * subsequent reads re-fetch.
    */
-  private async getActiveRound(
-    allEvents: Array<{ args: { round: number; globalPubKey: `0x${string}`; validatorAddr: `0x${string}` } }>,
-  ): Promise<{ round: number; events: typeof allEvents }> {
-    const minReq = await this.publicClient.readContract({
-      address: contractAddresses[this.network].dkg,
-      abi: dkgAbi,
-      functionName: "minReqFinalizedParticipants",
-    }) as bigint;
-    const minRequired = Number(minReq);
-
-    // Group events by round, deduplicate by validatorAddr within each round
-    const byRound = new Map<number, typeof allEvents>();
-    for (const e of allEvents) {
-      const round = e.args.round;
-      if (!byRound.has(round)) byRound.set(round, []);
-      const existing = byRound.get(round)!;
-      const alreadySeen = existing.some(
-        (prev) => prev.args.validatorAddr.toLowerCase() === e.args.validatorAddr.toLowerCase(),
-      );
-      if (!alreadySeen) existing.push(e);
-    }
-
-    // Find the highest round that meets the threshold (descending order)
-    const rounds = [...byRound.keys()].sort((a, b) => b - a);
-    for (const round of rounds) {
-      const events = byRound.get(round)!;
-      if (events.length >= minRequired) {
-        return { round, events };
-      }
-    }
-
-    // Fallback: no round meets threshold — warn and use the highest round.
-    const highestRound = rounds[0];
-    console.warn(
-      `[CDR SDK] Warning: no DKG round meets minReqFinalizedParticipants (${minRequired}). ` +
-      `Using highest round ${highestRound} as fallback. Data encrypted with this key may not be recoverable.`,
-    );
-    return { round: highestRound, events: byRound.get(highestRound)! };
-  }
-
-  private async getGlobalPubKeyFromEvents(params?: { fromBlock?: bigint }): Promise<Uint8Array> {
-    const toBlock = await this.publicClient.getBlockNumber();
-    const parsed = await this.getFinalizedEvents({ ...params, toBlock });
-
-    const { events: activeEvents } = await this.getActiveRound(parsed);
-    const latest = activeEvents[activeEvents.length - 1];
-    const rawPoint = toBytes(latest.args.globalPubKey);
-
-    // Cross-validate against additional RPCs if configured
-    if (this.validationClients?.length) {
-      const primaryHex = toHex(rawPoint);
-      const lookback = await this.getLookbackBlocks();
-      const fromBlock = params?.fromBlock ??
-        (toBlock > lookback ? toBlock - lookback : 0n);
-
-      const settled = await Promise.allSettled(
-        this.validationClients.map(async (client) => {
-          const logs = await this.fetchDkgEventLogs(
-            client,
-            "Finalized",
-            fromBlock,
-            toBlock,
-          );
-          const events = parseEventLogs({ abi: dkgAbi, logs, eventName: "Finalized" });
-          if (events.length === 0) return null;
-          const { events: activeEvents } = await this.getActiveRound(events);
-          return activeEvents[activeEvents.length - 1].args.globalPubKey;
-        }),
-      );
-
-      for (const s of settled) {
-        if (s.status === "fulfilled" && s.value !== null && s.value !== primaryHex) {
-          throw new RpcConsensusError("globalPubKey");
+  private async loadNetwork(round: number): Promise<DKGNetwork> {
+    const cached = this.networkSnapshots.get(round);
+    if (cached) return cached;
+    const promise = queryDKGNetwork({ apiUrl: this.apiUrl, round });
+    this.networkSnapshots.set(round, promise);
+    promise
+      .then((network) => {
+        if (network.stage !== STAGE_ACTIVE && network.stage !== STAGE_ENDED) {
+          if (this.networkSnapshots.get(round) === promise) {
+            this.networkSnapshots.delete(round);
+          }
         }
-      }
-    }
-
-    return rawPoint;
-  }
-
-  private async getRegisteredValidatorsFromEvents(params?: {
-    fromBlock?: bigint;
-    round?: number;
-  }): Promise<Map<string, Uint8Array>> {
-    const toBlock = await this.publicClient.getBlockNumber();
-    const lookback = await this.getLookbackBlocks();
-    const fromBlock = params?.fromBlock ??
-      (toBlock > lookback ? toBlock - lookback : 0n);
-
-    const rawLogs = await this.fetchDkgEventLogs(
-      this.publicClient,
-      "Registered",
-      fromBlock,
-      toBlock,
-    );
-
-    const parsed = parseEventLogs({
-      abi: dkgAbi,
-      logs: rawLogs,
-      eventName: "Registered",
-    });
-
-    const validators = new Map<string, Uint8Array>();
-    for (const log of parsed) {
-      if (params?.round !== undefined && log.args.round !== params.round) {
-        continue;
-      }
-      const addr = log.args.validatorAddr.toLowerCase() as `0x${string}`;
-      validators.set(addr, toBytes(log.args.enclaveCommKey));
-    }
-    return validators;
-  }
-
-  // =======================================================================
-  // Private: CometBFT abci_query implementation
-  // =======================================================================
-
-  private requireCometRpcUrl(): string {
-    if (!this.cometRpcUrl) {
-      throw new Error(
-        'Observer: cometRpcUrl is required when dkgSource is "cosmos-abci"',
-      );
-    }
-    return this.cometRpcUrl;
-  }
-
-  private async getLatestActiveNetwork(): Promise<DKGNetwork> {
-    return queryLatestActiveDKGNetwork(this.requireCometRpcUrl());
-  }
-
-  /**
-   * Fetch x/dkg module Params, cached for the lifetime of this Observer.
-   * Uses the configured `cometRpcUrl`; falls back to
-   * {@link Observer.DEFAULT_COMET_RPC_URL} with a one-time warning when none
-   * is set.
-   */
-  async getDKGParams(): Promise<DKGParams> {
-    if (!this.dkgParamsPromise) {
-      const url = this.cometRpcUrl ?? Observer.DEFAULT_COMET_RPC_URL;
-      if (!this.cometRpcUrl && !this.defaultCometUrlWarned) {
-        this.defaultCometUrlWarned = true;
-        // eslint-disable-next-line no-console
-        console.warn(
-          "[cdr-sdk] Using the default CometBFT RPC URL over plaintext HTTP " +
-            `(${Observer.DEFAULT_COMET_RPC_URL}) to fetch DKG params for the event-scan lookback. ` +
-            "A network-level attacker can forge params and shrink/expand the scan window. " +
-            "For production, pass `cometRpcUrl` to CDRClient pointing to your own CometBFT node " +
-            "or an HTTPS endpoint.",
-        );
-      }
-      this.dkgParamsPromise = queryDKGParams(url).catch((e) => {
-        this.dkgParamsPromise = null;
-        throw e;
+      })
+      .catch(() => {
+        if (this.networkSnapshots.get(round) === promise) {
+          this.networkSnapshots.delete(round);
+        }
       });
-    }
-    return this.dkgParamsPromise;
+    return promise;
   }
 
   /**
-   * Lookback window for EVM event scans, in blocks:
-   *   2 × (registrationPeriod + dealingPeriod + finalizationPeriod) + activePeriod
-   *
-   * Falls back to {@link Observer.DEFAULT_LOOKBACK_BLOCKS} when DKG params
-   * are unreachable on every CometBFT URL.
+   * Fetch + filter registrations for a round, or hit cache. Filters by
+   * `status === Finalized` so the returned map only contains validators
+   * whose registration is fully ratified. Cache is only retained when the
+   * round is in a stable stage (Active or Ended); non-stable stages may
+   * mutate, so they're evicted after resolution.
    */
-  async getLookbackBlocks(): Promise<bigint> {
-    try {
-      const p = await this.getDKGParams();
-      return 2n * (p.registrationPeriod + p.dealingPeriod + p.finalizationPeriod)
-        + p.activePeriod;
-    } catch {
-      return Observer.DEFAULT_LOOKBACK_BLOCKS;
-    }
-  }
+  private async loadRegistrations(round: number): Promise<Map<string, DKGRegistration>> {
+    const cached = this.registrationSnapshots.get(round);
+    if (cached) return cached;
 
-  private async getGlobalPubKeyFromCosmos(): Promise<Uint8Array> {
-    const network = await this.getLatestActiveNetwork();
-    return network.globalPublicKey;
-  }
+    const networkPromise = this.loadNetwork(round);
+    const regsPromise = queryAllRegistrations({ apiUrl: this.apiUrl, round });
 
-  private async getRegisteredValidatorsFromCosmos(params?: {
-    round?: number;
-    codeCommitmentHex?: string;
-  }): Promise<Map<string, Uint8Array>> {
-    let round = params?.round;
-    const codeCommitmentHex = params?.codeCommitmentHex ?? "";
-    if (round === undefined) {
-      round = (await this.getLatestActiveNetwork()).round;
-    }
-
-    const registrations = await queryVerifiedRegistrations(
-      this.requireCometRpcUrl(),
-      round,
-      codeCommitmentHex,
+    const promise = regsPromise.then(
+      (allRegs) =>
+        new Map<string, DKGRegistration>(
+          allRegs
+            .filter((r) => r.status === STATUS_FINALIZED)
+            .map((r) => [r.validatorAddr.toLowerCase(), r]),
+        ),
     );
 
-    const validators = new Map<string, Uint8Array>();
-    for (const reg of registrations) {
-      validators.set(reg.validatorAddr.toLowerCase(), reg.commPubKey);
-    }
-    return validators;
+    this.registrationSnapshots.set(round, promise);
+
+    Promise.all([networkPromise, promise])
+      .then(([network]) => {
+        if (network.stage !== STAGE_ACTIVE && network.stage !== STAGE_ENDED) {
+          if (this.registrationSnapshots.get(round) === promise) {
+            this.registrationSnapshots.delete(round);
+          }
+        }
+      })
+      .catch(() => {
+        if (this.registrationSnapshots.get(round) === promise) {
+          this.registrationSnapshots.delete(round);
+        }
+      });
+
+    return promise;
   }
+}
+
+/**
+ * The WASM TDH2 functions expect a 2-byte curve-code prefix on the Ed25519
+ * public key (0x043f). Story-API returns the raw 32-byte point, so we
+ * prepend the prefix here.
+ */
+function prefixEd25519Point(rawPoint: Uint8Array): Uint8Array {
+  if (rawPoint.length !== 32) return rawPoint;
+  const prefixed = new Uint8Array(34);
+  prefixed[0] = (CURVE_ED25519 >> 8) & 0xff;
+  prefixed[1] = CURVE_ED25519 & 0xff;
+  prefixed.set(rawPoint, 2);
+  return prefixed;
 }
