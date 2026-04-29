@@ -54,6 +54,13 @@ export class Observer {
   private networkSnapshots = new Map<number, Promise<DKGNetwork>>();
   /** Per-round registrations cache (status===Finalized only). */
   private registrationSnapshots = new Map<number, Promise<Map<string, DKGRegistration>>>();
+  /**
+   * Lifetime cache for `maxEncryptedDataSize`. The CDR contract treats this
+   * as a constant: it doesn't change during normal operation, so we fetch
+   * once per Observer instance with in-flight Promise dedup. Cleared on
+   * fetch failure so the next call retries.
+   */
+  private maxEncryptedDataSizePromise: Promise<bigint> | null = null;
 
   constructor(params: {
     network: Network;
@@ -131,13 +138,25 @@ export class Observer {
     });
   }
 
-  /** Get the maximum allowed encrypted data size for vault writes. */
+  /**
+   * Get the maximum allowed encrypted data size for vault writes (in bytes).
+   * Cached for the lifetime of this Observer — the CDR contract treats this
+   * as a constant.
+   */
   async getMaxEncryptedDataSize(): Promise<bigint> {
-    return this.publicClient.readContract({
-      address: contractAddresses[this.network].cdr,
-      abi: cdrAbi,
-      functionName: "maxEncryptedDataSize",
-    });
+    if (!this.maxEncryptedDataSizePromise) {
+      this.maxEncryptedDataSizePromise = this.publicClient
+        .readContract({
+          address: contractAddresses[this.network].cdr,
+          abi: cdrAbi,
+          functionName: "maxEncryptedDataSize",
+        })
+        .catch((e) => {
+          this.maxEncryptedDataSizePromise = null;
+          throw e;
+        });
+    }
+    return this.maxEncryptedDataSizePromise;
   }
 
   /** Get DKG operational threshold (basis-points constant from the DKG contract). */
@@ -230,12 +249,6 @@ export class Observer {
 
   // =========================================================================
   // Private cache layer
-  //
-  // TODO(Step 2 — Consumer rewrite): if Consumer ends up needing the same
-  // round-keyed network/registrations snapshot, extract this layer into
-  // `observer/cache.ts` (or a top-level `cache.ts`) so both modules share
-  // a single cache instance. Don't pre-extract — wait for the real reuse
-  // signal so the abstraction is shaped by an actual second caller.
   // =========================================================================
 
   /**

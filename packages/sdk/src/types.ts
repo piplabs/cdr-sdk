@@ -1,12 +1,10 @@
 /**
- * A collected partial decryption, either from an EVM
- * EncryptedPartialDecryptionSubmitted event (evm-events mode) or from the
- * x/dkg keeper via abci_query (cosmos-abci mode).
- *
- * `requesterPubKey` and `signature` are present only in evm-events mode.
- * The keeper does not persist them: signatures are verified on ingress and
- * dropped (see story/client/x/dkg/keeper/dkg_handler.go PartialDecryptionSubmitted),
- * and the requester key is the query parameter that scopes the lookup.
+ * A collected partial decryption, surfaced from the Story-API REST endpoint
+ * `/dkg/cdr_partials`. The keeper has already verified the validator's
+ * signature on ingress and dropped the signature bytes (see
+ * `story/client/x/dkg/keeper/dkg_handler.go::PartialDecryptionSubmitted`)
+ * so the SDK only carries the fields needed for ECIES decrypt + TDH2
+ * combine.
  */
 export interface PartialDecryptionEvent {
   /** Validator address (msg.sender of submitEncryptedPartialDecryption) */
@@ -23,10 +21,6 @@ export interface PartialDecryptionEvent {
   pubShare: `0x${string}`;
   /** Vault UUID */
   uuid: number;
-  /** Requester's public key. Populated from EVM events only. */
-  requesterPubKey?: `0x${string}`;
-  /** TEE signature over the partial decryption payload. Populated from EVM events only. */
-  signature?: `0x${string}`;
 }
 
 /** CDR Vault as stored on-chain */

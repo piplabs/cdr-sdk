@@ -33,6 +33,7 @@ import {
   queryCDRPartials,
   bytesToHex,
 } from "../src/story-api/index.js";
+import { logCase } from "./_helpers.js";
 
 const API_URL = process.env.CDR_API_URL;
 if (!API_URL) {
@@ -41,31 +42,10 @@ if (!API_URL) {
   );
 }
 
-/**
- * JSON.stringify replacer for live response logging:
- *   - `Uint8Array` → hex (truncated for fields longer than 80 hex chars,
- *     so e.g. a 4.7 KiB enclaveReport doesn't drown the console)
- *   - `bigint`     → string (so block heights serialize cleanly)
- */
-function pretty(value: unknown): string {
-  return JSON.stringify(
-    value,
-    (_key, v) => {
-      if (v instanceof Uint8Array) {
-        const hex = bytesToHex(v);
-        return hex.length > 80 ? `${hex.slice(0, 60)}…(${v.length}B)` : hex;
-      }
-      if (typeof v === "bigint") return v.toString();
-      return v;
-    },
-    2,
-  );
-}
-
 describe(`story-api integration tests (live: ${API_URL})`, () => {
   it("queryLatestActiveDKGNetwork returns current network state", async () => {
     const network = await queryLatestActiveDKGNetwork({ apiUrl: API_URL });
-    console.log("\n[queryLatestActiveDKGNetwork]\n" + pretty(network));
+    logCase("queryLatestActiveDKGNetwork", network);
 
     expect(network.round).toBeGreaterThanOrEqual(1);
     expect(network.threshold).toBeGreaterThan(0);
@@ -96,7 +76,7 @@ describe(`story-api integration tests (live: ${API_URL})`, () => {
   it("queryDKGNetwork(currentRound) returns the same network as latest_active", async () => {
     const cur = await queryLatestActiveDKGNetwork({ apiUrl: API_URL });
     const network = await queryDKGNetwork({ apiUrl: API_URL, round: cur.round });
-    console.log(`\n[queryDKGNetwork(round=${cur.round})]\n` + pretty(network));
+    logCase(`queryDKGNetwork(round=${cur.round})`, network);
 
     expect(network.round).toBe(cur.round);
     expect(network.total).toBe(cur.total);
@@ -109,7 +89,7 @@ describe(`story-api integration tests (live: ${API_URL})`, () => {
       queryGlobalPubKey({ apiUrl: API_URL }),
       queryLatestActiveDKGNetwork({ apiUrl: API_URL }),
     ]);
-    console.log("\n[queryGlobalPubKey]\n" + pretty(key));
+    logCase("queryGlobalPubKey", key);
 
     expect(key).toBeInstanceOf(Uint8Array);
     expect(key.length).toBe(32);
@@ -121,7 +101,7 @@ describe(`story-api integration tests (live: ${API_URL})`, () => {
   it("queryAllRegistrations(currentRound) returns the round's full registration set", async () => {
     const cur = await queryLatestActiveDKGNetwork({ apiUrl: API_URL });
     const regs = await queryAllRegistrations({ apiUrl: API_URL, round: cur.round });
-    console.log(`\n[queryAllRegistrations(round=${cur.round})] count=${regs.length}\n` + pretty(regs));
+    logCase(`queryAllRegistrations(round=${cur.round}) count=${regs.length}`, regs);
 
     expect(regs.length).toBe(cur.total);
     for (const r of regs) {
@@ -143,7 +123,7 @@ describe(`story-api integration tests (live: ${API_URL})`, () => {
   it("queryVerifiedRegistrations on an Active round returns empty (entries are Finalized)", async () => {
     const cur = await queryLatestActiveDKGNetwork({ apiUrl: API_URL });
     const verified = await queryVerifiedRegistrations({ apiUrl: API_URL, round: cur.round });
-    console.log(`\n[queryVerifiedRegistrations(round=${cur.round})]\n` + pretty(verified));
+    logCase(`queryVerifiedRegistrations(round=${cur.round})`, verified);
 
     expect(verified).toEqual([]);
   });
@@ -168,7 +148,7 @@ describe(`story-api integration tests (live: ${API_URL})`, () => {
     } catch (err) {
       expect((err as Error).message).toContain("code = NotFound");
     }
-    console.log(`\n[${label}]\n` + pretty(result));
+    logCase(label, result);
     expect(result).toEqual([]);
   }
 
@@ -202,7 +182,7 @@ describe(`story-api integration tests (live: ${API_URL})`, () => {
 
   it("queryAllRegistrations on a non-existent round returns empty", async () => {
     const result = await queryAllRegistrations({ apiUrl: API_URL, round: 999_999 });
-    console.log("\n[queryAllRegistrations(round=999999)]\n" + pretty(result));
+    logCase("queryAllRegistrations(round=999999)", result);
 
     expect(result).toEqual([]);
   });

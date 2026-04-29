@@ -14,10 +14,6 @@
  * Required env (from `.env.local`):
  *   CDR_API_URL  — Story-API REST base URL (e.g. http://172.207.250.203:1317)
  *   CDR_RPC_URL  — EVM JSON-RPC URL on the same chain (used by publicClient)
- *
- * Scope: read-only verification of the active DKG round. We do not exercise
- * `getVault` / fee getters here because they require a known vault UUID;
- * those will land in a sibling test that bootstraps state.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
@@ -26,9 +22,10 @@ import { Observer } from "../src/observer.js";
 import {
   queryLatestActiveDKGNetwork,
   queryDKGNetwork,
-  bytesToHex,
+  IncompleteDKGNetworkError,
 } from "../src/story-api/index.js";
 import type { Vault } from "../src/types.js";
+import { logCase, dkgFetchUrls, countFetchCallsTo } from "./_helpers.js";
 
 const API_URL = process.env.CDR_API_URL;
 const RPC_URL = process.env.CDR_RPC_URL;
@@ -55,45 +52,6 @@ function makeObserver(opts?: { minThresholdRatio?: number }): Observer {
   });
 }
 
-/**
- * JSON.stringify replacer for live response logging:
- *   - `Map`        → plain object (so commPubKey-by-validator dumps cleanly)
- *   - `Uint8Array` → hex (truncated for fields longer than 80 hex chars,
- *     so e.g. a 4.7 KiB enclaveReport doesn't drown the console)
- *   - `bigint`     → string (so block heights serialize cleanly)
- */
-function pretty(value: unknown): string {
-  return JSON.stringify(
-    value,
-    (_key, v) => {
-      if (v instanceof Map) return Object.fromEntries(v);
-      if (v instanceof Uint8Array) {
-        const hex = bytesToHex(v);
-        return hex.length > 80 ? `${hex.slice(0, 60)}…(${v.length}B)` : hex;
-      }
-      if (typeof v === "bigint") return v.toString();
-      return v;
-    },
-    2,
-  );
-}
-
-/** Count fetch calls whose URL contains the given path substring. */
-function countFetchCallsTo(spy: ReturnType<typeof vi.spyOn>, path: string): number {
-  return dkgFetchUrls(spy).filter((u) => u.includes(path)).length;
-}
-
-/** All recorded fetch URLs that hit a `/dkg/*` endpoint, in order. */
-function dkgFetchUrls(spy: ReturnType<typeof vi.spyOn>): string[] {
-  return spy.mock.calls
-    .map(([url]) => {
-      if (typeof url === "string") return url;
-      if (url instanceof URL) return url.href;
-      return (url as Request).url;
-    })
-    .filter((u): u is string => typeof u === "string" && u.includes("/dkg/"));
-}
-
 describe(`Observer integration tests (live: ${API_URL})`, () => {
   let fetchSpy: ReturnType<typeof vi.spyOn>;
 
@@ -117,8 +75,8 @@ describe(`Observer integration tests (live: ${API_URL})`, () => {
       observer.getActiveRound(),
       queryLatestActiveDKGNetwork({ apiUrl: API_URL! }),
     ]);
-    console.log(`\n[round]\n${round}`);
-    console.log(`\n[network]\n${pretty(network)}`);
+    logCase("round", round);
+    logCase("network", network);
     expect(round).toBe(network.round);
   });
 
@@ -128,8 +86,8 @@ describe(`Observer integration tests (live: ${API_URL})`, () => {
       observer.getGlobalPubKey(),
       queryLatestActiveDKGNetwork({ apiUrl: API_URL! }),
     ]);
-    console.log(`\n[key (prefixed, ${key.length}B)]\n${bytesToHex(key)}`);
-    console.log(`\n[network.globalPublicKey (${network.globalPublicKey.length}B)]\n${bytesToHex(network.globalPublicKey)}`);
+    logCase("key (prefixed)", key);
+    logCase("network.globalPublicKey", network.globalPublicKey);
     expect(key).toBeInstanceOf(Uint8Array);
     expect(key.length).toBe(34);
     expect(key[0]).toBe(0x04);
@@ -143,8 +101,8 @@ describe(`Observer integration tests (live: ${API_URL})`, () => {
       observer.getParticipantCount(),
       queryLatestActiveDKGNetwork({ apiUrl: API_URL! }),
     ]);
-    console.log(`\n[count]\n${count}`);
-    console.log(`\n[network.total]\n${network.total}`);
+    logCase("count", count);
+    logCase("network.total", network.total);
     expect(count).toBe(network.total);
   });
 
@@ -154,8 +112,8 @@ describe(`Observer integration tests (live: ${API_URL})`, () => {
       observer.getThreshold(),
       queryLatestActiveDKGNetwork({ apiUrl: API_URL! }),
     ]);
-    console.log(`\n[threshold]\n${threshold}`);
-    console.log(`\n[network.threshold]\n${network.threshold}`);
+    logCase("threshold", threshold);
+    logCase("network.threshold", network.threshold);
     expect(threshold).toBe(network.threshold);
   });
 
@@ -165,15 +123,14 @@ describe(`Observer integration tests (live: ${API_URL})`, () => {
     const expected = Math.max(network.threshold, Math.ceil(network.total * ratio));
     const observer = makeObserver({ minThresholdRatio: ratio });
     const actual = await observer.getThreshold();
-    console.log(
-      `\n[threshold compute]\n` +
-        `  total=${network.total}\n` +
-        `  network.threshold=${network.threshold}\n` +
-        `  ratio=${ratio}\n` +
-        `  ceil(total*ratio)=${Math.ceil(network.total * ratio)}\n` +
-        `  expected=${expected}\n` +
-        `  actual=${actual}`,
-    );
+    logCase("threshold compute", {
+      total: network.total,
+      networkThreshold: network.threshold,
+      ratio,
+      ceilTotalTimesRatio: Math.ceil(network.total * ratio),
+      expected,
+      actual,
+    });
     expect(actual).toBe(expected);
   });
 
@@ -187,9 +144,12 @@ describe(`Observer integration tests (live: ${API_URL})`, () => {
     const network = await queryLatestActiveDKGNetwork({ apiUrl: API_URL! });
     const validators = await observer.getRegisteredValidators();
 
-    console.log(`\n[validators] size=${validators.size}\n${pretty(validators)}`);
-    console.log(`\n[network.activeValSet] size=${network.activeValSet.length}\n${pretty(network.activeValSet)}`);
-    console.log(`\n[network.total]\n${network.total}`);
+    logCase(`validators (size=${validators.size})`, validators);
+    logCase(
+      `network.activeValSet (size=${network.activeValSet.length})`,
+      network.activeValSet,
+    );
+    logCase("network.total", network.total);
 
     // Active round → all participants are status=Finalized. Keeper invariant:
     // the SDK-side `status === 2` filter should leave exactly `total` rows.
@@ -212,15 +172,15 @@ describe(`Observer integration tests (live: ${API_URL})`, () => {
       observer.getValidatorAttestations(),
     ]);
 
-    console.log(`\n[validators.keys()]\n${pretty([...validators.keys()].sort())}`);
-    console.log(`\n[attestations.keys()]\n${pretty([...attestations.keys()].sort())}`);
-    console.log(
-      `\n[attestation sizes]\n` +
-        [...attestations.entries()]
-          .map(([addr, q]) => `  ${addr} → ${q.length}B`)
-          .join("\n"),
+    logCase("validators.keys()", [...validators.keys()].sort());
+    logCase("attestations.keys()", [...attestations.keys()].sort());
+    logCase(
+      "attestation sizes",
+      Object.fromEntries(
+        [...attestations.entries()].map(([addr, q]) => [addr, `${q.length}B`]),
+      ),
     );
-    console.log(`\n[attestations]\n${pretty(attestations)}`);
+    logCase("attestations", attestations);
 
     expect(attestations.size).toBe(validators.size);
     expect([...attestations.keys()].sort()).toEqual([...validators.keys()].sort());
@@ -252,9 +212,14 @@ describe(`Observer integration tests (live: ${API_URL})`, () => {
     const attestations = await observer.getValidatorAttestations();
 
     const urls = dkgFetchUrls(fetchSpy);
-    console.log(`\n[fetch calls after priming] count=${urls.length}\n` + urls.map((u) => "  " + u).join("\n"));
-    console.log(`\n[validators] size=${validators.size}\n${pretty(validators)}`);
-    console.log(`\n[attestations sizes]\n` + [...attestations.entries()].map(([a, q]) => `  ${a} → ${q.length}B`).join("\n"));
+    logCase("fetch calls after priming", urls);
+    logCase(`validators (size=${validators.size})`, validators);
+    logCase(
+      "attestation sizes",
+      Object.fromEntries(
+        [...attestations.entries()].map(([a, q]) => [a, `${q.length}B`]),
+      ),
+    );
 
     expect(countFetchCallsTo(fetchSpy, "/dkg/registrations")).toBe(1);
     expect(countFetchCallsTo(fetchSpy, "/dkg/dkg_network?round=")).toBe(0);
@@ -270,8 +235,8 @@ describe(`Observer integration tests (live: ${API_URL})`, () => {
     await observer.getRegisteredValidators({ round });
 
     const urls = dkgFetchUrls(fetchSpy);
-    console.log(`\n[round]\n${round}`);
-    console.log(`\n[fetch calls across 3 invocations] count=${urls.length}\n` + urls.map((u) => "  " + u).join("\n"));
+    logCase("round", round);
+    logCase("fetch calls across 3 invocations", urls);
 
     // Once for /dkg_network?round=N (stage check) and once for
     // /dkg/registrations?round=N. Subsequent calls hit cache.
@@ -288,7 +253,7 @@ describe(`Observer integration tests (live: ${API_URL})`, () => {
     await observer.getActiveRound();
 
     const urls = dkgFetchUrls(fetchSpy);
-    console.log(`\n[fetch calls across 3 getActiveRound invocations] count=${urls.length}\n` + urls.map((u) => "  " + u).join("\n"));
+    logCase("fetch calls across 3 getActiveRound invocations", urls);
 
     expect(countFetchCallsTo(fetchSpy, "/dkg/latest_active")).toBe(3);
   });
@@ -305,22 +270,41 @@ describe(`Observer integration tests (live: ${API_URL})`, () => {
     const current = await queryLatestActiveDKGNetwork({ apiUrl: API_URL! });
     const prev = current.round - 1;
     if (prev < 1) {
-      console.log(`\n[skip] only round ${current.round} exists, no previous round to test`);
+      logCase("skip", `only round ${current.round} exists, no previous round to test`);
       return;
     }
-    const prevNetwork = await queryDKGNetwork({ apiUrl: API_URL!, round: prev });
-    console.log(`\n[current.round]\n${current.round}`);
-    console.log(`\n[prev round]\n${prev}`);
-    console.log(`\n[prev network]\n${pretty(prevNetwork)}`);
+    let prevNetwork;
+    try {
+      prevNetwork = await queryDKGNetwork({ apiUrl: API_URL!, round: prev });
+    } catch (e) {
+      if (e instanceof IncompleteDKGNetworkError) {
+        logCase(
+          "skip",
+          `prev round ${prev} (stage=${e.stage}) is not decodable; ` +
+            `missing fields: ${e.missingFields.join(", ")}. ` +
+            `Clean rotation produces stage=Ended(6) at prev; this branch hits during a Failed/Dealing prev.`,
+        );
+        return;
+      }
+      throw e;
+    }
+    logCase("current.round", current.round);
+    logCase("prev round", prev);
+    logCase("prev network", prevNetwork);
 
     fetchSpy.mockClear();
     const validators = await observer.getRegisteredValidators({ round: prev });
     const attestations = await observer.getValidatorAttestations({ round: prev });
 
     const urls = dkgFetchUrls(fetchSpy);
-    console.log(`\n[fetch calls for prev round across both methods] count=${urls.length}\n` + urls.map((u) => "  " + u).join("\n"));
-    console.log(`\n[validators(prev)] size=${validators.size}\n${pretty(validators)}`);
-    console.log(`\n[attestations(prev) sizes]\n` + [...attestations.entries()].map(([a, q]) => `  ${a} → ${q.length}B`).join("\n"));
+    logCase("fetch calls for prev round across both methods", urls);
+    logCase(`validators(prev) (size=${validators.size})`, validators);
+    logCase(
+      "attestations(prev) sizes",
+      Object.fromEntries(
+        [...attestations.entries()].map(([a, q]) => [a, `${q.length}B`]),
+      ),
+    );
 
     // Both methods read the same per-round registrations cache → only ever
     // 1 /registrations fetch, regardless of stage. /dkg_network is also 1
@@ -344,7 +328,10 @@ describe(`Observer integration tests (live: ${API_URL})`, () => {
         expect(report.length).toBeGreaterThan(100);
       }
     } else {
-      console.log(`\n[note] prev round stage=${prevNetwork.stage} (not 4/6); cache will be evicted, content may be empty`);
+      logCase(
+        "note",
+        `prev round stage=${prevNetwork.stage} (not 4/6); cache will be evicted, content may be empty`,
+      );
     }
   });
 
@@ -355,10 +342,97 @@ describe(`Observer integration tests (live: ${API_URL})`, () => {
   // regression in the future PR shows up.
   // -------------------------------------------------------------------------
 
+  // -------------------------------------------------------------------------
+  // Concurrency: in-flight Promise dedup at the cache layer. Multiple
+  // concurrent reads for the same round must coalesce onto a single fetch.
+  // -------------------------------------------------------------------------
+
+  it("concurrent getRegisteredValidators({round}) calls share a single in-flight fetch (in-flight dedup)", async () => {
+    const observer = makeObserver();
+    const round = (await queryLatestActiveDKGNetwork({ apiUrl: API_URL! })).round;
+    fetchSpy.mockClear();
+
+    // 5 concurrent invocations. With in-flight dedup, the first call sets
+    // the rejected/resolved Promise into the cache before awaiting fetch,
+    // so calls 2-5 hit the cached Promise and never issue their own fetch.
+    const results = await Promise.all([
+      observer.getRegisteredValidators({ round }),
+      observer.getRegisteredValidators({ round }),
+      observer.getRegisteredValidators({ round }),
+      observer.getRegisteredValidators({ round }),
+      observer.getRegisteredValidators({ round }),
+    ]);
+
+    const dkgNetCalls = countFetchCallsTo(fetchSpy, `/dkg/dkg_network?round=${round}`);
+    const regsCalls = countFetchCallsTo(fetchSpy, `/dkg/registrations?round=${round}`);
+    logCase("fetch counts under 5x concurrency", {
+      [`/dkg_network?round=${round}`]: dkgNetCalls,
+      [`/registrations?round=${round}`]: regsCalls,
+    });
+
+    expect(dkgNetCalls).toBe(1);
+    expect(regsCalls).toBe(1);
+    // All callers must have observed the same Map (Promise sharing).
+    for (let i = 1; i < results.length; i++) {
+      expect(results[i].size).toBe(results[0].size);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Cross-method cache reuse: getActiveRound side-effect-caches the network
+  // snapshot under its round. A subsequent getRegisteredValidators({round})
+  // must hit that cache for /dkg_network (only /registrations is new).
+  // -------------------------------------------------------------------------
+
+  it("getActiveRound's side-effect network cache is reused by getRegisteredValidators({round})", async () => {
+    const observer = makeObserver();
+    const round = await observer.getActiveRound(); // warms networkSnapshots[round]
+    fetchSpy.mockClear();
+
+    await observer.getRegisteredValidators({ round });
+
+    const dkgNetCalls = countFetchCallsTo(fetchSpy, `/dkg/dkg_network?round=${round}`);
+    const regsCalls = countFetchCallsTo(fetchSpy, `/dkg/registrations?round=${round}`);
+    logCase("fetch counts after pre-warmed network snapshot", {
+      [`/dkg_network?round=${round}`]: dkgNetCalls, // expected 0 (cache hit)
+      [`/registrations?round=${round}`]: regsCalls, // expected 1 (first read)
+    });
+
+    expect(dkgNetCalls).toBe(0);
+    expect(regsCalls).toBe(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // Lifetime-cache invariants: maxEncryptedDataSize is treated as a contract
+  // constant and cached for the Observer's lifetime. Repeated calls must
+  // not issue additional EVM reads.
+  // -------------------------------------------------------------------------
+
+  it("getMaxEncryptedDataSize is cached for the Observer's lifetime (zero EVM reads after warm-up)", async () => {
+    const observer = makeObserver();
+    // Warm-up: first call may also trigger viem internals (eth_chainId, etc).
+    // Drain those before measuring.
+    const first = await observer.getMaxEncryptedDataSize();
+    fetchSpy.mockClear();
+
+    const repeats = await Promise.all(
+      Array.from({ length: 5 }, () => observer.getMaxEncryptedDataSize()),
+    );
+
+    logCase("result + fetch count", {
+      first,
+      repeats,
+      fetchCalls: fetchSpy.mock.calls.length,
+    });
+
+    expect(repeats.every((s) => s === first)).toBe(true);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it("getOperationalThreshold returns a positive bigint (DKG threshold constant)", async () => {
     const observer = makeObserver();
     const threshold = await observer.getOperationalThreshold();
-    console.log(`\n[operationalThreshold]\n${threshold}`);
+    logCase("operationalThreshold", threshold);
     expect(typeof threshold).toBe("bigint");
     expect(threshold).toBeGreaterThan(0n);
   });
@@ -370,7 +444,7 @@ describe(`Observer integration tests (live: ${API_URL})`, () => {
       observer.getWriteFee(),
       observer.getReadFee(),
     ]);
-    console.log(`\n[fees]\n  allocate=${allocate}\n  write=${write}\n  read=${read}`);
+    logCase("fees", { allocate, write, read });
     expect(typeof allocate).toBe("bigint");
     expect(typeof write).toBe("bigint");
     expect(typeof read).toBe("bigint");
@@ -382,32 +456,35 @@ describe(`Observer integration tests (live: ${API_URL})`, () => {
   it("getMaxEncryptedDataSize returns a positive bigint", async () => {
     const observer = makeObserver();
     const size = await observer.getMaxEncryptedDataSize();
-    console.log(`\n[maxEncryptedDataSize]\n${size}`);
+    logCase("maxEncryptedDataSize", size);
     expect(typeof size).toBe("bigint");
     expect(size).toBeGreaterThan(0n);
   });
 
-  it("getVault returns a Vault-shaped struct (uuid=0; expect zero-initialized for an unwritten slot)", async () => {
+  it("getVault returns a Vault-shaped struct (probes a far-out uuid unlikely to exist)", async () => {
     const observer = makeObserver();
+    // 999_999_999 is well beyond any realistic test allocation count.
+    const probeUuid = 999_999_999;
     let vault: Vault | undefined;
     let revertReason: string | undefined;
     try {
-      vault = await observer.getVault(0);
+      vault = await observer.getVault(probeUuid);
     } catch (err) {
       revertReason = (err as Error).message;
     }
-    console.log(`\n[vault uuid=0]\n${vault ? pretty(vault) : `revert: ${revertReason}`}`);
+    logCase(`vault uuid=${probeUuid}`, vault ?? `revert: ${revertReason}`);
 
     // Either path is acceptable — we only need to confirm the call goes
     // through Observer → publicClient → CDR contract. Specific behavior
-    // for an unwritten slot is contract-defined.
+    // for an unwritten slot is contract-defined; viem returns checksummed
+    // addresses (mixed case), so the regex is case-insensitive.
     expect(vault !== undefined || revertReason !== undefined).toBe(true);
     if (vault) {
-      expect(vault.uuid).toBe(0);
+      expect(vault.uuid).toBe(probeUuid);
       expect(typeof vault.updatable).toBe("boolean");
-      expect(vault.writeConditionAddr).toMatch(/^0x[0-9a-f]{40}$/);
-      expect(vault.readConditionAddr).toMatch(/^0x[0-9a-f]{40}$/);
-      expect(vault.encryptedData).toMatch(/^0x[0-9a-f]*$/);
+      expect(vault.writeConditionAddr).toMatch(/^0x[0-9a-fA-F]{40}$/);
+      expect(vault.readConditionAddr).toMatch(/^0x[0-9a-fA-F]{40}$/);
+      expect(vault.encryptedData).toMatch(/^0x[0-9a-fA-F]*$/);
     }
   });
 });
