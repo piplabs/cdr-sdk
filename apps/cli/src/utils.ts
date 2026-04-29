@@ -10,36 +10,111 @@ const DEFAULT_RPC_URLS: Record<Network, string> = {
 export interface GlobalOptions {
   network: Network;
   rpcUrl?: string;
+  /** Story-API REST URL. Falls back to `CDR_API_URL` env. No baked-in default — must be supplied explicitly. */
+  apiUrl?: string;
   privateKey?: string;
   json: boolean;
 }
 
-export function createClient(opts: GlobalOptions): CDRClient {
-  const rpcUrl = opts.rpcUrl ?? DEFAULT_RPC_URLS[opts.network];
+export interface ResolvedConfig {
+  network: Network;
+  rpcUrl: string;
+  apiUrl: string;
+  /** Resolved private key, present iff supplied via flag or env. */
+  privateKey?: `0x${string}`;
+  json: boolean;
+}
 
-  const publicClient = createPublicClient({ transport: http(rpcUrl) }) as PublicClient;
-
-  let walletClient;
-  const pk = opts.privateKey ?? process.env.CDR_PRIVATE_KEY;
-  if (pk) {
-    const account = privateKeyToAccount(pk as `0x${string}`);
-    walletClient = createWalletClient({ account, transport: http(rpcUrl) }) as WalletClient;
+/**
+ * Validate global options + resolve from env. Precedence: CLI flag > env var.
+ *
+ * `requireWallet=true` for commands that send transactions (`upload`,
+ * `access`); `false` for read-only Observer queries (`status *`). Missing
+ * required values exit the process with code 1; in `--json` mode the error
+ * is emitted as `{"error": {"message", "missing"}}` so scripts can parse it.
+ */
+export function resolveConfig(opts: GlobalOptions, requireWallet: boolean): ResolvedConfig {
+  const apiUrl = opts.apiUrl ?? process.env.CDR_API_URL;
+  if (!apiUrl) {
+    errExit(
+      opts.json,
+      "Story-API REST URL is required. Pass --api-url <url> or set CDR_API_URL env.",
+      "CDR_API_URL",
+    );
   }
 
-  return new CDRClient({ network: opts.network, publicClient, walletClient });
+  // RPC has a network-default fallback so read-only commands work out of the
+  // box on mainnet/testnet. To override (e.g., for DevNet), pass --rpc-url
+  // or set CDR_RPC_URL env.
+  const rpcUrl = opts.rpcUrl ?? process.env.CDR_RPC_URL ?? DEFAULT_RPC_URLS[opts.network];
+
+  const privateKey = (opts.privateKey ?? process.env.CDR_TEST_PRIVATE_KEY) as `0x${string}` | undefined;
+  if (requireWallet && !privateKey) {
+    errExit(
+      opts.json,
+      "Wallet private key is required for this command. Pass --private-key <hex> or set CDR_TEST_PRIVATE_KEY env.",
+      "CDR_TEST_PRIVATE_KEY",
+    );
+  }
+
+  return {
+    network: opts.network,
+    rpcUrl,
+    apiUrl,
+    privateKey,
+    json: opts.json,
+  };
+}
+
+export function createClient(cfg: ResolvedConfig): CDRClient {
+  const publicClient = createPublicClient({ transport: http(cfg.rpcUrl) }) as PublicClient;
+  let walletClient: WalletClient | undefined;
+  if (cfg.privateKey) {
+    const account = privateKeyToAccount(cfg.privateKey);
+    walletClient = createWalletClient({ account, transport: http(cfg.rpcUrl) }) as WalletClient;
+  }
+  return new CDRClient({
+    network: cfg.network,
+    publicClient,
+    walletClient,
+    apiUrl: cfg.apiUrl,
+  });
+}
+
+/**
+ * Print an error and exit. In `--json` mode, output structured JSON with
+ * `error.message` (and optionally `error.missing` for missing-config errors)
+ * to stderr; otherwise print a plain message. Always exits 1.
+ */
+export function errExit(json: boolean, message: string, missing?: string): never {
+  if (json) {
+    const payload = missing ? { error: { message, missing } } : { error: { message } };
+    console.error(JSON.stringify(payload));
+  } else {
+    console.error(`Error: ${message}`);
+  }
+  process.exit(1);
 }
 
 export function output(data: unknown, json: boolean): void {
   if (json) {
     console.log(JSON.stringify(data, replacer, 2));
-  } else if (typeof data === "string") {
-    console.log(data);
   } else {
-    console.log(data);
+    console.log(JSON.stringify(data, replacer, 2));
   }
 }
 
+/**
+ * JSON.stringify replacer that handles SDK return values:
+ * - `bigint` → decimal string (so JSON parsers don't choke)
+ * - `Uint8Array` → `0x`-prefixed hex string
+ * - `Map` → plain object (so getRegisteredValidators output round-trips through JSON)
+ */
 function replacer(_key: string, value: unknown): unknown {
   if (typeof value === "bigint") return value.toString();
+  if (value instanceof Uint8Array) {
+    return "0x" + Array.from(value).map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  if (value instanceof Map) return Object.fromEntries(value);
   return value;
 }

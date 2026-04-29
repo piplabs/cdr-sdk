@@ -19,6 +19,7 @@
     "dev": "tsx src/index.ts",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
+    "test:integration": "pnpm clean && pnpm build && vitest run __integration__",
     "prepublishOnly": "pnpm run build"
   },
   "dependencies": {
@@ -28,7 +29,9 @@
   },
   "devDependencies": {
     "@types/node": "^20",
+    "execa": "^8",
     "tsx": "^4",
-    "typescript": "^5.5"
+    "typescript": "^5.5",
+    "vitest": "^2"
   }
 }
