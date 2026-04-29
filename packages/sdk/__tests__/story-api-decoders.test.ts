@@ -9,6 +9,7 @@ import {
   type RawSubmission,
   type RawSubmissionsByRound,
 } from "../src/story-api/decoders.js";
+import { IncompleteDKGNetworkError } from "../src/story-api/errors.js";
 import { bytesToHex } from "../src/story-api/bytes.js";
 
 describe("story-api/decoders", () => {
@@ -85,6 +86,47 @@ describe("story-api/decoders", () => {
     it("decodes startBlockHash to 32-byte Uint8Array", () => {
       const decoded = decodeDKGNetwork(raw);
       expect(decoded.startBlockHash.length).toBe(32);
+    });
+
+    it("throws IncompleteDKGNetworkError when global_public_key is missing (Failed-stage payload)", () => {
+      const failed: RawDKGNetwork = {
+        ...raw,
+        stage: 5, // Failed
+        global_public_key: undefined,
+        public_coeffs: undefined,
+      };
+      expect(() => decodeDKGNetwork(failed)).toThrow(IncompleteDKGNetworkError);
+    });
+
+    it("error carries round, stage, and the full list of missing fields", () => {
+      const dealing: RawDKGNetwork = {
+        ...raw,
+        round: 17,
+        stage: 2, // Dealing
+        global_public_key: undefined,
+        public_coeffs: undefined,
+        active_val_set: undefined,
+      };
+      try {
+        decodeDKGNetwork(dealing);
+        throw new Error("expected throw");
+      } catch (e) {
+        expect(e).toBeInstanceOf(IncompleteDKGNetworkError);
+        const err = e as IncompleteDKGNetworkError;
+        expect(err.round).toBe(17);
+        expect(err.stage).toBe(2);
+        expect([...err.missingFields].sort()).toEqual(
+          ["active_val_set", "global_public_key", "public_coeffs"].sort(),
+        );
+      }
+    });
+
+    it("does not throw when stage is non-stable but all fields are populated", () => {
+      // Defensive: keeper behavior is empirical, not contractual. If a future
+      // keeper version surfaces full fields for a Failed round, accept it.
+      const decoded = decodeDKGNetwork({ ...raw, stage: 5 });
+      expect(decoded.stage).toBe(5);
+      expect(decoded.globalPublicKey).toBeInstanceOf(Uint8Array);
     });
   });
 

@@ -5,6 +5,7 @@
  */
 
 import { base64ToBytes } from "./bytes.js";
+import { IncompleteDKGNetworkError } from "./errors.js";
 import type {
   DKGNetwork,
   DKGRegistration,
@@ -16,17 +17,27 @@ import type {
 // Raw JSON shapes (one per response payload)
 // ---------------------------------------------------------------------------
 
+/**
+ * Raw `/dkg/{latest_active,dkg_network}` response shape. Several fields are
+ * stage-conditional: the keeper populates `start_block_height`,
+ * `start_block_hash`, `active_val_set`, `global_public_key`, and
+ * `public_coeffs` only once the round has progressed far enough to define
+ * them. For rounds in Registration / Dealing / Finalization / Failed stages,
+ * one or more of these will be absent. `decodeDKGNetwork` enforces presence
+ * and throws {@link IncompleteDKGNetworkError} if any required field is
+ * missing.
+ */
 export interface RawDKGNetwork {
   round: number;
-  start_block_height: string;
-  start_block_hash: string;
-  active_val_set: string[];
+  start_block_height?: string;
+  start_block_hash?: string;
+  active_val_set?: string[];
   total: number;
   threshold: number;
   stage: number;
   is_resharing: boolean;
-  global_public_key: string;
-  public_coeffs: string[];
+  global_public_key?: string;
+  public_coeffs?: string[];
 }
 
 export interface RawDKGRegistration {
@@ -66,17 +77,26 @@ export interface RawSubmissionsByRound {
 // ---------------------------------------------------------------------------
 
 export function decodeDKGNetwork(raw: RawDKGNetwork): DKGNetwork {
+  const missing: string[] = [];
+  if (raw.start_block_height === undefined) missing.push("start_block_height");
+  if (raw.start_block_hash === undefined) missing.push("start_block_hash");
+  if (raw.active_val_set === undefined) missing.push("active_val_set");
+  if (raw.global_public_key === undefined) missing.push("global_public_key");
+  if (raw.public_coeffs === undefined) missing.push("public_coeffs");
+  if (missing.length > 0) {
+    throw new IncompleteDKGNetworkError(raw.round, raw.stage, missing);
+  }
   return {
     round: raw.round,
-    startBlockHeight: BigInt(raw.start_block_height),
-    startBlockHash: base64ToBytes(raw.start_block_hash),
-    activeValSet: raw.active_val_set.map((a) => a.toLowerCase() as `0x${string}`),
+    startBlockHeight: BigInt(raw.start_block_height!),
+    startBlockHash: base64ToBytes(raw.start_block_hash!),
+    activeValSet: raw.active_val_set!.map((a) => a.toLowerCase() as `0x${string}`),
     total: raw.total,
     threshold: raw.threshold,
     stage: raw.stage,
     isResharing: raw.is_resharing,
-    globalPublicKey: base64ToBytes(raw.global_public_key),
-    publicCoeffs: raw.public_coeffs.map(base64ToBytes),
+    globalPublicKey: base64ToBytes(raw.global_public_key!),
+    publicCoeffs: raw.public_coeffs!.map(base64ToBytes),
   };
 }
 
