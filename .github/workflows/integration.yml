@@ -23,9 +23,20 @@ on:
   pull_request:
     branches: [main]
     paths:
+      # SDK and its workspace deps — anything that affects what `pnpm build`
+      # produces or how the SDK's runtime behaves.
       - 'packages/sdk/**'
+      - 'packages/crypto/**'
+      - 'packages/contracts/**'
       - 'apps/cli/**'
       - 'apps/examples/**'
+      # Workspace-level inputs. A change to root config or the lockfile can
+      # break `pnpm install` / `pnpm build` even if no source code under
+      # packages/* or apps/* moved.
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'tsconfig.base.json'
       - '.github/workflows/integration.yml'
 
 # PR runs cancel prior runs of the same PR; manual runs don't get cancelled
