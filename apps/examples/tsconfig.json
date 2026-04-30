@@ -1,7 +1,10 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "noEmit": true
+    "rootDir": ".",
+    "outDir": "dist",
+    "types": ["node"]
   },
-  "include": ["."]
+  "include": ["*.ts"],
+  "exclude": ["__integration__", "vitest.config.ts", "dist", "node_modules"]
 }

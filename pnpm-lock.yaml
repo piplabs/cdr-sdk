@@ -57,6 +57,9 @@ importers:
 
   apps/examples:
     dependencies:
+      '@noble/curves':
+        specifier: ^1.4
+        version: 1.6.0
       '@piplabs/cdr-sdk':
         specifier: workspace:*
         version: link:../../packages/sdk
@@ -64,9 +67,21 @@ importers:
         specifier: ^2.47.6
         version: 2.47.6(typescript@5.9.3)(zod@4.3.6)
     devDependencies:
+      '@types/node':
+        specifier: ^20
+        version: 20.19.37
+      execa:
+        specifier: ^8
+        version: 8.0.1
       tsx:
         specifier: ^4
         version: 4.21.0
+      typescript:
+        specifier: ^5.5
+        version: 5.9.3
+      vitest:
+        specifier: ^2
+        version: 2.1.9(@types/node@20.19.37)(terser@5.46.1)
 
   packages/contracts:
     devDependencies:
@@ -5673,7 +5688,7 @@ snapshots:
   '@ucanto/principal@9.0.3':
     dependencies:
       '@ipld/dag-ucan': 3.4.5
-      '@noble/curves': 1.9.1
+      '@noble/curves': 1.6.0
       '@noble/ed25519': 1.7.5
       '@noble/hashes': 1.8.0
       '@ucanto/interface': 11.0.1
