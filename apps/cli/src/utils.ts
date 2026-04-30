@@ -99,8 +99,22 @@ export function errExit(json: boolean, message: string, missing?: string): never
 export function output(data: unknown, json: boolean): void {
   if (json) {
     console.log(JSON.stringify(data, replacer, 2));
-  } else {
-    console.log(JSON.stringify(data, replacer, 2));
+    return;
+  }
+  // Human-readable: top-level object → "key: value" per line; nested
+  // values are inlined as compact JSON. The replacer normalises bigint /
+  // Uint8Array / Map first so values render naturally.
+  const normalised = JSON.parse(JSON.stringify(data, replacer)) as unknown;
+  if (normalised === null || typeof normalised !== "object" || Array.isArray(normalised)) {
+    console.log(typeof normalised === "string" ? normalised : JSON.stringify(normalised));
+    return;
+  }
+  for (const [k, v] of Object.entries(normalised as Record<string, unknown>)) {
+    const rendered =
+      v === null || typeof v !== "object"
+        ? String(v)
+        : JSON.stringify(v);
+    console.log(`${k}: ${rendered}`);
   }
 }
 

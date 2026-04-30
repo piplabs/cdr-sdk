@@ -165,7 +165,7 @@ describe("upload-cdr.ts", () => {
     logCase("stdout (first 800 chars)", stdout.slice(0, 800));
     expect(exitCode, `stderr=${stderr}`).toBe(0);
     expect(stdout).toMatch(/Vault UUID: \d+/);
-    expect(stdout).toMatch(/Allocate tx: |Vault allocated:.*tx=0x[0-9a-f]{64}/);
+    expect(stdout).toMatch(/(?:Allocate tx: 0x[0-9a-f]{64}|Vault allocated:.*tx=0x[0-9a-f]{64})/);
     expect(stdout).toMatch(/Data written:.*tx=0x[0-9a-f]{64}/);
     expect(stdout).toMatch(/Data key \(save this for later access\): 0x[0-9a-f]{64}/);
   }, 90_000);

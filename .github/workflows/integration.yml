@@ -1,5 +1,9 @@
 name: Integration
 
+# Default to read-only token; jobs that need more should override.
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
     inputs:
@@ -74,6 +78,11 @@ jobs:
           cache: pnpm
       - run: pnpm install
 
+      # Workspace deps (`@piplabs/cdr-crypto`, `@piplabs/cdr-contracts`)
+      # resolve via `main: dist/index.js`; without a build, vite fails to
+      # resolve them on a fresh CI checkout.
+      - run: pnpm build
+
       - name: Configure network env
         run: |
           case "$NETWORK" in
@@ -126,6 +135,7 @@ jobs:
           node-version: '20'
           cache: pnpm
       - run: pnpm install
+      - run: pnpm build
 
       - name: Configure DevNet env
         run: |
