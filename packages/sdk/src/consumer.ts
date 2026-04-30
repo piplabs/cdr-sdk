@@ -12,6 +12,7 @@ import {
   PartialCollectionTimeoutError,
   InvalidParamsError,
   CidIntegrityError,
+  EmptyVaultError,
 } from "./errors.js";
 import type { PartialDecryptionEvent } from "./types.js";
 import { uuidToLabel } from "./label.js";
@@ -150,30 +151,44 @@ export class Consumer {
 
   /**
    * Poll Story-API `/dkg/cdr_partials` until the keeper has surfaced at
-   * least the SDK's threshold worth of submissions for the given
-   * `(uuid, requesterPubKey)`.
+   * least the threshold worth of submissions for the given
+   * `(uuid, requesterPubKey)` whose `(round, ciphertext)` matches the
+   * vault's current state.
    *
-   * **Threshold**: derived from `observer.getThreshold()`, which equals
-   * `max(network.threshold, ceil(participants × minThresholdRatio))` if
-   * `minThresholdRatio` was set on the Observer/CDRClient, else the raw
-   * chain threshold. There is no per-call override — to change the
-   * threshold, construct a new CDRClient.
+   * **Bucket selection**: the keeper indexes submissions by
+   * `(round, ciphertext)`. Multiple groups can be returned across round
+   * transitions or after a vault update on an updatable vault. The vault's
+   * current `encryptedData` is loaded once at the start of this call and
+   * pinned for the rest of the poll loop; only groups whose `ciphertext`
+   * matches that value are accepted. If multiple groups match (same
+   * ciphertext, different rounds — rare), the highest round is preferred.
    *
-   * **Exit condition** (both must hold):
-   *   1. `submissions.length >= sdkThreshold`
+   * **Threshold**: derived from `observer.getThresholdAt(group.round)`,
+   * not the active round. So a DKG rollover during the poll doesn't make
+   * us measure the bucket against a different round's threshold.
+   *
+   * **Exit condition** (both must hold for the matching bucket):
+   *   1. `submissions.length >= round-aware threshold`
    *   2. keeper-reported `thresholdMet === true`
    *
-   * Returns `slice(0, sdkThreshold)` so the caller gets exactly the count
-   * they need for `tdh2Combine` — extras are dropped on the floor (the
-   * keeper guarantees order, so the first N are stable).
+   * Returns the first N submissions from the matching bucket (where N is
+   * the round's threshold) — extras are dropped on the floor (the keeper
+   * guarantees order, so the first N are stable).
+   *
+   * **Vault-state guarantees**: the vault is read **once** at the start of
+   * this call. If the vault is updated mid-poll, this call still resolves
+   * against the original ciphertext (atomic semantics). If the user wants
+   * to decrypt the new state, they must issue a fresh `accessCDR` after
+   * the update.
    *
    * **`attestationConfig`** (optional defense-in-depth): when provided,
    * the round's validator attestation reports are verified once via
    * {@link verifyAttestation} and a trust set is built; un-trusted
    * validators' partials are reported via `onInvalidPartial` and excluded.
-   * The attestations cache is shared with
-   * {@link Observer.getValidatorAttestations}, so this is a free cache hit
-   * if anything else in the round has already touched registrations.
+   *
+   * @throws {@link EmptyVaultError} if the vault has never been written to
+   *   (`encryptedData` is empty bytes). Fail-fast — better UX than waiting
+   *   for the poll to time out against a non-existent bucket.
    *
    * @example
    * ```ts
@@ -182,6 +197,8 @@ export class Consumer {
    *   requesterPubKey: "0x04...",
    *   timeoutMs: 60_000,
    * });
+   * // partials[i].ciphertext is the same for every i — caller can use it
+   * // for the subsequent decryptDataKey step without re-reading the chain.
    * ```
    */
   async collectPartials(params: {
@@ -205,7 +222,21 @@ export class Consumer {
       throw new InvalidParamsError("collectPartials: requesterPubKey is required");
     }
 
-    const sdkThreshold = await this.observer.getThreshold();
+    // Pin the vault's current ciphertext at the start of the call. The
+    // keeper indexes buckets by (round, ciphertext); we filter on this
+    // value for the rest of the poll loop so a concurrent vault update
+    // can't silently change which bucket we accept.
+    const vault = (await this.publicClient.readContract({
+      address: contractAddresses[this.network].cdr,
+      abi: cdrAbi,
+      functionName: "vaults",
+      args: [uuid],
+    })) as { encryptedData: `0x${string}` };
+    const vaultCiphertext = toBytes(vault.encryptedData);
+    if (vaultCiphertext.length === 0) {
+      throw new EmptyVaultError(uuid);
+    }
+
     const requesterPubKeyHex = requesterPubKey.replace(/^0x/i, "");
     const deadline = Date.now() + timeoutMs;
 
@@ -213,8 +244,10 @@ export class Consumer {
     const trustSetByRound = new Map<number, Set<string>>();
     /** `(validator, pid)` keys we've already reported via onInvalidPartial. */
     const reported = new Set<string>();
-    /** Last-known submission count, surfaced in the timeout error. */
+    /** Last-known submission count (within the matching bucket), for the timeout error. */
     let lastSeen = 0;
+    /** Last-known round threshold, for the timeout error. */
+    let lastNeeded = 0;
 
     while (Date.now() < deadline) {
       let groups: Awaited<ReturnType<typeof queryCDRPartials>> = [];
@@ -228,14 +261,24 @@ export class Consumer {
         // Transient REST error — retry on next poll tick.
       }
 
-      // A single (uuid, requesterPubKey) decryption never spans rounds: the
-      // user's `read()` tx pinned the round, and validators of that round
-      // continue submitting even after the round transitions. So at most
-      // one group has submissions in it.
-      const group = groups.find((g) => g.submissions.length > 0);
+      // Filter to groups whose ciphertext matches the pinned vault state.
+      // If multiple match (same ciphertext, different rounds — possible when
+      // a vault stays unchanged across a DKG rollover), prefer the newest
+      // round; older-round validators may have rotated out by the time we
+      // try to combine.
+      const matching = groups
+        .filter((g) => g.submissions.length > 0 && bytesEqual(g.ciphertext, vaultCiphertext))
+        .sort((a, b) => b.round - a.round);
+      const group = matching[0];
 
       if (group) {
         lastSeen = group.submissions.length;
+
+        // Bucket-aware threshold: evaluate against the bucket's own round,
+        // not the active round (which may have advanced past the bucket
+        // mid-poll).
+        const sdkThreshold = await this.observer.getThresholdAt(group.round);
+        lastNeeded = sdkThreshold;
 
         if (group.submissions.length >= sdkThreshold && group.thresholdMet) {
           const trustSet = attestationConfig
@@ -271,7 +314,7 @@ export class Consumer {
       await sleep(pollIntervalMs);
     }
 
-    throw new PartialCollectionTimeoutError(lastSeen, sdkThreshold, timeoutMs);
+    throw new PartialCollectionTimeoutError(lastSeen, lastNeeded, timeoutMs);
   }
 
   /**
@@ -401,15 +444,6 @@ export class Consumer {
       params.globalPubKey ?? (await this.observer.getGlobalPubKey());
 
     try {
-      const vault = await this.publicClient.readContract({
-        address: contractAddresses[this.network].cdr,
-        abi: cdrAbi,
-        functionName: "vaults",
-        args: [params.uuid],
-      });
-      const vaultResult = vault as { encryptedData: `0x${string}` };
-      const encryptedData = toBytes(vaultResult.encryptedData);
-
       const label = uuidToLabel(params.uuid);
 
       const { txHash } = await this.read({
@@ -426,6 +460,13 @@ export class Consumer {
         onInvalidPartial: params.onInvalidPartial,
         attestationConfig: params.attestationConfig,
       });
+
+      // collectPartials filtered to the vault's current ciphertext and
+      // pinned it across the poll; every event in `partials` carries the
+      // same `ciphertext` byte-string, so reading [0] avoids a redundant
+      // chain RPC and guarantees decrypt uses the same value the filter
+      // matched on.
+      const encryptedData = toBytes(partials[0].ciphertext);
 
       const dataKey = await this.decryptDataKey({
         ciphertext: { raw: encryptedData, label },
@@ -533,7 +574,14 @@ function submissionToEvent(
     ephemeralPubKey: toHex(sub.ephemeralPubKey),
     pubShare: toHex(sub.pubShare),
     uuid,
+    ciphertext: toHex(sub.ciphertext),
   };
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
 
 function sleep(ms: number): Promise<void> {

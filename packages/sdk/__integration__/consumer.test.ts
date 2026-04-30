@@ -41,7 +41,8 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { generateEphemeralKeyPair } from "@piplabs/cdr-crypto";
 import { CDRClient, initWasm } from "../src/index.js";
-import { PartialCollectionTimeoutError } from "../src/errors.js";
+import { PartialCollectionTimeoutError, EmptyVaultError } from "../src/errors.js";
+import { uuidToLabel } from "../src/label.js";
 import { queryCDRPartials, queryLatestActiveDKGNetwork } from "../src/story-api/index.js";
 import { logCase, countFetchCallsTo } from "./_helpers.js";
 
@@ -214,15 +215,29 @@ describe(`Consumer integration tests (live: ${API_URL})`, () => {
 
   it("collectPartials throws PartialCollectionTimeoutError when no read tx is in flight", async () => {
     const { client } = makeCDRClient();
-    // Real-shaped uncompressed secp256k1 pubkey so the keeper's validate()
-    // accepts the request — we only want to exercise the empty-poll path,
-    // not the malformed-key rejection.
+    const globalPubKey = await client.observer.getGlobalPubKey();
+
+    // Bootstrap a real vault so the EmptyVaultError fail-fast doesn't fire.
+    // Use a fresh requesterPubKey (no read tx is sent) so the keeper never
+    // produces partials for `(uuid, requesterPubKey)` — the matching bucket
+    // stays empty and the poll loop drains to its timeout.
+    const dataKey = crypto.getRandomValues(new Uint8Array(32));
+    const upload = await client.uploader.uploadCDR({
+      dataKey,
+      globalPubKey,
+      updatable: false,
+      writeConditionAddr: openCondition,
+      readConditionAddr: openCondition,
+      writeConditionData: "0x",
+      readConditionData: "0x",
+      accessAuxData: "0x",
+    });
     const requesterPubKey = toHex(generateEphemeralKeyPair().publicKey);
     const start = Date.now();
 
     await expect(
       client.consumer.collectPartials({
-        uuid: 999_999_999, // does not exist; no submissions will ever arrive
+        uuid: upload.uuid,
         requesterPubKey,
         timeoutMs: 5_000,
         pollIntervalMs: 1_000,
@@ -234,6 +249,29 @@ describe(`Consumer integration tests (live: ${API_URL})`, () => {
     // Confirm the loop actually waited the timeout (not a malformed-input
     // fast-fail). Lower bound 4s = timeout - 1 poll tick of slack.
     expect(elapsed).toBeGreaterThanOrEqual(4_000);
+  }, 60_000);
+
+  it("collectPartials throws EmptyVaultError fast when the uuid has no vault data", async () => {
+    const { client } = makeCDRClient();
+    const requesterPubKey = toHex(generateEphemeralKeyPair().publicKey);
+    const start = Date.now();
+
+    await expect(
+      client.consumer.collectPartials({
+        // Bogus uuid — vault.encryptedData reads as "0x" (empty bytes), so
+        // the new EmptyVaultError fail-fast fires before any REST poll.
+        uuid: 999_999_999,
+        requesterPubKey,
+        timeoutMs: 60_000,
+        pollIntervalMs: 1_000,
+      }),
+    ).rejects.toThrow(EmptyVaultError);
+
+    const elapsed = Date.now() - start;
+    logCase("elapsed (ms)", elapsed);
+    // Should fail almost immediately (single chain read), well under
+    // the timeoutMs budget.
+    expect(elapsed).toBeLessThan(5_000);
   }, 30_000);
 
   // -------------------------------------------------------------------------
@@ -620,6 +658,100 @@ describe(`Consumer integration tests (live: ${API_URL})`, () => {
   }, 180_000);
 
   // -------------------------------------------------------------------------
+  // Updatable vault: write → read (dataKey1) → write (dataKey2) → read again,
+  // reusing the same requesterPubKey across both reads. Regression coverage
+  // for #75: prior to the ciphertext-bucket filter, the second read could
+  // pick up the first read's stale (round, ciphertext1) bucket and try to
+  // combine those partials against the post-update vault ciphertext — yielding
+  // either an `aes/gcm: invalid ghash tag` decrypt failure or, worse, a
+  // recovered "dataKey1" that no longer matches what's on chain.
+  //
+  // This is also the only integration case that exercises `updatable: true` +
+  // a follow-up `Uploader.write` for an in-place vault update.
+  // -------------------------------------------------------------------------
+
+  it(
+    "accessCDR after vault update returns the new dataKey (regression #75)",
+    async () => {
+      const { client } = makeCDRClient();
+      const globalPubKey = await client.observer.getGlobalPubKey();
+
+      // ----- Initial upload (updatable=true) -----
+      const dataKey1 = crypto.getRandomValues(new Uint8Array(32));
+      const upload = await client.uploader.uploadCDR({
+        dataKey: dataKey1,
+        globalPubKey,
+        updatable: true,
+        writeConditionAddr: openCondition,
+        readConditionAddr: openCondition,
+        writeConditionData: "0x",
+        readConditionData: "0x",
+        accessAuxData: "0x",
+      });
+      const uuid = upload.uuid;
+      const label = uuidToLabel(uuid);
+      logCase("uuid", uuid);
+      logCase("dataKey1", dataKey1);
+
+      // ----- Reuse the same requester keypair across both reads. The bug
+      // only triggers when the keeper indexes both buckets under the same
+      // (uuid, requesterPubKey) — generating a fresh keypair would route
+      // the second read into its own bucket and mask the issue. -----
+      const kp = generateEphemeralKeyPair();
+      const requesterPubKey = toHex(kp.publicKey);
+
+      // ----- Read 1: should recover dataKey1 -----
+      const access1 = await client.consumer.accessCDR({
+        uuid,
+        accessAuxData: "0x",
+        requesterPubKey,
+        recipientPrivKey: kp.privateKey,
+        timeoutMs: 120_000,
+        pollIntervalMs: 2_000,
+      });
+      logCase("access1.dataKey", access1.dataKey);
+      expect(Array.from(access1.dataKey)).toEqual(Array.from(dataKey1));
+
+      // ----- Update vault: encrypt fresh dataKey2 to the same label,
+      // write it under the existing uuid. -----
+      const dataKey2 = crypto.getRandomValues(new Uint8Array(32));
+      const ciphertext2 = await client.uploader.encryptDataKey({
+        dataKey: dataKey2,
+        globalPubKey,
+        label,
+      });
+      const updateTx = await client.uploader.write({
+        uuid,
+        accessAuxData: "0x",
+        encryptedData: toHex(ciphertext2.raw),
+      });
+      logCase("updateTx", updateTx.txHash);
+      logCase("dataKey2", dataKey2);
+      expect(Array.from(dataKey1)).not.toEqual(Array.from(dataKey2));
+
+      // ----- Read 2 with the SAME requesterPubKey. The keeper now holds
+      // two buckets for (uuid, requesterPubKey): the original
+      // (round, ciphertext1) and the new (round, ciphertext2). The SDK
+      // must filter by ciphertext and decrypt against the post-update
+      // value. -----
+      const access2 = await client.consumer.accessCDR({
+        uuid,
+        accessAuxData: "0x",
+        requesterPubKey,
+        recipientPrivKey: kp.privateKey,
+        timeoutMs: 120_000,
+        pollIntervalMs: 2_000,
+      });
+      logCase("access2.dataKey", access2.dataKey);
+
+      // Strict regression assertions:
+      expect(Array.from(access2.dataKey)).toEqual(Array.from(dataKey2));
+      expect(Array.from(access2.dataKey)).not.toEqual(Array.from(dataKey1));
+    },
+    300_000,
+  );
+
+  // -------------------------------------------------------------------------
   // File-based vault APIs (`Consumer.downloadFile`) are intentionally not
   // exercised here. The SDK only exposes the `StorageProvider` interface;
   // concrete adapters (Helia, Storacha, Synapse, …) are supplied by the
@@ -631,4 +763,8 @@ describe(`Consumer integration tests (live: ${API_URL})`, () => {
   //   - attestationConfig with known MRENCLAVE/MRSIGNER (fragile across builds)
   //   - onInvalidPartial callback path (requires a known-bad validator)
   //   - collectPartials AND-gate edge (length>=t but thresholdMet=false)
+  //   - DKG round rollover during a single read (#76 — bucket round
+  //     threshold differs from active round threshold). Rollover happens
+  //     on a chain-driven timer (~5 min on DevNet) and can't be reliably
+  //     triggered mid-test — covered in unit tests via mocked observer.
 });

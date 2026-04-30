@@ -21,6 +21,13 @@ export interface PartialDecryptionEvent {
   pubShare: `0x${string}`;
   /** Vault UUID */
   uuid: number;
+  /**
+   * TDH2 ciphertext this partial decrypts. Carried per-event because the
+   * keeper indexes `/dkg/cdr_partials` by `(round, ciphertext)`; all events
+   * returned from a successful `collectPartials` call share the same value
+   * (filtered to match the vault's current ciphertext).
+   */
+  ciphertext: `0x${string}`;
 }
 
 /** CDR Vault as stored on-chain */

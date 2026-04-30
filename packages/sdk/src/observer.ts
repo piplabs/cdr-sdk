@@ -203,12 +203,42 @@ export class Observer {
   }
 
   /**
-   * Get the absolute threshold (minimum number of partial decryptions needed)
-   * for the active round. If `minThresholdRatio` was set on the Observer,
-   * returns `max(network.threshold, ceil(participants * minThresholdRatio))`.
+   * Get the absolute threshold for the **currently active** DKG round, with
+   * `minThresholdRatio` override applied if set:
+   * `max(network.threshold, ceil(participants * minThresholdRatio))`.
+   *
+   * Use this for UI / status display of "the network's current threshold".
+   *
+   * **Do NOT** use this to validate a specific partial-decryption bucket
+   * returned by `Consumer.collectPartials` — partial buckets carry their
+   * own round, which can differ from the active round during DKG rollover.
+   * The bucket-aware threshold is computed via {@link getThresholdAt}.
    */
   async getThreshold(): Promise<number> {
     const net = await this.fetchLatestActive();
+    if (this.minThresholdRatio !== undefined) {
+      const overrideThreshold = Math.ceil(net.total * this.minThresholdRatio);
+      return Math.max(net.threshold, overrideThreshold);
+    }
+    return net.threshold;
+  }
+
+  /**
+   * Get the absolute threshold for a specific DKG round, with
+   * `minThresholdRatio` override applied if set, computed against
+   * **that round's** participant total:
+   * `max(network[round].threshold, ceil(network[round].total * minThresholdRatio))`.
+   *
+   * Used by `Consumer.collectPartials` to evaluate a partial-decryption
+   * bucket against its own round's threshold, so a DKG rollover mid-poll
+   * doesn't make the SDK measure the bucket against the wrong round.
+   *
+   * Per-round network snapshots are cached (Active/Ended stages only —
+   * those are immutable post-protocol), so calling this for the same
+   * round multiple times is a single REST round-trip.
+   */
+  async getThresholdAt(round: number): Promise<number> {
+    const net = await this.loadNetwork(round);
     if (this.minThresholdRatio !== undefined) {
       const overrideThreshold = Math.ceil(net.total * this.minThresholdRatio);
       return Math.max(net.threshold, overrideThreshold);

@@ -37,7 +37,9 @@ import {
 import {
   PartialCollectionTimeoutError,
   InvalidParamsError,
+  EmptyVaultError,
 } from "../src/errors.js";
+import { toHex } from "viem";
 import type { Observer } from "../src/observer.js";
 import type { DKGPartialDecryptionSubmission } from "../src/story-api/types.js";
 
@@ -48,12 +50,25 @@ const VALIDATOR_C = "0x0000000000000000000000000000000000000003" as const;
 
 function makeFakeObserver(opts: {
   threshold?: number;
+  /**
+   * Per-round threshold lookup. Number → constant, fn → derived from round
+   * (lets #76 tests return e.g. 2 for round 10 vs 3 for the active round).
+   * Defaults to `threshold` so legacy tests don't have to specify both.
+   */
+  thresholdAt?: number | ((round: number) => number);
   registrations?: Map<string, Uint8Array>;
   attestations?: Map<string, Uint8Array>;
   globalPubKey?: Uint8Array;
 } = {}): Observer {
+  const threshold = opts.threshold ?? 2;
   return {
-    getThreshold: vi.fn().mockResolvedValue(opts.threshold ?? 2),
+    getThreshold: vi.fn().mockResolvedValue(threshold),
+    getThresholdAt: vi.fn().mockImplementation((round: number) => {
+      if (typeof opts.thresholdAt === "function") {
+        return Promise.resolve(opts.thresholdAt(round));
+      }
+      return Promise.resolve(opts.thresholdAt ?? threshold);
+    }),
     getRegisteredValidators: vi
       .fn()
       .mockResolvedValue(opts.registrations ?? new Map()),
@@ -66,10 +81,14 @@ function makeFakeObserver(opts: {
   } as unknown as Observer;
 }
 
+/** Default ciphertext byte string used by `makeGroup` and `mockClients`. */
+const DEFAULT_CIPHERTEXT_BYTES = new Uint8Array([0x01]);
+
 function makeSubmission(opts: {
   validator: `0x${string}`;
   pid: number;
   round?: number;
+  ciphertext?: Uint8Array;
 }): DKGPartialDecryptionSubmission {
   return {
     validator: opts.validator,
@@ -78,7 +97,7 @@ function makeSubmission(opts: {
     encryptedPartial: new Uint8Array([1, 2, 3]),
     ephemeralPubKey: new Uint8Array(65).fill(0xaa),
     pubShare: new Uint8Array(34).fill(0xbb),
-    ciphertext: new Uint8Array([0xcc]),
+    ciphertext: opts.ciphertext ?? DEFAULT_CIPHERTEXT_BYTES,
     label: new Uint8Array(32).fill(0xdd),
   };
 }
@@ -87,19 +106,43 @@ function makeGroup(opts: {
   round?: number;
   submissions: DKGPartialDecryptionSubmission[];
   thresholdMet?: boolean;
+  ciphertext?: Uint8Array;
+  threshold?: number;
 }) {
   return {
     round: opts.round ?? 4,
     submissions: opts.submissions,
-    ciphertext: new Uint8Array([0x01]),
-    threshold: 2,
+    ciphertext: opts.ciphertext ?? DEFAULT_CIPHERTEXT_BYTES,
+    threshold: opts.threshold ?? 2,
     thresholdMet: opts.thresholdMet ?? true,
   };
 }
 
-function mockClients() {
+function mockClients(opts: { vaultEncryptedData?: `0x${string}` } = {}) {
+  // Default vault ciphertext matches `makeGroup`'s default so the
+  // ciphertext-bucket filter passes without per-test plumbing.
+  const vaultEncryptedData = opts.vaultEncryptedData ?? toHex(DEFAULT_CIPHERTEXT_BYTES);
+  // Route reads by functionName so tests don't break under the
+  // `accessCDR` → `read` (readFee) → `collectPartials` (vaults) ordering.
+  const readContract = vi.fn().mockImplementation((args: unknown) => {
+    const a = args as { functionName?: string } | undefined;
+    if (a?.functionName === "vaults") {
+      return Promise.resolve({
+        encryptedData: vaultEncryptedData,
+        updatable: false,
+        writeConditionAddr: "0x0",
+        readConditionAddr: "0x0",
+        writeConditionData: "0x",
+        readConditionData: "0x",
+      });
+    }
+    if (a?.functionName === "readFee") {
+      return Promise.resolve(1n);
+    }
+    return Promise.resolve(undefined);
+  });
   const publicClient = {
-    readContract: vi.fn(),
+    readContract,
     getBlockNumber: vi.fn().mockResolvedValue(1000n),
   };
   const walletClient = {
@@ -110,12 +153,15 @@ function mockClients() {
   return { publicClient: publicClient as any, walletClient: walletClient as any };
 }
 
-function makeConsumer(observer: Observer = makeFakeObserver()): {
+function makeConsumer(
+  observer: Observer = makeFakeObserver(),
+  clientOpts: { vaultEncryptedData?: `0x${string}` } = {},
+): {
   consumer: Consumer;
   publicClient: ReturnType<typeof mockClients>["publicClient"];
   walletClient: ReturnType<typeof mockClients>["walletClient"];
 } {
-  const { publicClient, walletClient } = mockClients();
+  const { publicClient, walletClient } = mockClients(clientOpts);
   const consumer = new Consumer({
     network: "testnet",
     publicClient,
@@ -536,17 +582,10 @@ describe("Consumer", () => {
         threshold,
         globalPubKey: new Uint8Array(34).fill(0xaa),
       });
-      const { consumer, publicClient } = makeConsumer(observer);
-      publicClient.readContract
-        .mockResolvedValueOnce({
-          encryptedData: "0x",
-          updatable: false,
-          writeConditionAddr: "0x0",
-          readConditionAddr: "0x0",
-          writeConditionData: "0x",
-          readConditionData: "0x",
-        })
-        .mockResolvedValueOnce(1n);
+      // mockClients defaults vault.encryptedData to `toHex(DEFAULT_CIPHERTEXT_BYTES)`,
+      // which matches makeGroup's default ciphertext, so the ciphertext-bucket
+      // filter passes without explicit per-call setup.
+      const { consumer } = makeConsumer(observer);
       vi.mocked(queryCDRPartials).mockResolvedValue([
         makeGroup({
           submissions: [
@@ -610,25 +649,16 @@ describe("Consumer", () => {
     });
 
     it("uses provided globalPubKey: skips observer.getGlobalPubKey", async () => {
-      // observer.getThreshold is still called once from collectPartials
-      // (it derives sdkThreshold internally) — that's expected and
-      // independent of accessCDR's globalPubKey shortcut.
+      // observer.getThresholdAt is called once from collectPartials (it
+      // derives the bucket-round threshold). observer.getThreshold (the
+      // active-round variant) must NOT be called from collectPartials —
+      // those are now distinct methods.
       vi.mocked(generateEphemeralKeyPair).mockReturnValue({
         privateKey: new Uint8Array(32).fill(1),
         publicKey: new Uint8Array(65).fill(2),
       });
       const observer = makeFakeObserver();
-      const { consumer, publicClient } = makeConsumer(observer);
-      publicClient.readContract
-        .mockResolvedValueOnce({
-          encryptedData: "0x",
-          updatable: false,
-          writeConditionAddr: "0x0",
-          readConditionAddr: "0x0",
-          writeConditionData: "0x",
-          readConditionData: "0x",
-        })
-        .mockResolvedValueOnce(1n);
+      const { consumer } = makeConsumer(observer);
       vi.mocked(queryCDRPartials).mockResolvedValue([
         makeGroup({
           submissions: [
@@ -648,8 +678,232 @@ describe("Consumer", () => {
         timeoutMs: 1000,
       });
       expect(observer.getGlobalPubKey).not.toHaveBeenCalled();
-      // observer.getThreshold gets called exactly once from collectPartials.
-      expect(observer.getThreshold).toHaveBeenCalledTimes(1);
+      expect(observer.getThresholdAt).toHaveBeenCalledTimes(1);
+      expect(observer.getThresholdAt).toHaveBeenCalledWith(4);
+      expect(observer.getThreshold).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // collectPartials: bucket-by-ciphertext + bucket-round-threshold (#75 / #76)
+  // -------------------------------------------------------------------------
+  describe("collectPartials — bucket selection by (round, ciphertext)", () => {
+    it("filters multi-group response by vault ciphertext, picks the matching bucket (#75)", async () => {
+      const VAULT_CIPHERTEXT = new Uint8Array([0xa1, 0xa2]);
+      const STALE_CIPHERTEXT = new Uint8Array([0xb1, 0xb2]);
+      const observer = makeFakeObserver({ threshold: 2 });
+      const { consumer } = makeConsumer(observer, {
+        vaultEncryptedData: toHex(VAULT_CIPHERTEXT),
+      });
+
+      // Two groups: a stale (older, different ciphertext) bucket and the
+      // current vault's bucket. Without #75's filter the SDK would pick the
+      // stale one (ascending round sort makes it appear first) and decrypt
+      // garbage.
+      vi.mocked(queryCDRPartials).mockResolvedValueOnce([
+        makeGroup({
+          round: 10,
+          ciphertext: STALE_CIPHERTEXT,
+          submissions: [
+            makeSubmission({ validator: VALIDATOR_A, pid: 1, round: 10, ciphertext: STALE_CIPHERTEXT }),
+            makeSubmission({ validator: VALIDATOR_B, pid: 2, round: 10, ciphertext: STALE_CIPHERTEXT }),
+          ],
+          thresholdMet: true,
+        }),
+        makeGroup({
+          round: 11,
+          ciphertext: VAULT_CIPHERTEXT,
+          submissions: [
+            makeSubmission({ validator: VALIDATOR_A, pid: 1, round: 11, ciphertext: VAULT_CIPHERTEXT }),
+            makeSubmission({ validator: VALIDATOR_B, pid: 2, round: 11, ciphertext: VAULT_CIPHERTEXT }),
+          ],
+          thresholdMet: true,
+        }),
+      ]);
+
+      const result = await consumer.collectPartials({
+        uuid: 1,
+        requesterPubKey: "0x04ab" as `0x${string}`,
+        timeoutMs: 1000,
+        pollIntervalMs: 5,
+      });
+
+      expect(result).toHaveLength(2);
+      // All returned events must be from the matching (round=11) bucket.
+      expect(result.every((p) => p.round === 11)).toBe(true);
+      expect(result.every((p) => p.ciphertext === toHex(VAULT_CIPHERTEXT))).toBe(true);
+    });
+
+    it("polls past stale-only buckets and returns when the matching bucket fills (#75)", async () => {
+      const VAULT_CIPHERTEXT = new Uint8Array([0xa1, 0xa2]);
+      const STALE_CIPHERTEXT = new Uint8Array([0xb1, 0xb2]);
+      const observer = makeFakeObserver({ threshold: 2 });
+      const { consumer } = makeConsumer(observer, {
+        vaultEncryptedData: toHex(VAULT_CIPHERTEXT),
+      });
+
+      // Tick 1: only stale bucket has submissions → keep waiting.
+      // Tick 2: matching bucket fills → return.
+      vi.mocked(queryCDRPartials)
+        .mockResolvedValueOnce([
+          makeGroup({
+            round: 10,
+            ciphertext: STALE_CIPHERTEXT,
+            submissions: [
+              makeSubmission({ validator: VALIDATOR_A, pid: 1, round: 10, ciphertext: STALE_CIPHERTEXT }),
+              makeSubmission({ validator: VALIDATOR_B, pid: 2, round: 10, ciphertext: STALE_CIPHERTEXT }),
+            ],
+            thresholdMet: true,
+          }),
+        ])
+        .mockResolvedValueOnce([
+          makeGroup({
+            round: 10,
+            ciphertext: STALE_CIPHERTEXT,
+            submissions: [],
+            thresholdMet: false,
+          }),
+          makeGroup({
+            round: 11,
+            ciphertext: VAULT_CIPHERTEXT,
+            submissions: [
+              makeSubmission({ validator: VALIDATOR_A, pid: 1, round: 11, ciphertext: VAULT_CIPHERTEXT }),
+              makeSubmission({ validator: VALIDATOR_B, pid: 2, round: 11, ciphertext: VAULT_CIPHERTEXT }),
+            ],
+            thresholdMet: true,
+          }),
+        ]);
+
+      const result = await consumer.collectPartials({
+        uuid: 1,
+        requesterPubKey: "0x04ab" as `0x${string}`,
+        timeoutMs: 1000,
+        pollIntervalMs: 5,
+      });
+
+      expect(result).toHaveLength(2);
+      expect(result.every((p) => p.round === 11)).toBe(true);
+      expect(queryCDRPartials).toHaveBeenCalledTimes(2);
+    });
+
+    it("times out when no group ever matches the vault ciphertext (#75)", async () => {
+      const VAULT_CIPHERTEXT = new Uint8Array([0xa1, 0xa2]);
+      const STALE_CIPHERTEXT = new Uint8Array([0xb1, 0xb2]);
+      const observer = makeFakeObserver({ threshold: 2 });
+      const { consumer } = makeConsumer(observer, {
+        vaultEncryptedData: toHex(VAULT_CIPHERTEXT),
+      });
+
+      vi.mocked(queryCDRPartials).mockResolvedValue([
+        makeGroup({
+          round: 10,
+          ciphertext: STALE_CIPHERTEXT,
+          submissions: [
+            makeSubmission({ validator: VALIDATOR_A, pid: 1, round: 10, ciphertext: STALE_CIPHERTEXT }),
+            makeSubmission({ validator: VALIDATOR_B, pid: 2, round: 10, ciphertext: STALE_CIPHERTEXT }),
+          ],
+          thresholdMet: true,
+        }),
+      ]);
+
+      await expect(
+        consumer.collectPartials({
+          uuid: 1,
+          requesterPubKey: "0x04ab" as `0x${string}`,
+          timeoutMs: 30,
+          pollIntervalMs: 5,
+        }),
+      ).rejects.toThrow(PartialCollectionTimeoutError);
+    });
+
+    it("when multiple buckets match the same ciphertext, prefers the highest round", async () => {
+      const VAULT_CIPHERTEXT = new Uint8Array([0xa1, 0xa2]);
+      const observer = makeFakeObserver({ threshold: 2 });
+      const { consumer } = makeConsumer(observer, {
+        vaultEncryptedData: toHex(VAULT_CIPHERTEXT),
+      });
+
+      vi.mocked(queryCDRPartials).mockResolvedValueOnce([
+        makeGroup({
+          round: 10,
+          ciphertext: VAULT_CIPHERTEXT,
+          submissions: [
+            makeSubmission({ validator: VALIDATOR_A, pid: 1, round: 10, ciphertext: VAULT_CIPHERTEXT }),
+            makeSubmission({ validator: VALIDATOR_B, pid: 2, round: 10, ciphertext: VAULT_CIPHERTEXT }),
+          ],
+          thresholdMet: true,
+        }),
+        makeGroup({
+          round: 11,
+          ciphertext: VAULT_CIPHERTEXT,
+          submissions: [
+            makeSubmission({ validator: VALIDATOR_A, pid: 1, round: 11, ciphertext: VAULT_CIPHERTEXT }),
+            makeSubmission({ validator: VALIDATOR_B, pid: 2, round: 11, ciphertext: VAULT_CIPHERTEXT }),
+          ],
+          thresholdMet: true,
+        }),
+      ]);
+
+      const result = await consumer.collectPartials({
+        uuid: 1,
+        requesterPubKey: "0x04ab" as `0x${string}`,
+        timeoutMs: 1000,
+        pollIntervalMs: 5,
+      });
+
+      expect(result).toHaveLength(2);
+      expect(result.every((p) => p.round === 11)).toBe(true);
+    });
+
+    it("uses the bucket's round threshold via getThresholdAt — bucket complete even when active round threshold is higher (#76)", async () => {
+      // Round 10 has threshold 2 (bucket's round); round 11 (active) has
+      // threshold 3. Without #76, getThreshold() would return 3 and the SDK
+      // would keep waiting on a 2/2 bucket. With #76, getThresholdAt(10)
+      // returns 2 and the SDK returns immediately.
+      const observer = makeFakeObserver({
+        thresholdAt: (round) => (round === 10 ? 2 : 3),
+      });
+      const { consumer } = makeConsumer(observer);
+
+      vi.mocked(queryCDRPartials).mockResolvedValueOnce([
+        makeGroup({
+          round: 10,
+          submissions: [
+            makeSubmission({ validator: VALIDATOR_A, pid: 1, round: 10 }),
+            makeSubmission({ validator: VALIDATOR_B, pid: 2, round: 10 }),
+          ],
+          threshold: 2,
+          thresholdMet: true,
+        }),
+      ]);
+
+      const result = await consumer.collectPartials({
+        uuid: 1,
+        requesterPubKey: "0x04ab" as `0x${string}`,
+        timeoutMs: 1000,
+        pollIntervalMs: 5,
+      });
+
+      expect(result).toHaveLength(2);
+      expect(observer.getThresholdAt).toHaveBeenCalledWith(10);
+      // getThreshold (active-round) must not be called from collectPartials.
+      expect(observer.getThreshold).not.toHaveBeenCalled();
+    });
+
+    it("throws EmptyVaultError when vault has no encryptedData", async () => {
+      const observer = makeFakeObserver({ threshold: 2 });
+      const { consumer } = makeConsumer(observer, { vaultEncryptedData: "0x" });
+
+      await expect(
+        consumer.collectPartials({
+          uuid: 1,
+          requesterPubKey: "0x04ab" as `0x${string}`,
+          timeoutMs: 100,
+          pollIntervalMs: 5,
+        }),
+      ).rejects.toThrow(EmptyVaultError);
+      // Should not even poll the REST endpoint — fail fast.
+      expect(queryCDRPartials).not.toHaveBeenCalled();
     });
   });
 });
