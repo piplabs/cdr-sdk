@@ -208,6 +208,18 @@ export class Consumer {
     pollIntervalMs?: number;
     onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
     attestationConfig?: AttestationConfig;
+    /**
+     * @internal Pre-loaded vault ciphertext from a containing call (e.g.
+     * `accessCDR`'s preflight). When set, the polling loop filters
+     * buckets against this value and skips the otherwise-mandatory
+     * vault read. This exists so a single `accessCDR` invocation can
+     * pin one vault-state snapshot across preflight + filter + decrypt
+     * (avoiding an SDK-side race when the vault is updated between
+     * those steps for an `updatable` vault). External callers should
+     * omit it — `collectPartials` will then load the vault itself and
+     * provide its own atomic snapshot.
+     */
+    pinnedCiphertext?: Uint8Array;
   }): Promise<PartialDecryptionEvent[]> {
     const {
       uuid,
@@ -216,17 +228,21 @@ export class Consumer {
       pollIntervalMs = 3_000,
       onInvalidPartial,
       attestationConfig,
+      pinnedCiphertext,
     } = params;
 
     if (!requesterPubKey) {
       throw new InvalidParamsError("collectPartials: requesterPubKey is required");
     }
 
-    // Pin the vault's current ciphertext at the start of the call. The
+    // Pin the vault's current ciphertext for the entire poll loop. The
     // keeper indexes buckets by (round, ciphertext); we filter on this
-    // value for the rest of the poll loop so a concurrent vault update
-    // can't silently change which bucket we accept.
-    const vaultCiphertext = await this.loadAndCheckVault(uuid);
+    // value so a concurrent vault update can't silently change which
+    // bucket we accept. If a containing call already pinned a snapshot
+    // (e.g. `accessCDR` did its preflight before submitting `read()`),
+    // reuse it — that closes the SDK-side race window between
+    // preflight and the read tx mining.
+    const vaultCiphertext = pinnedCiphertext ?? (await this.loadAndCheckVault(uuid));
 
     const requesterPubKeyHex = requesterPubKey.replace(/^0x/i, "");
     const deadline = Date.now() + timeoutMs;
@@ -463,13 +479,12 @@ export class Consumer {
 
     try {
       // Preflight the vault state BEFORE submitting a fee-bearing `read()`
-      // tx. The same check fires inside `collectPartials` too — keeping it
-      // in both places is intentional: here it prevents the paid tx for
-      // empty / non-existent vaults, there it covers direct
-      // `collectPartials` callers (defense-in-depth). Costs one extra
-      // chain read per `accessCDR`; tolerable next to the read-tx + poll
-      // round-trip the call would otherwise wait through.
-      await this.loadAndCheckVault(params.uuid);
+      // tx and pin the ciphertext for the whole flow. Reusing this single
+      // snapshot for the bucket filter (via `pinnedCiphertext`) and the
+      // decrypt step closes the SDK-side race that would otherwise exist
+      // between this preflight, the read tx mining, and a later vault
+      // re-read inside `collectPartials` — see #79.
+      const vaultCiphertext = await this.loadAndCheckVault(params.uuid);
 
       const label = uuidToLabel(params.uuid);
 
@@ -486,17 +501,11 @@ export class Consumer {
         timeoutMs: params.timeoutMs,
         onInvalidPartial: params.onInvalidPartial,
         attestationConfig: params.attestationConfig,
+        pinnedCiphertext: vaultCiphertext,
       });
 
-      // collectPartials filtered to the vault's current ciphertext and
-      // pinned it across the poll; every event in `partials` carries the
-      // same `ciphertext` byte-string, so reading [0] avoids a redundant
-      // chain RPC and guarantees decrypt uses the same value the filter
-      // matched on.
-      const encryptedData = toBytes(partials[0].ciphertext);
-
       const dataKey = await this.decryptDataKey({
-        ciphertext: { raw: encryptedData, label },
+        ciphertext: { raw: vaultCiphertext, label },
         partials,
         recipientPrivKey,
         globalPubKey,

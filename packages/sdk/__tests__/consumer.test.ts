@@ -704,6 +704,78 @@ describe("Consumer", () => {
       // Also: the partial poll must never start.
       expect(queryCDRPartials).not.toHaveBeenCalled();
     });
+
+    it("pins one vault snapshot for the whole flow — concurrent update doesn't shift the filter (#79)", async () => {
+      vi.mocked(generateEphemeralKeyPair).mockReturnValue({
+        privateKey: new Uint8Array(32).fill(1),
+        publicKey: new Uint8Array(65).fill(2),
+      });
+      const observer = makeFakeObserver({
+        threshold: 2,
+        globalPubKey: new Uint8Array(34).fill(0xaa),
+      });
+      const { consumer, publicClient } = makeConsumer(observer);
+
+      // Simulate a concurrent vault update: the first vault read (preflight)
+      // returns ciphertext C1; any subsequent vault read would return C2.
+      // With #79's fix, the SDK reuses the preflight snapshot across the
+      // whole `accessCDR` call, so the vault is read exactly once and the
+      // filter pins to C1 — matching the keeper's bucket. Without the fix,
+      // a second read inside `collectPartials` would shift the filter to
+      // C2 and the call would time out.
+      let vaultReadCount = 0;
+      publicClient.readContract.mockImplementation((args: unknown) => {
+        const a = args as { functionName?: string };
+        if (a?.functionName === "vaults") {
+          vaultReadCount++;
+          return Promise.resolve({
+            encryptedData: vaultReadCount === 1 ? "0x01" : "0x02",
+            updatable: true,
+            writeConditionAddr: "0x0",
+            readConditionAddr: "0x0",
+            writeConditionData: "0x",
+            readConditionData: "0x",
+          });
+        }
+        if (a?.functionName === "readFee") return Promise.resolve(1n);
+        return Promise.resolve(undefined);
+      });
+
+      // Keeper produced partials for the original ciphertext (C1 = 0x01),
+      // matching what was on chain at read-tx-block time.
+      vi.mocked(queryCDRPartials).mockResolvedValue([
+        makeGroup({
+          ciphertext: new Uint8Array([0x01]),
+          submissions: [
+            makeSubmission({
+              validator: VALIDATOR_A,
+              pid: 1,
+              ciphertext: new Uint8Array([0x01]),
+            }),
+            makeSubmission({
+              validator: VALIDATOR_B,
+              pid: 2,
+              ciphertext: new Uint8Array([0x01]),
+            }),
+          ],
+          thresholdMet: true,
+        }),
+      ]);
+      vi.mocked(decryptPartial).mockResolvedValue(new Uint8Array([1]));
+      vi.mocked(tdh2Combine).mockResolvedValue(new Uint8Array([0xff]));
+
+      const result = await consumer.accessCDR({
+        uuid: 42,
+        accessAuxData: "0x",
+        timeoutMs: 1000,
+      });
+
+      expect(result.dataKey).toEqual(new Uint8Array([0xff]));
+      // Critical regression assertion: vault is read EXACTLY once. Two
+      // reads would mean accessCDR + collectPartials each loaded the
+      // vault separately, and the filter would pin C2 instead of C1.
+      expect(vaultReadCount).toBe(1);
+    });
   });
 
   // -------------------------------------------------------------------------
