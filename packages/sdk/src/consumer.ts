@@ -226,16 +226,7 @@ export class Consumer {
     // keeper indexes buckets by (round, ciphertext); we filter on this
     // value for the rest of the poll loop so a concurrent vault update
     // can't silently change which bucket we accept.
-    const vault = (await this.publicClient.readContract({
-      address: contractAddresses[this.network].cdr,
-      abi: cdrAbi,
-      functionName: "vaults",
-      args: [uuid],
-    })) as { encryptedData: `0x${string}` };
-    const vaultCiphertext = toBytes(vault.encryptedData);
-    if (vaultCiphertext.length === 0) {
-      throw new EmptyVaultError(uuid);
-    }
+    const vaultCiphertext = await this.loadAndCheckVault(uuid);
 
     const requesterPubKeyHex = requesterPubKey.replace(/^0x/i, "");
     const deadline = Date.now() + timeoutMs;
@@ -315,6 +306,26 @@ export class Consumer {
     }
 
     throw new PartialCollectionTimeoutError(lastSeen, lastNeeded, timeoutMs);
+  }
+
+  /**
+   * Read the vault's current ciphertext and reject early if it has none.
+   * Single source of truth for the `EmptyVaultError` gate, called from
+   * `accessCDR` (preflight before the fee-bearing `read()` tx) and
+   * `collectPartials` (defense-in-depth — direct callers benefit too).
+   */
+  private async loadAndCheckVault(uuid: number): Promise<Uint8Array> {
+    const vault = (await this.publicClient.readContract({
+      address: contractAddresses[this.network].cdr,
+      abi: cdrAbi,
+      functionName: "vaults",
+      args: [uuid],
+    })) as { encryptedData: `0x${string}` };
+    const ciphertext = toBytes(vault.encryptedData);
+    if (ciphertext.length === 0) {
+      throw new EmptyVaultError(uuid);
+    }
+    return ciphertext;
   }
 
   /**
@@ -401,6 +412,13 @@ export class Consumer {
    * secp256k1 keypair is generated and the private key is zeroed after use.
    * If `globalPubKey` is omitted, it is auto-queried via the Observer.
    *
+   * The vault is preflight-checked with one chain read before any
+   * fee-bearing `read()` tx is submitted. For empty / non-existent
+   * vaults this throws `EmptyVaultError` synchronously (no tx, no fee).
+   *
+   * @throws {@link EmptyVaultError} if the uuid's vault has no
+   *   `encryptedData`. Raised before submitting `read()`.
+   *
    * @example
    * ```ts
    * const { dataKey, txHash } = await consumer.accessCDR({
@@ -444,6 +462,15 @@ export class Consumer {
       params.globalPubKey ?? (await this.observer.getGlobalPubKey());
 
     try {
+      // Preflight the vault state BEFORE submitting a fee-bearing `read()`
+      // tx. The same check fires inside `collectPartials` too — keeping it
+      // in both places is intentional: here it prevents the paid tx for
+      // empty / non-existent vaults, there it covers direct
+      // `collectPartials` callers (defense-in-depth). Costs one extra
+      // chain read per `accessCDR`; tolerable next to the read-tx + poll
+      // round-trip the call would otherwise wait through.
+      await this.loadAndCheckVault(params.uuid);
+
       const label = uuidToLabel(params.uuid);
 
       const { txHash } = await this.read({

@@ -682,6 +682,28 @@ describe("Consumer", () => {
       expect(observer.getThresholdAt).toHaveBeenCalledWith(4);
       expect(observer.getThreshold).not.toHaveBeenCalled();
     });
+
+    it("throws EmptyVaultError BEFORE submitting any tx — no fee paid for empty vault (#78)", async () => {
+      const observer = makeFakeObserver();
+      const { consumer, walletClient } = makeConsumer(observer, {
+        vaultEncryptedData: "0x",
+      });
+
+      await expect(
+        consumer.accessCDR({
+          uuid: 999,
+          accessAuxData: "0x",
+          timeoutMs: 100,
+        }),
+      ).rejects.toThrow(EmptyVaultError);
+
+      // Critical regression assertion: the preflight must run BEFORE any
+      // fee-bearing read tx is submitted. If `read()` is called before the
+      // empty check, the user pays for a request that can never succeed.
+      expect(walletClient.writeContract).not.toHaveBeenCalled();
+      // Also: the partial poll must never start.
+      expect(queryCDRPartials).not.toHaveBeenCalled();
+    });
   });
 
   // -------------------------------------------------------------------------
