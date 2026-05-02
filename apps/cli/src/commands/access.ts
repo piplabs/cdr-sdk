@@ -1,7 +1,7 @@
 import { Command } from "commander";
 import { toHex, fromHex } from "viem";
 import { initWasm } from "@piplabs/cdr-sdk";
-import { resolveConfig, createClient, output, errExit, type GlobalOptions } from "../utils.js";
+import { resolveConfig, createClient, output, parseNonNegInt, type GlobalOptions } from "../utils.js";
 
 /**
  * `cdr-cli access <uuid>` — read + decrypt a CDR vault.
@@ -23,17 +23,14 @@ export function accessCommand(program: Command) {
     .action(async (uuidStr: string, opts: any, cmd: Command) => {
       const cfg = resolveConfig(cmd.optsWithGlobals() as GlobalOptions, /* requireWallet */ true);
 
-      const uuid = parseInt(uuidStr);
-      if (!Number.isInteger(uuid) || uuid < 0) {
-        errExit(cfg.json, `Invalid uuid: ${uuidStr}. Must be a non-negative integer.`);
-      }
+      const uuid = parseNonNegInt(uuidStr, "uuid", cfg.json);
 
       await initWasm();
       const client = createClient(cfg);
 
       // accessCDR doesn't expose pollIntervalMs (it's an internal collectPartials
       // detail with a sane default). Only timeoutMs is surfaced here.
-      const timeoutMs = parseInt(opts.timeout);
+      const timeoutMs = parseNonNegInt(opts.timeout, "timeout", cfg.json);
 
       const result = await client.consumer.accessCDR({
         uuid,

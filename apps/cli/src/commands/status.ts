@@ -1,6 +1,6 @@
 import { Command } from "commander";
 import { queryLatestActiveDKGNetwork } from "@piplabs/cdr-sdk";
-import { resolveConfig, createClient, output, errExit, type GlobalOptions } from "../utils.js";
+import { resolveConfig, createClient, output, parseNonNegInt, type GlobalOptions } from "../utils.js";
 
 /**
  * `cdr-cli status <subcommand>` — read-only DKG / CDR state queries.
@@ -24,10 +24,7 @@ export function statusCommand(program: Command) {
     .description("Get vault details by UUID")
     .action(async (uuidStr: string, _opts: any, cmd: Command) => {
       const cfg = resolveConfig(cmd.optsWithGlobals() as GlobalOptions, /* requireWallet */ false);
-      const uuid = parseInt(uuidStr);
-      if (!Number.isInteger(uuid) || uuid < 0) {
-        errExit(cfg.json, `Invalid uuid: ${uuidStr}. Must be a non-negative integer.`);
-      }
+      const uuid = parseNonNegInt(uuidStr, "uuid", cfg.json);
       const client = createClient(cfg);
       const vault = await client.observer.getVault(uuid);
       output(vault, cfg.json);

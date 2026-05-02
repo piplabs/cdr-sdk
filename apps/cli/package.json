@@ -19,6 +19,7 @@
     "dev": "tsx src/index.ts",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
+    "test": "vitest run --exclude '**/__integration__/**' --exclude '**/node_modules/**' --exclude '**/dist/**'",
     "test:integration": "pnpm clean && pnpm build && vitest run __integration__",
     "prepublishOnly": "pnpm run build"
   },

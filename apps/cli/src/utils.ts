@@ -82,6 +82,32 @@ export function createClient(cfg: ResolvedConfig): CDRClient {
 }
 
 /**
+ * Parse a CLI numeric argument with strict whole-string validation.
+ *
+ * `parseInt("12oops")` returns `12` because it stops at the first
+ * non-digit — that lets malformed user input silently coerce into
+ * a valid-looking number. We gate on `/^\d+$/` so the *entire* input
+ * must be digits (no trailing garbage, no signs, no decimal, no
+ * scientific notation, no whitespace, no hex prefix).
+ *
+ * Calls `errExit` on rejection — the caller does not need to handle
+ * the error path.
+ */
+export function parseNonNegInt(value: string, label: string, json: boolean): number {
+  if (!/^\d+$/.test(value)) {
+    errExit(json, `Invalid ${label}: ${value}. Must be a non-negative integer.`);
+  }
+  const n = parseInt(value, 10);
+  // Defensive: a 21-digit input parses to a non-safe-integer like 1e21.
+  // uuid is uint32 (max 10 digits) so legitimate values can never trip
+  // this branch; it just blocks pathological input from flowing on.
+  if (!Number.isSafeInteger(n)) {
+    errExit(json, `Invalid ${label}: ${value}. Exceeds safe integer range.`);
+  }
+  return n;
+}
+
+/**
  * Print an error and exit. In `--json` mode, output structured JSON with
  * `error.message` (and optionally `error.missing` for missing-config errors)
  * to stderr; otherwise print a plain message. Always exits 1.
