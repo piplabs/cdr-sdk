@@ -70,7 +70,6 @@ describe("Consumer.downloadFile", () => {
       requesterPubKey: "0xpubkey",
       recipientPrivKey: new Uint8Array(32),
       globalPubKey: new Uint8Array(34),
-      threshold: 2,
       storageProvider,
       skipCidVerification: true,
     });

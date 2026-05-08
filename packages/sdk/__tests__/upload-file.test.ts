@@ -11,6 +11,13 @@ import { Uploader } from "../src/uploader.js";
 import { tdh2Encrypt, encryptFile } from "@piplabs/cdr-crypto";
 import { ContentSizeExceededError } from "../src/errors.js";
 import type { StorageProvider } from "../src/storage/types.js";
+import type { Observer } from "../src/observer.js";
+
+function fakeObserver(opts: { maxSize?: bigint } = {}): Observer {
+  return {
+    getMaxEncryptedDataSize: vi.fn().mockResolvedValue(opts.maxSize ?? 10_000n),
+  } as unknown as Observer;
+}
 
 function makeVaultAllocatedLog(uuid: number) {
   const topic0 = keccak256(
@@ -99,14 +106,18 @@ describe("Uploader.uploadFile", () => {
     publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
       logs: [makeVaultAllocatedLog(42)],
     });
-    // maxEncryptedDataSize check (after TDH2 encrypt, default on)
-    publicClient.readContract.mockResolvedValueOnce(10000n);
+    // maxEncryptedDataSize check is now in `write`, served by Observer (mocked).
     // writeFee
     publicClient.readContract.mockResolvedValueOnce(200n);
     walletClient.writeContract.mockResolvedValueOnce("0xwritetx" as `0x${string}`);
     publicClient.waitForTransactionReceipt.mockResolvedValueOnce({});
 
-    const uploader = new Uploader({ network: "testnet", publicClient, walletClient });
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer: fakeObserver(),
+    });
     const content = new TextEncoder().encode("hello world");
 
     const result = await uploader.uploadFile({
@@ -133,14 +144,14 @@ describe("Uploader.uploadFile", () => {
     expect(result.txHashes.write).toBe("0xwritetx");
   });
 
-  it("throws ContentSizeExceededError when TDH2 ciphertext exceeds max (checkSize defaults to true)", async () => {
+  it("throws ContentSizeExceededError when TDH2 ciphertext exceeds maxEncryptedDataSize", async () => {
     const { publicClient, walletClient } = mockClients();
     const storageProvider = mockStorageProvider();
 
     const fakeKey = new Uint8Array(32).fill(0xaa);
     vi.mocked(encryptFile).mockReturnValue({ ciphertext: new Uint8Array([1]), key: fakeKey });
 
-    // TDH2 ciphertext that is larger than the max
+    // TDH2 ciphertext (200 bytes) is larger than the Observer's maxSize (10 bytes).
     const largeTdh2Ct = { raw: new Uint8Array(200), label: new Uint8Array([4]) };
     vi.mocked(tdh2Encrypt).mockResolvedValue(largeTdh2Ct);
 
@@ -150,10 +161,13 @@ describe("Uploader.uploadFile", () => {
     publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
       logs: [makeVaultAllocatedLog(42)],
     });
-    // maxEncryptedDataSize = 10 bytes (smaller than TDH2 ciphertext)
-    publicClient.readContract.mockResolvedValueOnce(10n);
 
-    const uploader = new Uploader({ network: "testnet", publicClient, walletClient });
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer: fakeObserver({ maxSize: 10n }),
+    });
 
     await expect(
       uploader.uploadFile({
@@ -163,45 +177,7 @@ describe("Uploader.uploadFile", () => {
       }),
     ).rejects.toThrow(ContentSizeExceededError);
 
-    // Allocate was called (happens before size check), but write was NOT
+    // Allocate happened (size check is in `write`, after allocate); write was NOT.
     expect(walletClient.writeContract).toHaveBeenCalledOnce(); // allocate only
-  });
-
-  it("skips size check when checkSize is false", async () => {
-    const { publicClient, walletClient } = mockClients();
-    const storageProvider = mockStorageProvider();
-
-    const fakeKey = new Uint8Array(32).fill(0xaa);
-    vi.mocked(encryptFile).mockReturnValue({ ciphertext: new Uint8Array([1]), key: fakeKey });
-
-    const mockTdh2Ct = { raw: new Uint8Array([10]), label: new Uint8Array([4]) };
-    vi.mocked(tdh2Encrypt).mockResolvedValue(mockTdh2Ct);
-
-    // allocateFee (no maxEncryptedDataSize call since checkSize=false)
-    publicClient.readContract.mockResolvedValueOnce(1000n);
-    walletClient.writeContract.mockResolvedValueOnce("0xalloctx" as `0x${string}`);
-    publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
-      logs: [makeVaultAllocatedLog(1)],
-    });
-    // writeFee
-    publicClient.readContract.mockResolvedValueOnce(200n);
-    walletClient.writeContract.mockResolvedValueOnce("0xwritetx" as `0x${string}`);
-    publicClient.waitForTransactionReceipt.mockResolvedValueOnce({});
-
-    const uploader = new Uploader({ network: "testnet", publicClient, walletClient });
-
-    await uploader.uploadFile({
-      ...baseParams,
-      content: new Uint8Array([1, 2, 3]),
-      storageProvider,
-      checkSize: false,
-    });
-
-    // maxEncryptedDataSize should NOT have been called
-    const readContractCalls = publicClient.readContract.mock.calls;
-    const maxSizeCalls = readContractCalls.filter(
-      (c: any) => c[0].functionName === "maxEncryptedDataSize",
-    );
-    expect(maxSizeCalls.length).toBe(0);
   });
 });

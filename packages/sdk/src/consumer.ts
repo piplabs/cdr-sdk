@@ -1,50 +1,63 @@
-import { parseEventLogs, toBytes, toHex, fromHex, type PublicClient, type WalletClient } from "viem";
-import { cdrAbi, dkgAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
-import { decryptPartial as eciesDecrypt, tdh2Combine, verifyPartialSignature, decryptFile, generateEphemeralKeyPair, type TDH2Ciphertext, type DecryptedPartial } from "@piplabs/cdr-crypto";
-import { PartialCollectionTimeoutError, InvalidParamsError, ObserverRequiredError, CidIntegrityError } from "./errors.js";
+import { toBytes, toHex, fromHex, type PublicClient, type WalletClient } from "viem";
+import { cdrAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
+import {
+  decryptPartial as eciesDecrypt,
+  tdh2Combine,
+  decryptFile,
+  generateEphemeralKeyPair,
+  type TDH2Ciphertext,
+  type DecryptedPartial,
+} from "@piplabs/cdr-crypto";
+import {
+  PartialCollectionTimeoutError,
+  InvalidParamsError,
+  CidIntegrityError,
+  EmptyVaultError,
+} from "./errors.js";
 import type { PartialDecryptionEvent } from "./types.js";
 import { uuidToLabel } from "./label.js";
 import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
-import type { AttestationConfig } from "./attestation.js";
-import { queryCDRPartials, queryLatestActiveDKGNetwork } from "./cosmos/abci-query.js";
-import { bytesToHex as cosmosBytesToHex } from "./cosmos/protobuf.js";
+import { verifyAttestation, type AttestationConfig } from "./attestation.js";
+import { queryCDRPartials } from "./story-api/client.js";
+import type { DKGPartialDecryptionSubmission } from "./story-api/types.js";
 
+/**
+ * Consumer reads encrypted vault data from the CDR contract and recovers the
+ * data key by collecting validator partial decryptions through the
+ * Story-API REST endpoint.
+ *
+ * ## Trust model
+ *
+ * Partial decryptions are read from `/dkg/cdr_partials` — the keeper has
+ * already verified each validator's signature on ingress (see
+ * `story/client/x/dkg/keeper/dkg_handler.go::PartialDecryptionSubmitted`)
+ * and dropped the signature bytes. The SDK trusts the keeper at the same
+ * level as any other authoritative chain RPC read.
+ *
+ * The SDK also trusts the keeper to index submissions correctly by
+ * `(uuid, requesterPubKey)`. The response payload does not carry
+ * `requesterPubKey` per submission, so the SDK relies on the query-side
+ * filter being honored. A misrouted partial (encrypted to a different
+ * reader's pubkey) would not yield a meaningful ECIES decryption with this
+ * consumer's `recipientPrivKey`; the resulting garbage bytes would propagate
+ * through {@link decryptDataKey}'s `tdh2Combine` and ultimately fail at the
+ * outermost AES-GCM auth check when decrypting the vault payload. There is
+ * no explicit early-fail check inside {@link collectPartials} for this case.
+ *
+ * Optional defense-in-depth: pass `attestationConfig` to `collectPartials`
+ * to verify each validator's SGX enclave (MRENCLAVE / MRSIGNER / SVN)
+ * before accepting their partials. Attestation is checked once per round
+ * (the per-round registrations cache is shared with
+ * {@link Observer.getValidatorAttestations}, so this is free) and an
+ * un-trusted validator's partial is reported via `onInvalidPartial`.
+ */
 export class Consumer {
   private publicClient: PublicClient;
   private walletClient: WalletClient;
   private network: Network;
-  private observer: Observer | null;
-
-  /**
-   * In-flight (or settled) promise for the cached commPubKey map. Promise-
-   * level caching deduplicates concurrent calls: if two accessCDR invocations
-   * both trigger a build at the same time, only one scan runs.
-   *
-   * Registered events are immutable, so the only staleness risk is a new
-   * validator registering after the cache was built; that surfaces as
-   * "unknown validator" during verify, which triggers an automatic one-shot
-   * refresh (see collectPartialsFromEvents).
-   */
-  private commPubKeyMapPromise: Promise<Map<string, Uint8Array[]>> | null = null;
-
-  /**
-   * Whether a scan is currently in progress. Used to deduplicate concurrent
-   * force-refresh requests: without this flag, two collectPartials calls that
-   * both encounter a verification failure at the same time would each call
-   * getCommPubKeyMap(true) and fan out into two parallel full-history scans.
-   * With it, the second caller joins the first refresh's in-flight promise.
-   */
-  private commPubKeyMapBuildInFlight = false;
-
-  /**
-   * Cached "fallback" Observer used by getEventLookback when the Consumer
-   * was constructed without one. Reusing the same instance preserves its
-   * `defaultCometUrlWarned` flag, so the plaintext-HTTP warning fires
-   * exactly once per Consumer instead of once per getEventLookback call
-   * (which would re-fire after every cache refresh).
-   */
-  private fallbackObserver: Observer | null = null;
+  private observer: Observer;
+  private apiUrl: string;
 
   /** Alias for {@link accessCDR} */
   readVault: Consumer["accessCDR"];
@@ -55,47 +68,44 @@ export class Consumer {
     network: Network;
     publicClient: PublicClient;
     walletClient: WalletClient;
-    observer?: Observer;
+    /** Observer instance — required. Provides round-keyed registrations / attestations cache. */
+    observer: Observer;
+    /** Story-API REST base URL, e.g. `"http://node:1317"`. */
+    apiUrl: string;
   }) {
     this.publicClient = params.publicClient;
     this.walletClient = params.walletClient;
     this.network = params.network;
-    this.observer = params.observer ?? null;
+    this.observer = params.observer;
+    this.apiUrl = params.apiUrl;
     this.readVault = this.accessCDR.bind(this);
     this.readFileVault = this.downloadFile.bind(this);
   }
 
   /**
-   * Warm the validator commPubKey cache in the background.
+   * Warm the validator commPubKey + attestation cache for the active round.
    *
-   * The cache is normally built lazily on the first accessCDR / downloadFile
-   * call, which requires a full-history scan of DKG Registered events and
-   * can take tens of seconds on mature chains — long enough that a request
-   * triggered by a user click can appear to hang. Frontends that know a
-   * read is imminent (e.g. right after user login / wallet connection) can
-   * call prefetchRegistry() to start the scan early, so the subsequent
-   * accessCDR call hits a warm cache and returns immediately.
+   * The first `accessCDR` / `downloadFile` call after construction would
+   * otherwise stall on this fetch. Frontends that know a read is imminent
+   * (e.g. right after wallet connection) can call `prefetchRegistry()` in
+   * the background so the subsequent decryption returns from a warm cache.
    *
-   * Safe to call multiple times — concurrent callers share the same
-   * in-flight build via Promise-level dedupe, so repeated prefetches cost
-   * nothing. Errors propagate; callers doing best-effort warming should
-   * attach their own `.catch(() => {})` and let the real accessCDR call
-   * surface the failure later if it still occurs.
+   * Safe to call repeatedly — Observer's per-round cache plus its in-flight
+   * Promise dedup ensure only one REST request is in flight at any time.
    *
    * @example
    * ```ts
-   * // Right after user login / wallet connection, in a useEffect:
-   * cdrClient.consumer.prefetchRegistry().catch(() => {
-   *   // best-effort warm-up; real accessCDR call will retry if needed
-   * });
+   * cdrClient.consumer.prefetchRegistry().catch(() => {});  // best-effort
    * ```
    */
   async prefetchRegistry(): Promise<void> {
-    await this.getCommPubKeyMap();
+    await this.observer.getRegisteredValidators();
   }
 
   /**
-   * Request a vault read. Auto-queries read fee. Emits VaultRead event for validators.
+   * Send the CDR `read` transaction for a vault, which prompts validators
+   * to submit encrypted partial decryptions.
+   *
    * @example
    * ```ts
    * const { txHash } = await consumer.read({
@@ -109,6 +119,13 @@ export class Consumer {
     uuid: number;
     accessAuxData: `0x${string}`;
     requesterPubKey: `0x${string}`;
+    /**
+     * Explicit read fee. Skips the auto-query for `readFee()`. NOT a way
+     * to pay a different amount — the CDR contract requires
+     * `msg.value == readFee` exactly and rejects mismatches with
+     * "Invalid fee amount". Use this to skip a duplicate RPC when the
+     * caller already has the fee value.
+     */
     feeOverride?: bigint;
   }): Promise<{ txHash: `0x${string}` }> {
     const cdrAddress = contractAddresses[this.network].cdr;
@@ -133,380 +150,234 @@ export class Consumer {
   }
 
   /**
-   * Fetch validator address → commPubKey[] map from DKG Registered events.
+   * Poll Story-API `/dkg/cdr_partials` until the keeper has surfaced at
+   * least the threshold worth of submissions for the given
+   * `(uuid, requesterPubKey)` whose `(round, ciphertext)` matches the
+   * vault's current state.
    *
-   * Hybrid mode (default): query `GetLatestActiveDKGNetwork` via CometBFT
-   * ABCI to identify the currently active DKG round, then scan EVM
-   * `Registered` events within a bounded window and keep only registrations
-   * for that round. The CometBFT RPC URL defaults to
-   * {@link Observer.DEFAULT_COMET_RPC_URL}; callers can override it by
-   * passing `cometRpcUrl` when constructing `CDRClient`. If the ABCI query
-   * fails (network unreachable, URL misconfigured, etc.), we fall back to
-   * keeping every key in the window and letting the verify loop try each.
+   * **Bucket selection**: the keeper indexes submissions by
+   * `(round, ciphertext)`. Multiple groups can be returned across round
+   * transitions or after a vault update on an updatable vault. The vault's
+   * current `encryptedData` is loaded once at the start of this call and
+   * pinned for the rest of the poll loop; only groups whose `ciphertext`
+   * matches that value are accepted. If multiple groups match (same
+   * ciphertext, different rounds — rare), the highest round is preferred.
    *
-   * The scan window is computed from on-chain DKG params via
-   * {@link Observer.getLookbackBlocks} — `2 × (registrationPeriod +
-   * dealingPeriod + finalizationPeriod) + activePeriod` — covering the
-   * current epoch plus one prior protocol pass for buffer.
-   */
-  /** Chunk size for historical getLogs scans. Kept well below typical RPC block-range limits. */
-  private static readonly DKG_LOGS_BLOCK_CHUNK = 500_000n;
-  /** Max attempts per chunk getLogs call before propagating the error. */
-  private static readonly GETLOGS_MAX_ATTEMPTS = 3;
-  /** Base delay (ms) for exponential backoff between getLogs retries. */
-  private static readonly GETLOGS_BACKOFF_MS = 500;
-
-  /**
-   * Return the cached commPubKey map, building it on first call or when
-   * {@link forceRefresh} is true.
+   * **Threshold**: derived from `observer.getThresholdAt(group.round)`,
+   * not the active round. So a DKG rollover during the poll doesn't make
+   * us measure the bucket against a different round's threshold.
    *
-   * Concurrent callers share the same in-flight build promise so we never
-   * scan the full history twice in parallel — this dedup applies to the
-   * force-refresh path as well, so two collectPartials calls that both
-   * hit a verification failure at the same time only trigger one rescan.
-   * On build failure the rejected promise is cleared so a subsequent
-   * call can retry from scratch instead of inheriting the rejection.
-   */
-  private async getCommPubKeyMap(forceRefresh = false): Promise<Map<string, Uint8Array[]>> {
-    // Any build currently in flight is shared with all callers, refresh or not.
-    if (this.commPubKeyMapBuildInFlight && this.commPubKeyMapPromise) {
-      return this.commPubKeyMapPromise;
-    }
-    // No build in flight: a non-refresh caller can reuse a settled cache.
-    if (!forceRefresh && this.commPubKeyMapPromise) {
-      return this.commPubKeyMapPromise;
-    }
-    this.commPubKeyMapBuildInFlight = true;
-    const dkgAddress = contractAddresses[this.network].dkg;
-    const p = this.fetchRegisteredValidators(dkgAddress)
-      .catch((err) => {
-        if (this.commPubKeyMapPromise === p) {
-          this.commPubKeyMapPromise = null;
-        }
-        throw err;
-      })
-      .finally(() => {
-        this.commPubKeyMapBuildInFlight = false;
-      });
-    this.commPubKeyMapPromise = p;
-    return p;
-  }
-
-  /**
-   * Resolve the event-scan lookback window in blocks:
-   *   2 × (registrationPeriod + dealingPeriod + finalizationPeriod) + activePeriod
+   * **Exit condition** (both must hold for the matching bucket):
+   *   1. `submissions.length >= round-aware threshold`
+   *   2. keeper-reported `thresholdMet === true`
    *
-   * Delegates to the configured Observer (which caches DKG params). When no
-   * Observer is wired, lazily builds a single temporary one bound to this
-   * Consumer's cometRpcUrl resolution and reuses it across calls — reusing
-   * preserves the Observer's `defaultCometUrlWarned` flag so the plaintext-
-   * HTTP warning fires once per Consumer rather than once per refresh.
-   */
-  private async getEventLookback(): Promise<bigint> {
-    if (this.observer) return this.observer.getLookbackBlocks();
-    if (!this.fallbackObserver) {
-      this.fallbackObserver = new Observer({
-        network: this.network,
-        publicClient: this.publicClient,
-      });
-    }
-    return this.fallbackObserver.getLookbackBlocks();
-  }
-
-  private async fetchRegisteredValidators(
-    dkgAddress: `0x${string}`,
-  ): Promise<Map<string, Uint8Array[]>> {
-    const latestBlock = await this.publicClient.getBlockNumber();
-    const chunk = Consumer.DKG_LOGS_BLOCK_CHUNK;
-    const lookback = await this.getEventLookback();
-    const startBlock = latestBlock > lookback ? latestBlock - lookback : 0n;
-
-    // Hybrid mode (default): query CometBFT ABCI for the currently active DKG
-    // round so we can filter EVM Registered events to just that round's
-    // commPubKeys. Uses the Observer's cometRpcUrl if the caller set one,
-    // otherwise falls back to the SDK's network-specific default URL (the
-    // one-time plaintext-HTTP warning is emitted by Observer.getDKGParams,
-    // which getEventLookback() already invoked above).
-    let activeRound: number | undefined;
-    const cometRpcUrl = this.observer?.cometRpcUrl ?? Observer.DEFAULT_COMET_RPC_URL;
-    try {
-      const network = await queryLatestActiveDKGNetwork(cometRpcUrl);
-      activeRound = network.round;
-    } catch {
-      // ABCI unreachable or query failed — fall back to unfiltered scan.
-    }
-
-    const validators = new Map<string, Uint8Array[]>();
-
-    for (let from = startBlock; from <= latestBlock; from = from + chunk + 1n) {
-      const to = from + chunk > latestBlock ? latestBlock : from + chunk;
-
-      const rawLogs = await this.getLogsWithRetry(dkgAddress, from, to);
-
-      const parsed = parseEventLogs({
-        abi: dkgAbi,
-        logs: rawLogs,
-        eventName: "Registered",
-      });
-
-      for (const log of parsed) {
-        if (activeRound !== undefined && log.args.round !== activeRound) {
-          continue; // Hybrid mode: skip non-active rounds.
-        }
-        const addr = log.args.validatorAddr.toLowerCase() as `0x${string}`;
-        const keys = validators.get(addr) ?? [];
-        keys.push(toBytes(log.args.enclaveCommKey));
-        validators.set(addr, keys);
-      }
-    }
-
-    return validators;
-  }
-
-  /**
-   * getLogs wrapper with exponential-backoff retry. Public RPCs can return
-   * transient errors for individual chunk ranges (observed as
-   * "invalid block range params" on Aeneid); a narrow retry loop keeps the
-   * full-history scan robust without swallowing persistent failures.
-   */
-  private async getLogsWithRetry(
-    address: `0x${string}`,
-    fromBlock: bigint,
-    toBlock: bigint,
-  ): Promise<Awaited<ReturnType<PublicClient["getLogs"]>>> {
-    let lastError: unknown;
-    for (let attempt = 0; attempt < Consumer.GETLOGS_MAX_ATTEMPTS; attempt++) {
-      try {
-        return await this.publicClient.getLogs({ address, fromBlock, toBlock });
-      } catch (err) {
-        lastError = err;
-        if (attempt === Consumer.GETLOGS_MAX_ATTEMPTS - 1) break;
-        const delay = Consumer.GETLOGS_BACKOFF_MS * 2 ** attempt;
-        await new Promise((resolve) => setTimeout(resolve, delay));
-      }
-    }
-    throw lastError;
-  }
-
-  /**
-   * Collect at least `minPartials` partial decryptions for this vault read.
+   * Returns the first N submissions from the matching bucket (where N is
+   * the round's threshold) — extras are dropped on the floor (the keeper
+   * guarantees order, so the first N are stable).
    *
-   * In the default evm-events mode: polls `EncryptedPartialDecryptionSubmitted`
-   * events from the CDR contract, filtered by uuid, and verifies each partial's
-   * TEE signature against the validator's registered commPubKey.
+   * **Vault-state guarantees**: the vault is read **once** at the start of
+   * this call. If the vault is updated mid-poll, this call still resolves
+   * against the original ciphertext (atomic semantics). If the user wants
+   * to decrypt the new state, they must issue a fresh `accessCDR` after
+   * the update.
    *
-   * In cosmos-abci mode (when the Observer is configured with
-   * `dkgSource: "cosmos-abci"`): polls the x/dkg keeper's GetCDRPartials
-   * query via CometBFT abci_query. Signature verification is performed by
-   * the keeper on ingress (see story/client/x/dkg/keeper/dkg_handler.go
-   * PartialDecryptionSubmitted), so the SDK trusts the keeper state returned
-   * by the node — the same trust level as any EVM RPC read.
-   * The caller must supply `requesterPubKey` in this mode.
+   * **`attestationConfig`** (optional defense-in-depth): when provided,
+   * the round's validator attestation reports are verified once via
+   * {@link verifyAttestation} and a trust set is built; un-trusted
+   * validators' partials are reported via `onInvalidPartial` and excluded.
+   *
+   * @throws {@link EmptyVaultError} if the vault has never been written to
+   *   (`encryptedData` is empty bytes). Fail-fast — better UX than waiting
+   *   for the poll to time out against a non-existent bucket.
    *
    * @example
    * ```ts
    * const partials = await consumer.collectPartials({
    *   uuid: 42,
-   *   minPartials: 3,
-   *   fromBlock: startBlock,
+   *   requesterPubKey: "0x04...",
    *   timeoutMs: 60_000,
    * });
+   * // partials[i].ciphertext is the same for every i — caller can use it
+   * // for the subsequent decryptDataKey step without re-reading the chain.
    * ```
    */
   async collectPartials(params: {
     uuid: number;
-    minPartials: number;
-    fromBlock: bigint;
+    requesterPubKey: `0x${string}`;
     timeoutMs?: number;
     pollIntervalMs?: number;
-    /** Required in cosmos-abci mode; ignored in evm-events mode. */
-    requesterPubKey?: `0x${string}`;
-    /** Called when a partial fails signature verification. evm-events mode only. */
     onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
-    /** If provided, verify each validator's attestation report. Invalid attestations trigger onInvalidPartial. */
     attestationConfig?: AttestationConfig;
+    /**
+     * @internal Pre-loaded vault ciphertext from a containing call (e.g.
+     * `accessCDR`'s preflight). When set, the polling loop filters
+     * buckets against this value and skips the otherwise-mandatory
+     * vault read. This exists so a single `accessCDR` invocation can
+     * pin one vault-state snapshot across preflight + filter + decrypt
+     * (avoiding an SDK-side race when the vault is updated between
+     * those steps for an `updatable` vault). External callers should
+     * omit it — `collectPartials` will then load the vault itself and
+     * provide its own atomic snapshot.
+     */
+    pinnedCiphertext?: Uint8Array;
   }): Promise<PartialDecryptionEvent[]> {
-    if (this.observer?.dkgSource === "cosmos-abci") {
-      return this.collectPartialsFromCosmos(params);
-    }
-    return this.collectPartialsFromEvents(params);
-  }
+    const {
+      uuid,
+      requesterPubKey,
+      timeoutMs = 60_000,
+      pollIntervalMs = 3_000,
+      onInvalidPartial,
+      attestationConfig,
+      pinnedCiphertext,
+    } = params;
 
-  private async collectPartialsFromEvents(params: {
-    uuid: number;
-    minPartials: number;
-    fromBlock: bigint;
-    timeoutMs?: number;
-    pollIntervalMs?: number;
-    onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
-    attestationConfig?: AttestationConfig;
-  }): Promise<PartialDecryptionEvent[]> {
-    const { uuid, minPartials, fromBlock, timeoutMs = 60_000, pollIntervalMs = 3_000, onInvalidPartial } = params;
-    const cdrAddress = contractAddresses[this.network].cdr;
+    if (!requesterPubKey) {
+      throw new InvalidParamsError("collectPartials: requesterPubKey is required");
+    }
+
+    // Pin the vault's current ciphertext for the entire poll loop. The
+    // keeper indexes buckets by (round, ciphertext); we filter on this
+    // value so a concurrent vault update can't silently change which
+    // bucket we accept. If a containing call already pinned a snapshot
+    // (e.g. `accessCDR` did its preflight before submitting `read()`),
+    // reuse it — that closes the SDK-side race window between
+    // preflight and the read tx mining.
+    const vaultCiphertext = pinnedCiphertext ?? (await this.loadAndCheckVault(uuid));
+
+    const requesterPubKeyHex = requesterPubKey.replace(/^0x/i, "");
     const deadline = Date.now() + timeoutMs;
 
-    // Build commPubKey map from DKG Registered events (cached across calls).
-    let commPubKeyMap = await this.getCommPubKeyMap();
-    // Track which validators have already triggered a cache refresh this call,
-    // so a genuinely unknown validator can't force repeated re-scans.
-    const refreshedFor = new Set<string>();
-
-    let lastScannedBlock = fromBlock;
-    const collected = new Map<string, PartialDecryptionEvent>();
+    /** Per-round trust set; only populated when attestationConfig is set. */
+    const trustSetByRound = new Map<number, Set<string>>();
+    /** `(validator, pid)` keys we've already reported via onInvalidPartial. */
+    const reported = new Set<string>();
+    /** Last-known submission count (within the matching bucket), for the timeout error. */
+    let lastSeen = 0;
+    /** Last-known round threshold, for the timeout error. */
+    let lastNeeded = 0;
 
     while (Date.now() < deadline) {
-      const currentBlock = await this.publicClient.getBlockNumber();
-      if (currentBlock >= lastScannedBlock) {
-        // Same retry wrapper used for the DKG scan: public RPCs (notably
-        // aeneid.storyrpc.io) occasionally return "invalid block range params"
-        // for tiny ranges — a transient error we should not let surface as an
-        // accessCDR failure in the middle of the poll loop. See PERF-05 flake
-        // observed in https://github.com/piplabs/story-cdr-e2e/actions/runs/24884251274.
-        const rawLogs = await this.getLogsWithRetry(cdrAddress, lastScannedBlock, currentBlock);
-        lastScannedBlock = currentBlock + BigInt(1);
-
-        const parsed = parseEventLogs({
-          abi: cdrAbi,
-          logs: rawLogs,
-          eventName: "EncryptedPartialDecryptionSubmitted",
+      let groups: Awaited<ReturnType<typeof queryCDRPartials>> = [];
+      try {
+        groups = await queryCDRPartials({
+          apiUrl: this.apiUrl,
+          uuid,
+          requesterPubKeyHex,
         });
+      } catch {
+        // Transient REST error — retry on next poll tick.
+      }
 
-        for (const log of parsed) {
-          if (log.args.uuid === uuid) {
-            const key = `${log.args.validator}-${log.args.pid}`;
-            if (!collected.has(key)) {
-              const event: PartialDecryptionEvent = {
-                validator: log.args.validator,
-                round: log.args.round,
-                pid: log.args.pid,
-                encryptedPartial: log.args.encryptedPartial,
-                ephemeralPubKey: log.args.ephemeralPubKey,
-                pubShare: log.args.pubShare,
-                requesterPubKey: log.args.requesterPubKey,
-                uuid: log.args.uuid,
-                signature: log.args.signature,
-              };
+      // Filter to groups whose ciphertext matches the pinned vault state.
+      // If multiple match (same ciphertext, different rounds — possible when
+      // a vault stays unchanged across a DKG rollover), prefer the newest
+      // round; older-round validators may have rotated out by the time we
+      // try to combine.
+      const matching = groups
+        .filter((g) => g.submissions.length > 0 && bytesEqual(g.ciphertext, vaultCiphertext))
+        .sort((a, b) => b.round - a.round);
+      const group = matching[0];
 
-              // Verify signature — try all known commPubKeys for this validator.
-              // In hybrid mode the cached map holds only the active-round keys,
-              // so a DKG rotation that happens after the cache is built leaves
-              // every validator with stale (old-round) keys. Refreshing on any
-              // verification failure — not just on an absent validator — lets
-              // the next round's partials recover without a process restart.
-              const validatorAddr = log.args.validator.toLowerCase();
-              let commPubKeys = commPubKeyMap.get(validatorAddr);
+      if (group) {
+        lastSeen = group.submissions.length;
 
-              const tryVerifyWith = (keys: Uint8Array[] | undefined): boolean => {
-                if (!keys || keys.length === 0) return false;
-                for (let ki = keys.length - 1; ki >= 0; ki--) {
-                  if (verifyPartialSignature({
-                    round: event.round,
-                    ciphertext: toBytes(log.args.ciphertext),
-                    encryptedPartial: toBytes(event.encryptedPartial),
-                    ephemeralPubKey: toBytes(event.ephemeralPubKey),
-                    pubShare: toBytes(event.pubShare),
-                    signature: toBytes(log.args.signature),
-                    commPubKey: keys[ki],
-                  })) return true;
-                }
-                return false;
-              };
+        // Bucket-aware threshold: evaluate against the bucket's own round,
+        // not the active round (which may have advanced past the bucket
+        // mid-poll).
+        const sdkThreshold = await this.observer.getThresholdAt(group.round);
+        lastNeeded = sdkThreshold;
 
-              let valid = tryVerifyWith(commPubKeys);
+        if (group.submissions.length >= sdkThreshold && group.thresholdMet) {
+          const trustSet = attestationConfig
+            ? await this.getTrustSet(group.round, attestationConfig, trustSetByRound)
+            : undefined;
 
-              // Refresh the cache once per validator per call on any verification
-              // failure (unknown validator OR all cached keys fail). Deduped by
-              // validator address so a genuinely bad signer can't force repeated
-              // full-history rescans within a single collectPartials invocation.
-              if (!valid && !refreshedFor.has(validatorAddr)) {
-                refreshedFor.add(validatorAddr);
-                commPubKeyMap = await this.getCommPubKeyMap(true);
-                commPubKeys = commPubKeyMap.get(validatorAddr);
-                valid = tryVerifyWith(commPubKeys);
+          const accepted: PartialDecryptionEvent[] = [];
+          for (const sub of group.submissions) {
+            const event = submissionToEvent(sub, uuid);
+            if (trustSet && !trustSet.has(sub.validator)) {
+              const dedupeKey = `${sub.validator}-${sub.pid}`;
+              if (!reported.has(dedupeKey)) {
+                reported.add(dedupeKey);
+                onInvalidPartial?.(
+                  event,
+                  new Error(`attestation rejected for validator ${sub.validator}`),
+                );
               }
-
-              if (!valid) {
-                const reason = (!commPubKeys || commPubKeys.length === 0)
-                  ? `unknown validator: ${log.args.validator}`
-                  : `invalid signature from validator ${log.args.validator}`;
-                onInvalidPartial?.(event, new Error(reason));
-                continue;
-              }
-
-              collected.set(key, event);
+              continue;
             }
+            accepted.push(event);
           }
+
+          if (accepted.length >= sdkThreshold) {
+            return accepted.slice(0, sdkThreshold);
+          }
+          // Not enough trusted partials this poll — keep waiting; more
+          // validators may still submit, and the trust set is fixed for
+          // this round so newly-arrived partials reuse the same checks.
         }
       }
 
-      if (collected.size >= minPartials) {
-        return [...collected.values()].slice(0, minPartials);
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      await sleep(pollIntervalMs);
     }
 
-    throw new PartialCollectionTimeoutError(collected.size, minPartials, timeoutMs);
+    throw new PartialCollectionTimeoutError(lastSeen, lastNeeded, timeoutMs);
   }
 
-  private async collectPartialsFromCosmos(params: {
-    uuid: number;
-    minPartials: number;
-    timeoutMs?: number;
-    pollIntervalMs?: number;
-    requesterPubKey?: `0x${string}`;
-  }): Promise<PartialDecryptionEvent[]> {
-    const { uuid, minPartials, timeoutMs = 60_000, pollIntervalMs = 3_000, requesterPubKey } = params;
-    if (!requesterPubKey) {
-      throw new InvalidParamsError(
-        'collectPartials: requesterPubKey is required when observer is configured with dkgSource: "cosmos-abci"',
-      );
+  /**
+   * Read the vault's current ciphertext and reject early if it has none.
+   * Single source of truth for the `EmptyVaultError` gate, called from
+   * `accessCDR` (preflight before the fee-bearing `read()` tx) and
+   * `collectPartials` (defense-in-depth — direct callers benefit too).
+   */
+  private async loadAndCheckVault(uuid: number): Promise<Uint8Array> {
+    const vault = (await this.publicClient.readContract({
+      address: contractAddresses[this.network].cdr,
+      abi: cdrAbi,
+      functionName: "vaults",
+      args: [uuid],
+    })) as { encryptedData: `0x${string}` };
+    const ciphertext = toBytes(vault.encryptedData);
+    if (ciphertext.length === 0) {
+      throw new EmptyVaultError(uuid);
     }
-    const rpcUrl = this.observer?.cometRpcUrl;
-    if (!rpcUrl) {
-      throw new InvalidParamsError(
-        'collectPartials: observer.cometRpcUrl is required when observer is configured with dkgSource: "cosmos-abci"',
-      );
+    return ciphertext;
+  }
+
+  /**
+   * Build (and cache) the set of validators whose attestation passes the
+   * configured checks for a given round. The attestations are read from
+   * Observer's per-round cache, so this is a free hit alongside any
+   * `getRegisteredValidators({round})` call within the same flow.
+   */
+  private async getTrustSet(
+    round: number,
+    config: AttestationConfig,
+    cache: Map<number, Set<string>>,
+  ): Promise<Set<string>> {
+    const cached = cache.get(round);
+    if (cached) return cached;
+    const trusted = new Set<string>();
+    const attestations = await this.observer.getValidatorAttestations({ round });
+    for (const [addr, report] of attestations) {
+      const result = await verifyAttestation(report, config);
+      if (result.valid) trusted.add(addr);
     }
-    const requesterPubKeyHex = requesterPubKey.replace(/^0x/i, "");
-    const deadline = Date.now() + timeoutMs;
-    let lastCount = 0;
-
-    while (Date.now() < deadline) {
-      const rounds = await queryCDRPartials(rpcUrl, uuid, requesterPubKeyHex);
-
-      // Pick the highest-round bucket with submissions — that's the round
-      // this decrypt request was serviced under.
-      const active = rounds
-        .filter((r) => r.submissions.length > 0)
-        .sort((a, b) => b.round - a.round)[0];
-
-      const subs = active?.submissions ?? [];
-      lastCount = subs.length;
-
-      if (subs.length >= minPartials || (active && active.thresholdMet)) {
-        return subs.slice(0, minPartials).map((s) => {
-          const validatorHex = s.validator.startsWith("0x") ? s.validator : `0x${s.validator}`;
-          return {
-            validator: validatorHex.toLowerCase() as `0x${string}`,
-            round: s.round,
-            pid: s.pid,
-            encryptedPartial: `0x${cosmosBytesToHex(s.encryptedPartial)}` as `0x${string}`,
-            ephemeralPubKey: `0x${cosmosBytesToHex(s.ephemeralPubKey)}` as `0x${string}`,
-            pubShare: `0x${cosmosBytesToHex(s.pubShare)}` as `0x${string}`,
-            uuid,
-          };
-        });
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-    }
-
-    throw new PartialCollectionTimeoutError(lastCount, minPartials, timeoutMs);
+    cache.set(round, trusted);
+    return trusted;
   }
 
   /**
    * Decrypt collected partials and combine to recover the original data key.
+   *
+   * The TDH2 combine threshold is taken implicitly as `partials.length`:
+   * the SDK's `collectPartials` always returns exactly the threshold count
+   * needed for reconstruction, and `tdh2Combine` requires `threshold ≤
+   * partials.length`. Any value larger than `partials.length` would throw
+   * `InsufficientPartialsError`; any value smaller would discard partials
+   * the caller went to the trouble of collecting. Caller's responsibility:
+   * pass exactly the partials they want combined.
+   *
    * @example
    * ```ts
    * const dataKey = await consumer.decryptDataKey({
@@ -515,7 +386,6 @@ export class Consumer {
    *   recipientPrivKey,
    *   globalPubKey,
    *   label,
-   *   threshold: 3,
    * });
    * ```
    */
@@ -525,9 +395,8 @@ export class Consumer {
     recipientPrivKey: Uint8Array;
     globalPubKey: Uint8Array;
     label: Uint8Array;
-    threshold: number;
   }): Promise<Uint8Array> {
-    const { ciphertext, partials, recipientPrivKey, globalPubKey, label, threshold } = params;
+    const { ciphertext, partials, recipientPrivKey, globalPubKey, label } = params;
 
     const decryptedPartials: DecryptedPartial[] = await Promise.all(
       partials.map(async (p) => {
@@ -549,17 +418,25 @@ export class Consumer {
       partials: decryptedPartials,
       globalPubKey,
       label,
-      threshold,
+      threshold: partials.length,
     });
   }
 
   /**
    * Convenience: read + collect + decrypt in one call.
-   * If requesterPubKey/recipientPrivKey are omitted, an ephemeral secp256k1 keypair is generated and the private key is zeroed after use.
-   * If globalPubKey/threshold are omitted, they are auto-queried via the Observer (requires observer to be set).
+   * If `requesterPubKey`/`recipientPrivKey` are omitted, an ephemeral
+   * secp256k1 keypair is generated and the private key is zeroed after use.
+   * If `globalPubKey` is omitted, it is auto-queried via the Observer.
+   *
+   * The vault is preflight-checked with one chain read before any
+   * fee-bearing `read()` tx is submitted. For empty / non-existent
+   * vaults this throws `EmptyVaultError` synchronously (no tx, no fee).
+   *
+   * @throws {@link EmptyVaultError} if the uuid's vault has no
+   *   `encryptedData`. Raised before submitting `read()`.
+   *
    * @example
    * ```ts
-   * // Simplified — keys and DKG params auto-managed:
    * const { dataKey, txHash } = await consumer.accessCDR({
    *   uuid: 42,
    *   accessAuxData: "0x",
@@ -572,17 +449,21 @@ export class Consumer {
     requesterPubKey?: `0x${string}`;
     recipientPrivKey?: Uint8Array;
     globalPubKey?: Uint8Array;
-    threshold?: number;
     timeoutMs?: number;
+    /** See {@link read}'s `feeOverride` — same strict-equality semantics. */
     feeOverride?: bigint;
     onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
+    attestationConfig?: AttestationConfig;
   }): Promise<{ dataKey: Uint8Array; txHash: `0x${string}` }> {
-    // Validate key pair: both must be provided or both omitted
-    if ((params.requesterPubKey && !params.recipientPrivKey) || (!params.requesterPubKey && params.recipientPrivKey)) {
-      throw new InvalidParamsError("requesterPubKey and recipientPrivKey must both be provided or both omitted");
+    if (
+      (params.requesterPubKey && !params.recipientPrivKey) ||
+      (!params.requesterPubKey && params.recipientPrivKey)
+    ) {
+      throw new InvalidParamsError(
+        "requesterPubKey and recipientPrivKey must both be provided or both omitted",
+      );
     }
 
-    // Auto-generate ephemeral keypair if not provided
     let recipientPrivKey = params.recipientPrivKey;
     let requesterPubKey = params.requesterPubKey;
     let ephemeralGenerated = false;
@@ -593,32 +474,20 @@ export class Consumer {
       ephemeralGenerated = true;
     }
 
-    // Auto-query globalPubKey and threshold from Observer if not provided
-    let globalPubKey = params.globalPubKey;
-    let threshold = params.threshold;
-    if (!globalPubKey || threshold === undefined) {
-      if (!this.observer) {
-        throw new ObserverRequiredError();
-      }
-      [globalPubKey, threshold] = await Promise.all([
-        globalPubKey ? Promise.resolve(globalPubKey) : this.observer.getGlobalPubKey(),
-        threshold !== undefined ? Promise.resolve(threshold) : this.observer.getThreshold(),
-      ]);
-    }
+    const globalPubKey =
+      params.globalPubKey ?? (await this.observer.getGlobalPubKey());
 
     try {
-      const vault = await this.publicClient.readContract({
-        address: contractAddresses[this.network].cdr,
-        abi: cdrAbi,
-        functionName: "vaults",
-        args: [params.uuid],
-      });
-      const vaultResult = vault as { encryptedData: `0x${string}` };
-      const encryptedData = toBytes(vaultResult.encryptedData);
+      // Preflight the vault state BEFORE submitting a fee-bearing `read()`
+      // tx and pin the ciphertext for the whole flow. Reusing this single
+      // snapshot for the bucket filter (via `pinnedCiphertext`) and the
+      // decrypt step closes the SDK-side race that would otherwise exist
+      // between this preflight, the read tx mining, and a later vault
+      // re-read inside `collectPartials` — see #79.
+      const vaultCiphertext = await this.loadAndCheckVault(params.uuid);
 
       const label = uuidToLabel(params.uuid);
 
-      const fromBlock = await this.publicClient.getBlockNumber();
       const { txHash } = await this.read({
         uuid: params.uuid,
         accessAuxData: params.accessAuxData,
@@ -628,20 +497,19 @@ export class Consumer {
 
       const partials = await this.collectPartials({
         uuid: params.uuid,
-        minPartials: threshold,
-        fromBlock,
-        timeoutMs: params.timeoutMs,
         requesterPubKey,
+        timeoutMs: params.timeoutMs,
         onInvalidPartial: params.onInvalidPartial,
+        attestationConfig: params.attestationConfig,
+        pinnedCiphertext: vaultCiphertext,
       });
 
       const dataKey = await this.decryptDataKey({
-        ciphertext: { raw: encryptedData, label },
+        ciphertext: { raw: vaultCiphertext, label },
         partials,
         recipientPrivKey,
         globalPubKey,
         label,
-        threshold,
       });
 
       return { dataKey, txHash };
@@ -653,8 +521,8 @@ export class Consumer {
   }
 
   /**
-   * Convenience: access vault, parse CID + key payload, download from storage, and decrypt file.
-   * Key/threshold params are optional — see accessCDR() for auto-generation behavior.
+   * Convenience: access vault, parse CID + key payload, download from
+   * storage, and decrypt file.
    * @example
    * ```ts
    * const { content, cid } = await consumer.downloadFile({
@@ -670,11 +538,12 @@ export class Consumer {
     requesterPubKey?: `0x${string}`;
     recipientPrivKey?: Uint8Array;
     globalPubKey?: Uint8Array;
-    threshold?: number;
     storageProvider: StorageProvider;
     timeoutMs?: number;
+    /** See {@link read}'s `feeOverride` — same strict-equality semantics. */
     feeOverride?: bigint;
     onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
+    attestationConfig?: AttestationConfig;
     /** Skip CID integrity verification of downloaded file (default: false). */
     skipCidVerification?: boolean;
   }): Promise<{
@@ -682,55 +551,75 @@ export class Consumer {
     cid: string;
     txHash: `0x${string}`;
   }> {
-    // Step 1: Access vault to get decrypted payload
     const { dataKey: payloadBytes, txHash } = await this.accessCDR({
       uuid: params.uuid,
       accessAuxData: params.accessAuxData,
       requesterPubKey: params.requesterPubKey,
       recipientPrivKey: params.recipientPrivKey,
       globalPubKey: params.globalPubKey,
-      threshold: params.threshold,
       timeoutMs: params.timeoutMs,
       feeOverride: params.feeOverride,
       onInvalidPartial: params.onInvalidPartial,
+      attestationConfig: params.attestationConfig,
     });
 
-    // Step 2: Parse JSON payload
     const payloadStr = new TextDecoder().decode(payloadBytes);
     const { cid, key: keyHex } = JSON.parse(payloadStr) as { cid: string; key: `0x${string}` };
     const key = fromHex(keyHex, "bytes");
 
-    // Step 3: Download encrypted file from storage
     const encryptedFile = await params.storageProvider.download(cid);
 
-    // Step 4: Verify CID integrity (if multiformats is available)
     if (!params.skipCidVerification) {
-      let cidMod: any;
-      let hashMod: any;
+      let cidMod: typeof import("multiformats/cid") | undefined;
+      let hashMod: typeof import("multiformats/hashes/sha2") | undefined;
       try {
         cidMod = await import("multiformats/cid");
         hashMod = await import("multiformats/hashes/sha2");
       } catch {
-        // multiformats not installed — skip verification
+        // multiformats not installed — skip verification.
       }
 
       if (cidMod && hashMod) {
-        const CID = cidMod.CID;
-        const sha256 = hashMod.sha256;
-
-        const expectedCid = CID.parse(cid);
-        const hash = await sha256.digest(encryptedFile);
-        const actualCid = CID.create(expectedCid.version, expectedCid.code, hash);
-
+        const expectedCid = cidMod.CID.parse(cid);
+        const hash = await hashMod.sha256.digest(encryptedFile);
+        const actualCid = cidMod.CID.create(expectedCid.version, expectedCid.code, hash);
         if (!expectedCid.equals(actualCid)) {
           throw new CidIntegrityError(cid, String(actualCid));
         }
       }
     }
 
-    // Step 5: Decrypt file
     const content = decryptFile({ ciphertext: encryptedFile, key });
-
     return { content, cid, txHash };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function submissionToEvent(
+  sub: DKGPartialDecryptionSubmission,
+  uuid: number,
+): PartialDecryptionEvent {
+  return {
+    validator: sub.validator,
+    round: sub.round,
+    pid: sub.pid,
+    encryptedPartial: toHex(sub.encryptedPartial),
+    ephemeralPubKey: toHex(sub.ephemeralPubKey),
+    pubShare: toHex(sub.pubShare),
+    uuid,
+    ciphertext: toHex(sub.ciphertext),
+  };
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

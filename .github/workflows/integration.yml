@@ -1,0 +1,167 @@
+name: Integration
+
+# Default to read-only token; jobs that need more should override.
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_network:
+        type: choice
+        description: Network to test against
+        options: [devnet, aeneid]
+        default: devnet
+      run_integration:
+        type: boolean
+        description: Run integration suites (SDK + CLI + examples)
+        default: true
+      run_stress:
+        type: boolean
+        description: Run 1h stress suite (DevNet only)
+        default: false
+  pull_request:
+    branches: [main]
+    paths:
+      # SDK and its workspace deps — anything that affects what `pnpm build`
+      # produces or how the SDK's runtime behaves.
+      - 'packages/sdk/**'
+      - 'packages/crypto/**'
+      - 'packages/contracts/**'
+      - 'apps/cli/**'
+      - 'apps/examples/**'
+      # Workspace-level inputs. A change to root config or the lockfile can
+      # break `pnpm install` / `pnpm build` even if no source code under
+      # packages/* or apps/* moved.
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'tsconfig.base.json'
+      - '.github/workflows/integration.yml'
+
+# PR runs cancel prior runs of the same PR; manual runs don't get cancelled
+# (in particular a 1h stress run shouldn't be killed by a follow-up dispatch).
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('integration-pr-{0}', github.event.pull_request.number) || format('integration-manual-{0}', inputs.target_network) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      network: ${{ steps.resolve.outputs.network }}
+      run_integration: ${{ steps.resolve.outputs.run_integration }}
+      run_stress: ${{ steps.resolve.outputs.run_stress }}
+    steps:
+      - id: resolve
+        name: Resolve effective inputs
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "network=${{ inputs.target_network }}" >> $GITHUB_OUTPUT
+            echo "run_integration=${{ inputs.run_integration }}" >> $GITHUB_OUTPUT
+            echo "run_stress=${{ inputs.run_stress }}" >> $GITHUB_OUTPUT
+          else
+            # PR trigger: always devnet, integration only, stress disabled.
+            echo "network=devnet" >> $GITHUB_OUTPUT
+            echo "run_integration=true" >> $GITHUB_OUTPUT
+            echo "run_stress=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Validate (stress is DevNet-only)
+        if: ${{ steps.resolve.outputs.run_stress == 'true' && steps.resolve.outputs.network != 'devnet' }}
+        run: |
+          echo "::error::run_stress=true but network=${{ steps.resolve.outputs.network }}; stress is DevNet-only"
+          exit 1
+
+  integration:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.run_integration == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      NETWORK: ${{ needs.prepare.outputs.network }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+      - run: pnpm install
+
+      # Workspace deps (`@piplabs/cdr-crypto`, `@piplabs/cdr-contracts`)
+      # resolve via `main: dist/index.js`; without a build, vite fails to
+      # resolve them on a fresh CI checkout.
+      - run: pnpm build
+
+      - name: Configure network env
+        run: |
+          case "$NETWORK" in
+            devnet)
+              echo "CDR_API_URL=http://172.207.250.203:1317" >> $GITHUB_ENV
+              echo "CDR_RPC_URL=http://172.207.250.203:8545" >> $GITHUB_ENV
+              echo "CDR_TEST_PRIVATE_KEY=${{ secrets.CDR_DEVNET_TEST_PRIVATE_KEY }}" >> $GITHUB_ENV
+              ;;
+            aeneid)
+              echo "CDR_API_URL=http://172.192.41.96:1317" >> $GITHUB_ENV
+              echo "CDR_RPC_URL=https://aeneid.storyrpc.io" >> $GITHUB_ENV
+              echo "CDR_TEST_PRIVATE_KEY=${{ secrets.CDR_AENEID_TEST_PRIVATE_KEY }}" >> $GITHUB_ENV
+              ;;
+          esac
+
+      - name: Verify env populated
+        run: |
+          if [ -z "$CDR_TEST_PRIVATE_KEY" ]; then
+            echo "::error::CDR_TEST_PRIVATE_KEY is empty (likely missing repo secret for $NETWORK)"
+            exit 1
+          fi
+
+      # All three suites share anvil-0 (DevNet) or the same wallet (Aeneid),
+      # so they must run sequentially — parallel would collide on the funder
+      # nonce stream.
+      - name: SDK integration
+        working-directory: packages/sdk
+        run: pnpm test:integration
+
+      - name: CLI integration
+        working-directory: apps/cli
+        run: pnpm test:integration
+
+      - name: Examples integration
+        working-directory: apps/examples
+        run: pnpm test:integration
+
+  stress:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.run_stress == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      NETWORK: ${{ needs.prepare.outputs.network }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+      - run: pnpm install
+      - run: pnpm build
+
+      - name: Configure DevNet env
+        run: |
+          echo "CDR_API_URL=http://172.207.250.203:1317" >> $GITHUB_ENV
+          echo "CDR_RPC_URL=http://172.207.250.203:8545" >> $GITHUB_ENV
+          echo "CDR_TEST_PRIVATE_KEY=${{ secrets.CDR_DEVNET_TEST_PRIVATE_KEY }}" >> $GITHUB_ENV
+
+      - name: Run stress (1h)
+        working-directory: packages/sdk
+        run: pnpm test:stress
+
+      - name: Upload stress log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cdr-stress-log-${{ github.run_id }}
+          path: /tmp/cdr-stress.log
+          retention-days: 14

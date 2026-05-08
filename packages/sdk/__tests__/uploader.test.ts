@@ -9,6 +9,20 @@ vi.mock("@piplabs/cdr-crypto", () => ({
 
 import { Uploader } from "../src/uploader.js";
 import { tdh2Encrypt } from "@piplabs/cdr-crypto";
+import { ContentSizeExceededError } from "../src/errors.js";
+import type { Observer } from "../src/observer.js";
+
+/**
+ * Minimal Observer stub for Uploader unit tests. Uploader consults Observer
+ * for `maxEncryptedDataSize` (the size-validation gate in `write`) and for
+ * `getGlobalPubKey` (the auto-query fallback when callers omit globalPubKey).
+ */
+function fakeObserver(opts: { maxSize?: bigint; globalPubKey?: Uint8Array } = {}): Observer {
+  return {
+    getMaxEncryptedDataSize: vi.fn().mockResolvedValue(opts.maxSize ?? 10_000n),
+    getGlobalPubKey: vi.fn().mockResolvedValue(opts.globalPubKey ?? new Uint8Array([0xaa, 0xbb])),
+  } as unknown as Observer;
+}
 
 // Build a properly ABI-encoded VaultAllocated log that viem's parseEventLogs can decode.
 // All fields in VaultAllocated are non-indexed, so they live entirely in `data`.
@@ -81,6 +95,7 @@ describe("Uploader", () => {
       network: "testnet",
       publicClient,
       walletClient,
+      observer: fakeObserver(),
     });
 
     const result = await uploader.allocate({
@@ -109,6 +124,7 @@ describe("Uploader", () => {
       network: "testnet",
       publicClient,
       walletClient,
+      observer: fakeObserver(),
     });
 
     const result = await uploader.allocate({
@@ -135,6 +151,7 @@ describe("Uploader", () => {
       network: "testnet",
       publicClient,
       walletClient,
+      observer: fakeObserver(),
     });
 
     const result = await uploader.write({
@@ -158,6 +175,7 @@ describe("Uploader", () => {
       network: "testnet",
       publicClient,
       walletClient,
+      observer: fakeObserver(),
     });
 
     await uploader.write({
@@ -181,6 +199,7 @@ describe("Uploader", () => {
       network: "testnet",
       publicClient,
       walletClient,
+      observer: fakeObserver(),
     });
 
     await expect(
@@ -196,12 +215,18 @@ describe("Uploader", () => {
     ).rejects.toThrow("VaultAllocated event not found in transaction logs");
   });
 
-  it("encryptDataKey delegates to tdh2Encrypt with correct args", async () => {
+  it("encryptDataKey delegates to tdh2Encrypt with correct args (explicit globalPubKey)", async () => {
     const { publicClient, walletClient } = mockClients();
     const mockCiphertext = { raw: new Uint8Array([1, 2, 3]), label: new Uint8Array([4, 5]) };
     vi.mocked(tdh2Encrypt).mockResolvedValueOnce(mockCiphertext);
 
-    const uploader = new Uploader({ network: "testnet", publicClient, walletClient });
+    const observer = fakeObserver();
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer,
+    });
     const dataKey = new Uint8Array([10, 20, 30]);
     const globalPubKey = new Uint8Array([99]);
     const label = new TextEncoder().encode("test-label");
@@ -213,5 +238,79 @@ describe("Uploader", () => {
     expect(callArgs.globalPubKey).toBe(globalPubKey);
     expect(callArgs.label).toEqual(label);
     expect(result).toBe(mockCiphertext);
+
+    // Explicit caller bypass: Observer is NOT consulted.
+    expect(observer.getGlobalPubKey).not.toHaveBeenCalled();
+  });
+
+  it("encryptDataKey auto-queries Observer.getGlobalPubKey when globalPubKey is omitted", async () => {
+    const { publicClient, walletClient } = mockClients();
+    const mockCiphertext = { raw: new Uint8Array([7, 8, 9]), label: new Uint8Array([10]) };
+    vi.mocked(tdh2Encrypt).mockResolvedValueOnce(mockCiphertext);
+
+    const fetchedKey = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+    const observer = fakeObserver({ globalPubKey: fetchedKey });
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer,
+    });
+    const dataKey = new Uint8Array([1, 2]);
+    const label = new TextEncoder().encode("auto-fallback");
+    const result = await uploader.encryptDataKey({ dataKey, label });
+
+    expect(observer.getGlobalPubKey).toHaveBeenCalledOnce();
+    const callArgs = vi.mocked(tdh2Encrypt).mock.calls[0][0];
+    expect(callArgs.globalPubKey).toBe(fetchedKey);
+    expect(result).toBe(mockCiphertext);
+  });
+
+  it("write throws ContentSizeExceededError when encryptedData exceeds maxEncryptedDataSize", async () => {
+    const { publicClient, walletClient } = mockClients();
+    // 5-byte limit; the input below is 8 bytes.
+    const observer = fakeObserver({ maxSize: 5n });
+
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer,
+    });
+
+    await expect(
+      uploader.write({
+        uuid: 1,
+        accessAuxData: "0x",
+        encryptedData: "0xdeadbeefcafe1234",
+        feeOverride: 0n, // skip the readContract for writeFee
+      }),
+    ).rejects.toThrow(ContentSizeExceededError);
+
+    // No tx ever submitted — fail-fast before writeContract.
+    expect(walletClient.writeContract).not.toHaveBeenCalled();
+    expect(observer.getMaxEncryptedDataSize).toHaveBeenCalledOnce();
+  });
+
+  it("write passes when encryptedData is within maxEncryptedDataSize", async () => {
+    const { publicClient, walletClient } = mockClients();
+    const observer = fakeObserver({ maxSize: 100n });
+    walletClient.writeContract.mockResolvedValueOnce("0xtxh" as `0x${string}`);
+
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer,
+    });
+
+    await uploader.write({
+      uuid: 1,
+      accessAuxData: "0x",
+      encryptedData: "0xdeadbeef", // 4 bytes
+      feeOverride: 0n,
+    });
+
+    expect(walletClient.writeContract).toHaveBeenCalledOnce();
   });
 });

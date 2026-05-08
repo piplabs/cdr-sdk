@@ -3,16 +3,25 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "lint": "tsc --noEmit",
     "upload": "tsx upload-cdr.ts",
     "access": "tsx access-cdr.ts",
     "query": "tsx query-dkg-state.ts",
-    "e2e": "tsx e2e-demo.ts"
+    "e2e": "tsx e2e-demo.ts",
+    "test:integration": "pnpm clean && pnpm build && vitest run __integration__"
   },
   "dependencies": {
+    "@noble/curves": "^1.4",
     "@piplabs/cdr-sdk": "workspace:*",
     "viem": "^2.47.6"
   },
   "devDependencies": {
-    "tsx": "^4"
+    "@types/node": "^20",
+    "execa": "^8",
+    "tsx": "^4",
+    "typescript": "^5.5",
+    "vitest": "^2"
   }
 }

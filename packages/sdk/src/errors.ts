@@ -90,3 +90,14 @@ export class ContentSizeExceededError extends CDRError {
     this.max = max;
   }
 }
+
+export class EmptyVaultError extends CDRError {
+  uuid: number;
+  constructor(uuid: number) {
+    super(
+      `Vault ${uuid} has no data (encryptedData is empty); upload first or verify the uuid`,
+      "EMPTY_VAULT",
+    );
+    this.uuid = uuid;
+  }
+}
