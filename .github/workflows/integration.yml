@@ -438,64 +438,96 @@ jobs:
           }
 
           # ─── Perf-stats table (B): glob /tmp/perf-stats-*.json ────────────────
+          # One row PER (suite, op) tuple. For a suite that only does
+          # accessCDR (e.g. 100w-shared / 1000w-perf) there's a single
+          # `access` row. For suites that do both (100w-fresh, stress)
+          # both an `upload` row and an `access` row appear so the
+          # reader doesn't have to mentally separate the two latency
+          # paths — and a separate extras block below covers anything
+          # that doesn't fit the per-op latency shape (stress cycle
+          # counters etc.).
+          #
+          # `Wall clock`, `failed`, and `refund` are suite-level totals
+          # (not per-op) — emitted only on the suite's FIRST row, with
+          # `—` on subsequent op rows of the same suite. This avoids
+          # double-counting failures or implying access-only refund.
           render_perf_table() {
             shopt -s nullglob
             local files=(/tmp/perf-stats-*.json)
             shopt -u nullglob
             [ "${#files[@]}" -gt 0 ] || { echo "_(no perf-stats output produced — nothing to summarize)_"; echo ""; return; }
-            echo "Latencies are per-wallet (or per-cycle for the stress suite). All percentiles are nearest-rank, no interpolation."
+            echo "**One row per (suite, operation).** The \`Op\` column is the operation being timed —"
+            echo "\`upload\` = \`uploadCDR\` (allocate + write txs); \`access\` = \`accessCDR\` (read tx + validator partial-collection + decrypt). Suites that do both emit two rows so upload + access latencies are side-by-side."
             echo ""
-            echo "> **stress row caveat:** the \`Wallets\` column is the **concurrency** (10), not the cycle count, and \`failed\` counts **failed cycles**, not failed wallets — see the \`stress\` extras block below for total/failed cycle counts."
+            echo "Latencies are **per-wallet** (or per-cycle for stress). All percentiles are nearest-rank, no interpolation."
+            echo "Suite-level totals (\`Wall clock\`, \`failed\`, \`refund\`) appear only on each suite's first row."
             echo ""
-            echo "| Suite | Wallets | Wall clock | min | p50 | mean | p95 | p99 | max | failed | refund |"
-            echo "|---|---|---|---|---|---|---|---|---|---|---|"
+            echo "> **stress row caveat:** the \`Wallets\` column is **concurrency** (10), not the cycle count, and \`failed\` counts **failed cycles**, not failed wallets — see the stress extras block below for total/failed cycle counts."
+            echo ""
+            echo "| Suite | Op | Wallets | min | p50 | mean | p95 | p99 | max | Wall clock | failed | refund |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
             for f in "${files[@]}"; do
+              # Emit upload row first (chronologically upload precedes access
+              # within a cycle), then access row. Suite-level columns —
+              # Wall clock / failed / refund — go on the FIRST row of the
+              # suite; subsequent rows get `—` to avoid double-counting.
               jq -r '
                 def humanMs: if . == null or . == 0 then "—" else
                   if . < 1000 then (. | tostring) + "ms"
                   else ((. / 1000 * 10 | floor) / 10 | tostring) + "s"
                   end
                 end;
-                def humanWei: if . == null then "—" else
-                  ((. | tonumber) / 1e18 | tostring | (. + "0000")[0:6]) + " IP"
-                end;
-                # `accessMs` is the canonical latency. If absent, fall back to uploadMs.
-                ((.accessMs // .uploadMs) // {}) as $lat |
-                "| " + .label
-                + " | " + (.wallets | tostring)
-                + " | " + (.wall_clock_ms | humanMs)
-                + " | " + ($lat.min_ms // 0 | humanMs)
-                + " | " + ($lat.p50_ms // 0 | humanMs)
-                + " | " + ($lat.mean_ms // 0 | humanMs)
-                + " | " + ($lat.p95_ms // 0 | humanMs)
-                + " | " + ($lat.p99_ms // 0 | humanMs)
-                + " | " + ($lat.max_ms // 0 | humanMs)
-                + " | " + (.failed | tostring)
-                + " | " + (if .refund == null then "—"
-                           else (.refund.refunded_wei | humanWei) + " / " + (.refund.funded_wei | humanWei)
-                           end)
+                def fmtIp:
+                  ((. | tonumber) / 1e18) as $ip |
+                  ($ip * 10000 | floor) as $n |
+                  ($n / 10000 | floor | tostring) as $whole |
+                  ($n % 10000 | tostring) as $fracraw |
+                  ("0000" + $fracraw)[-4:] as $frac |
+                  $whole + "." + $frac + " IP";
+                def refundCell:
+                  if . == null then "—"
+                  else (.refunded_wei | fmtIp) + " / " + (.funded_wei | fmtIp)
+                  end;
+                # Ordered list of (op_name, stats) pairs for this suite,
+                # filtered to only those present. Upload first if present.
+                [
+                  (if .uploadMs != null then {op: "upload", lat: .uploadMs} else empty end),
+                  (if .accessMs != null then {op: "access", lat: .accessMs} else empty end)
+                ] as $ops |
+                # Suite-level summary columns are emitted on row 0 only.
+                ([$ops | length] | add) as $n_ops |
+                . as $self |
+                $ops | to_entries[] |
+                .value as $row |
+                .key as $i |
+                "| " + $self.label
+                + " | " + $row.op
+                + " | " + ($self.wallets | tostring)
+                + " | " + ($row.lat.min_ms  // 0 | humanMs)
+                + " | " + ($row.lat.p50_ms  // 0 | humanMs)
+                + " | " + ($row.lat.mean_ms // 0 | humanMs)
+                + " | " + ($row.lat.p95_ms  // 0 | humanMs)
+                + " | " + ($row.lat.p99_ms  // 0 | humanMs)
+                + " | " + ($row.lat.max_ms  // 0 | humanMs)
+                + " | " + (if $i == 0 then ($self.wall_clock_ms | humanMs) else "—" end)
+                + " | " + (if $i == 0 then ($self.failed | tostring)       else "—" end)
+                + " | " + (if $i == 0 then ($self.refund | refundCell)     else "—" end)
                 + " |"
               ' "$f"
             done
             echo ""
-            # Per-suite extras (e.g. stress cycles, upload p50 when distinct from access)
+            # Suite-specific extras (stress cycles + failure rate etc.) —
+            # upload p50/p95/mean is no longer here since it's a first-class
+            # row in the table above.
             for f in "${files[@]}"; do
               local label
               label=$(jq -r '.label' "$f")
-              local up_p50
-              up_p50=$(jq -r '.uploadMs.p50_ms // empty' "$f")
               local extra
               extra=$(jq -r '.extra // empty | to_entries[]? | "  - " + .key + " = " + (.value | tostring)' "$f")
-              if [ -n "$up_p50" ] || [ -n "$extra" ]; then
+              if [ -n "$extra" ]; then
                 echo "**${label}** extras:"
                 echo ""
-                [ -n "$up_p50" ] && {
-                  local up_p95 up_mean
-                  up_p95=$(jq -r '.uploadMs.p95_ms // 0' "$f")
-                  up_mean=$(jq -r '.uploadMs.mean_ms // 0' "$f")
-                  echo "  - upload p50/p95/mean = ${up_p50}ms / ${up_p95}ms / ${up_mean}ms"
-                }
-                [ -n "$extra" ] && echo "$extra"
+                echo "$extra"
                 echo ""
               fi
             done
