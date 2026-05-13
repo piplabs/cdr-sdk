@@ -365,11 +365,17 @@ jobs:
               echo ""
               return
             fi
-            local files_passed files_failed tests_passed tests_failed dur_ms dur_s
+            local files_passed files_failed files_skipped tests_passed tests_failed tests_skipped dur_ms dur_s
             files_passed=$(jq -r '.numPassedTestSuites // 0' "$json")
             files_failed=$(jq -r '.numFailedTestSuites // 0' "$json")
+            # `numPendingTestSuites` = test files where every test was skipped
+            # (e.g. a whole describe gated off via `describe.skipIf`).
+            files_skipped=$(jq -r '.numPendingTestSuites // 0' "$json")
             tests_passed=$(jq -r '.numPassedTests // 0' "$json")
             tests_failed=$(jq -r '.numFailedTests // 0' "$json")
+            # `numPendingTests` = `.skip` or `skipIf`-gated. `numTodoTests`
+            # = `.todo` placeholders. Both render as ⏭️.
+            tests_skipped=$(jq -r '(.numPendingTests // 0) + (.numTodoTests // 0)' "$json")
             dur_ms=$(jq -r '
               ([.testResults[].endTime // 0] | max) as $end
               | (.startTime // 0) as $start
@@ -377,8 +383,8 @@ jobs:
             ' "$json")
             dur_s=$(awk -v ms="$dur_ms" 'BEGIN { printf "%.1f", ms / 1000 }')
             echo '```'
-            echo "Test Files  ${files_passed} passed | ${files_failed} failed"
-            echo "     Tests  ${tests_passed} passed | ${tests_failed} failed"
+            echo "Test Files  ${files_passed} passed | ${files_failed} failed | ${files_skipped} skipped"
+            echo "     Tests  ${tests_passed} passed | ${tests_failed} failed | ${tests_skipped} skipped"
             echo "  Duration  ${dur_s}s"
             echo '```'
             echo ""
@@ -410,7 +416,7 @@ jobs:
                 + " |"
             ' "$json")
             if [ -n "$rows" ]; then
-              echo "<details><summary>Per-case results (${tests_passed}✅ ${tests_failed}❌)</summary>"
+              echo "<details><summary>Per-case results (${tests_passed}✅ ${tests_failed}❌ ${tests_skipped}⏭️)</summary>"
               echo ""
               echo "| File | Test | Status | Duration |"
               echo "|---|---|---|---|"
