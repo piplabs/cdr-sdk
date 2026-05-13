@@ -426,6 +426,8 @@ jobs:
             [ "${#files[@]}" -gt 0 ] || { echo "_(no perf-stats output produced — nothing to summarize)_"; echo ""; return; }
             echo "Latencies are per-wallet (or per-cycle for the stress suite). All percentiles are nearest-rank, no interpolation."
             echo ""
+            echo "> **stress row caveat:** the \`Wallets\` column is the **concurrency** (10), not the cycle count, and \`failed\` counts **failed cycles**, not failed wallets — see the \`stress\` extras block below for total/failed cycle counts."
+            echo ""
             echo "| Suite | Wallets | Wall clock | min | p50 | mean | p95 | p99 | max | failed | refund |"
             echo "|---|---|---|---|---|---|---|---|---|---|---|"
             for f in "${files[@]}"; do
@@ -518,10 +520,6 @@ jobs:
             echo "| Wall time (s) | — | — | $ELAPSED_S |"
             echo ""
             echo "_DKG stage codes: 1 = Registration, 2 = Dealing, 3 = Finalization, 4 = Active._"
-            if [ "$ROUND_DELTA" != "?" ] && [ "$ROUND_DELTA" -gt 0 ]; then
-              echo ""
-              echo "> ⚠️ **DKG round rotated mid-run** (${ROUND_PRE} → ${ROUND_POST}). Vault reads spanning rotation may exercise the bucket-round filter (#75)."
-            fi
             echo ""
 
             echo "### Performance metrics"
