@@ -60,10 +60,15 @@ jobs:
 
       - name: Write unit-test summary
         if: always()
+        # head_ref is attacker-controlled — pass via env so the shell
+        # sees the value as a quoted parameter, not as script (Wiz SAST
+        # finding on PR #83).
         env:
           SDK_OUTCOME: ${{ steps.unit_sdk.outcome }}
           CRYPTO_OUTCOME: ${{ steps.unit_crypto.outcome }}
           CLI_OUTCOME: ${{ steps.unit_cli.outcome }}
+          GH_BRANCH: ${{ github.head_ref || github.ref_name }}
+          GH_SHA: ${{ github.sha }}
         run: |
           strip_ansi() { sed -E $'s/\x1b\\[[0-9;]*[a-zA-Z]//g'; }
           icon() {
@@ -153,8 +158,8 @@ jobs:
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Branch | \`${{ github.head_ref || github.ref_name }}\` |"
-            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Branch | \`${GH_BRANCH}\` |"
+            echo "| Commit | \`${GH_SHA}\` |"
             echo ""
             echo "### Per-package results"
             echo ""

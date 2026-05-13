@@ -98,17 +98,28 @@ jobs:
 
       - name: Write run summary
         if: always()
+        # head_ref is attacker-controlled (any PR opener picks the
+        # branch name); shell-interpolating it directly is a known
+        # script-injection vector (Wiz SAST flagged this on PR #83).
+        # Pipe via env vars so values are quoted by the shell, not
+        # by the ${{ }} expression engine.
+        env:
+          GH_EVENT_NAME: ${{ github.event_name }}
+          GH_BRANCH: ${{ github.head_ref || github.ref_name }}
+          GH_SHA: ${{ github.sha }}
+          NETWORK: ${{ steps.resolve.outputs.network }}
+          TEST_SUITE: ${{ steps.resolve.outputs.test_suite }}
         run: |
           {
             echo "## Run configuration"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Trigger | \`${{ github.event_name }}\` |"
-            echo "| Branch | \`${{ github.head_ref || github.ref_name }}\` |"
-            echo "| Commit | \`${{ github.sha }}\` |"
-            echo "| Network | \`${{ steps.resolve.outputs.network }}\` |"
-            echo "| Test suite | \`${{ steps.resolve.outputs.test_suite }}\` |"
+            echo "| Trigger | \`${GH_EVENT_NAME}\` |"
+            echo "| Branch | \`${GH_BRANCH}\` |"
+            echo "| Commit | \`${GH_SHA}\` |"
+            echo "| Network | \`${NETWORK}\` |"
+            echo "| Test suite | \`${TEST_SUITE}\` |"
             echo ""
           } >> $GITHUB_STEP_SUMMARY
 
@@ -260,6 +271,11 @@ jobs:
       # ─── Summary (always) ─────────────────────────────────────────────────────
       - name: Write integration summary
         if: always()
+        # head_ref is attacker-controlled — pass via env (NOT inline
+        # interpolation) so the shell sees the value as a quoted
+        # parameter, not as part of the script. Same reasoning for
+        # the GH context fields below (sha + run_id are GH-controlled
+        # but threaded through env for consistency).
         env:
           SDK_OUTCOME: ${{ steps.sdk.outcome }}
           CLI_OUTCOME: ${{ steps.cli.outcome }}
@@ -269,6 +285,9 @@ jobs:
           ROUND_PRE: ${{ steps.env_pre.outputs.round }}
           STAGE_PRE: ${{ steps.env_pre.outputs.stage }}
           TS_PRE:    ${{ steps.env_pre.outputs.ts }}
+          GH_BRANCH: ${{ github.head_ref || github.ref_name }}
+          GH_SHA: ${{ github.sha }}
+          GH_RUN_ID: ${{ github.run_id }}
         run: |
           set -u
           strip_ansi() { sed -E $'s/\x1b\\[[0-9;]*[a-zA-Z]//g'; }
@@ -503,10 +522,10 @@ jobs:
             echo "| Test suite | \`${TEST_SUITE}\` |"
             echo "| CDR_API_URL | \`${CDR_API_URL}\` |"
             echo "| CDR_RPC_URL | \`${CDR_RPC_URL}\` |"
-            echo "| Branch | \`${{ github.head_ref || github.ref_name }}\` |"
-            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Branch | \`${GH_BRANCH}\` |"
+            echo "| Commit | \`${GH_SHA}\` |"
             if [ "$RUN_STRESS" = "true" ]; then
-              echo "| Stress log artifact | \`cdr-stress-log-${{ github.run_id }}\` (14-day retention) |"
+              echo "| Stress log artifact | \`cdr-stress-log-${GH_RUN_ID}\` (14-day retention) |"
             fi
             echo ""
 
