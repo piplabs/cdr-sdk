@@ -73,6 +73,35 @@ jobs:
           echo "::error::run_stress=true but network=${{ steps.resolve.outputs.network }}; stress is DevNet-only"
           exit 1
 
+      - name: Write run summary
+        if: always()
+        run: |
+          {
+            echo "## Run configuration"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Trigger | \`${{ github.event_name }}\` |"
+            echo "| Branch | \`${{ github.ref_name }}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Network | \`${{ steps.resolve.outputs.network }}\` |"
+            echo "| Run integration suites | \`${{ steps.resolve.outputs.run_integration }}\` |"
+            echo "| Run 1h stress suite | \`${{ steps.resolve.outputs.run_stress }}\` |"
+            echo ""
+            echo "### Downstream jobs"
+            echo ""
+            if [ "${{ steps.resolve.outputs.run_integration }}" = "true" ]; then
+              echo "- \`integration\` will run (SDK + CLI + examples against \`${{ steps.resolve.outputs.network }}\`)"
+            else
+              echo "- \`integration\` **skipped** (run_integration=false)"
+            fi
+            if [ "${{ steps.resolve.outputs.run_stress }}" = "true" ]; then
+              echo "- \`stress\` will run (1h, DevNet only, 10 wallets concurrent upload+access)"
+            else
+              echo "- \`stress\` **skipped** (run_stress=false)"
+            fi
+          } >> $GITHUB_STEP_SUMMARY
+
   integration:
     needs: prepare
     if: ${{ needs.prepare.outputs.run_integration == 'true' }}
@@ -120,16 +149,90 @@ jobs:
       # so they must run sequentially — parallel would collide on the funder
       # nonce stream.
       - name: SDK integration
+        id: sdk
         working-directory: packages/sdk
-        run: pnpm test:integration
+        run: |
+          set -o pipefail
+          pnpm test:integration 2>&1 | tee /tmp/sdk-integration.log
 
       - name: CLI integration
+        id: cli
         working-directory: apps/cli
-        run: pnpm test:integration
+        run: |
+          set -o pipefail
+          pnpm test:integration 2>&1 | tee /tmp/cli-integration.log
 
       - name: Examples integration
+        id: examples
         working-directory: apps/examples
-        run: pnpm test:integration
+        run: |
+          set -o pipefail
+          pnpm test:integration 2>&1 | tee /tmp/examples-integration.log
+
+      - name: Write integration summary
+        if: always()
+        env:
+          SDK_OUTCOME: ${{ steps.sdk.outcome }}
+          CLI_OUTCOME: ${{ steps.cli.outcome }}
+          EXAMPLES_OUTCOME: ${{ steps.examples.outcome }}
+        run: |
+          # Strip ANSI color codes; capture vitest's three summary lines if present.
+          strip_ansi() { sed -E $'s/\x1b\\[[0-9;]*[a-zA-Z]//g'; }
+          icon() {
+            case "$1" in
+              success) echo "✅" ;;
+              failure) echo "❌" ;;
+              skipped) echo "⏭️" ;;
+              cancelled) echo "🛑" ;;
+              *) echo "❔" ;;
+            esac
+          }
+          summarize() {
+            local title=$1 log=$2 outcome=$3 scope=$4
+            local emoji; emoji=$(icon "$outcome")
+            echo "### ${emoji} ${title} — \`${outcome}\`"
+            echo ""
+            echo "_${scope}_"
+            echo ""
+            if [ -f "$log" ]; then
+              local files tests duration
+              files=$(grep -E "Test Files" "$log" | tail -1 | strip_ansi || true)
+              tests=$(grep -E "^[[:space:]]+Tests " "$log" | tail -1 | strip_ansi || true)
+              duration=$(grep -E "^[[:space:]]+Duration" "$log" | tail -1 | strip_ansi || true)
+              if [ -n "$files$tests$duration" ]; then
+                echo '```'
+                [ -n "$files" ]    && echo "$files"
+                [ -n "$tests" ]    && echo "$tests"
+                [ -n "$duration" ] && echo "$duration"
+                echo '```'
+              else
+                echo "_(vitest summary not captured; check raw logs above)_"
+              fi
+            else
+              echo "_(step did not run — no log)_"
+            fi
+            echo ""
+          }
+          {
+            echo "## Integration test results"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Network | \`${NETWORK}\` |"
+            echo "| CDR_API_URL | \`${CDR_API_URL}\` |"
+            echo "| CDR_RPC_URL | \`${CDR_RPC_URL}\` |"
+            echo "| Branch | \`${{ github.ref_name }}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo ""
+            echo "### Per-suite results"
+            echo ""
+            summarize "SDK integration"      /tmp/sdk-integration.log      "$SDK_OUTCOME" \
+              "packages/sdk/__integration__ — story-api / observer / uploader / consumer (49 cases incl. stress excluded)"
+            summarize "CLI integration"      /tmp/cli-integration.log      "$CLI_OUTCOME" \
+              "apps/cli/__integration__ — DKG state + upload + access + status commands (9 cases)"
+            summarize "Examples integration" /tmp/examples-integration.log "$EXAMPLES_OUTCOME" \
+              "apps/examples/__integration__ — query-dkg-state, upload-cdr, access-cdr, e2e-demo (4 cases)"
+          } >> $GITHUB_STEP_SUMMARY
 
   stress:
     needs: prepare
@@ -154,9 +257,16 @@ jobs:
           echo "CDR_RPC_URL=http://172.207.250.203:8545" >> $GITHUB_ENV
           echo "CDR_TEST_PRIVATE_KEY=${{ secrets.CDR_DEVNET_TEST_PRIVATE_KEY }}" >> $GITHUB_ENV
 
+      - name: Record stress start
+        id: started
+        run: echo "ts=$(date +%s)" >> $GITHUB_OUTPUT
+
       - name: Run stress (1h)
+        id: stress
         working-directory: packages/sdk
-        run: pnpm test:stress
+        run: |
+          set -o pipefail
+          pnpm test:stress 2>&1 | tee /tmp/stress-stdout.log
 
       - name: Upload stress log
         if: always()
@@ -165,3 +275,49 @@ jobs:
           name: cdr-stress-log-${{ github.run_id }}
           path: /tmp/cdr-stress.log
           retention-days: 14
+
+      - name: Write stress summary
+        if: always()
+        env:
+          STRESS_OUTCOME: ${{ steps.stress.outcome }}
+          STARTED_TS: ${{ steps.started.outputs.ts }}
+        run: |
+          icon() {
+            case "$1" in
+              success) echo "✅" ;;
+              failure) echo "❌" ;;
+              skipped) echo "⏭️" ;;
+              cancelled) echo "🛑" ;;
+              *) echo "❔" ;;
+            esac
+          }
+          emoji=$(icon "$STRESS_OUTCOME")
+          now=$(date +%s)
+          elapsed=$(( now - ${STARTED_TS:-$now} ))
+          mins=$(( elapsed / 60 ))
+          secs=$(( elapsed % 60 ))
+
+          {
+            echo "## ${emoji} Stress test — \`${STRESS_OUTCOME}\`"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Network | DevNet (\`${CDR_API_URL}\`) |"
+            echo "| Funder | anvil-0 (\`${CDR_TEST_PRIVATE_KEY:+set}\`) |"
+            echo "| Wallets | 10 ephemeral, 1000 IP each from funder |"
+            echo "| Workload | every 10s, per-wallet: \`uploadCDR\` (own vault) + \`accessCDR\` (shared vault) |"
+            echo "| Concurrency | cross-wallet parallel, per-wallet sequential (viem nonce safety) |"
+            echo "| Elapsed | ${mins}m${secs}s |"
+            echo "| Log artifact | \`cdr-stress-log-${{ github.run_id }}\` (14-day retention) |"
+            echo ""
+            if [ -f /tmp/cdr-stress.log ]; then
+              total=$(wc -l < /tmp/cdr-stress.log | tr -d ' ')
+              echo "### cdr-stress.log — last 80 of ${total} lines"
+              echo ""
+              echo '```'
+              tail -80 /tmp/cdr-stress.log
+              echo '```'
+            else
+              echo "_(no /tmp/cdr-stress.log produced)_"
+            fi
+          } >> $GITHUB_STEP_SUMMARY
