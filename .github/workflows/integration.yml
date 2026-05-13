@@ -1,5 +1,7 @@
 name: Integration
 
+run-name: integration-${{ inputs.network || 'devnet' }}-${{ inputs.test_suite || 'default' }}
+
 # Default to read-only token; jobs that need more should override.
 permissions:
   contents: read
@@ -7,19 +9,24 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
-      target_network:
+      network:
         type: choice
         description: Network to test against
         options: [devnet, aeneid]
         default: devnet
-      run_integration:
-        type: boolean
-        description: Run integration suites (SDK + CLI + examples)
-        default: true
-      run_stress:
-        type: boolean
-        description: Run 1h stress suite (DevNet only)
-        default: false
+      test_suite:
+        type: choice
+        description: Which suite to run (gated inside test files via TEST_SUITE env)
+        options:
+          # default          — basic SDK/CLI/Examples + 100w ephemeral tests
+          # all              — default + 1000w perf + 60min stress (stress devnet-only)
+          # 1000-wallet-performance — only the 1000-wallet perf suite
+          # 1H-stress-devnet-only   — only the 60-min combined stress (DevNet only)
+          - default
+          - all
+          - 1000-wallet-performance
+          - 1H-stress-devnet-only
+        default: default
   pull_request:
     branches: [main]
     paths:
@@ -42,7 +49,7 @@ on:
 # PR runs cancel prior runs of the same PR; manual runs don't get cancelled
 # (in particular a 1h stress run shouldn't be killed by a follow-up dispatch).
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('integration-pr-{0}', github.event.pull_request.number) || format('integration-manual-{0}', inputs.target_network) }}
+  group: ${{ github.event_name == 'pull_request' && format('integration-pr-{0}', github.event.pull_request.number) || format('integration-manual-{0}-{1}', inputs.network, inputs.test_suite) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -51,6 +58,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       network: ${{ steps.resolve.outputs.network }}
+      test_suite: ${{ steps.resolve.outputs.test_suite }}
       run_integration: ${{ steps.resolve.outputs.run_integration }}
       run_stress: ${{ steps.resolve.outputs.run_stress }}
     steps:
@@ -58,19 +66,42 @@ jobs:
         name: Resolve effective inputs
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "network=${{ inputs.target_network }}" >> $GITHUB_OUTPUT
-            echo "run_integration=${{ inputs.run_integration }}" >> $GITHUB_OUTPUT
-            echo "run_stress=${{ inputs.run_stress }}" >> $GITHUB_OUTPUT
+            NETWORK="${{ inputs.network }}"
+            SUITE="${{ inputs.test_suite }}"
           else
-            # PR trigger: always devnet, integration only, stress disabled.
-            echo "network=devnet" >> $GITHUB_OUTPUT
-            echo "run_integration=true" >> $GITHUB_OUTPUT
-            echo "run_stress=false" >> $GITHUB_OUTPUT
+            # PR trigger: always devnet, default suite (excludes perf + stress).
+            NETWORK="devnet"
+            SUITE="default"
           fi
-      - name: Validate (stress is DevNet-only)
+
+          # Job gating from suite:
+          #   - integration job covers default + 1000w perf (single vitest run
+          #     with TEST_SUITE env steering describe.skipIf inside test files).
+          #   - stress job runs only the 60-min stress (separate vitest invocation).
+          case "$SUITE" in
+            default|1000-wallet-performance)
+              RUN_INTEGRATION=true
+              RUN_STRESS=false ;;
+            all)
+              RUN_INTEGRATION=true
+              RUN_STRESS=true ;;
+            1H-stress-devnet-only)
+              RUN_INTEGRATION=false
+              RUN_STRESS=true ;;
+            *)
+              echo "::error::unknown test_suite=$SUITE"; exit 1 ;;
+          esac
+
+          echo "network=$NETWORK"        >> $GITHUB_OUTPUT
+          echo "test_suite=$SUITE"       >> $GITHUB_OUTPUT
+          echo "run_integration=$RUN_INTEGRATION" >> $GITHUB_OUTPUT
+          echo "run_stress=$RUN_STRESS"  >> $GITHUB_OUTPUT
+
+      - name: Validate (stress + 1000w-perf+all are DevNet-only)
+        # 60-min stress is DevNet-only by design (needs anvil-0 funder).
         if: ${{ steps.resolve.outputs.run_stress == 'true' && steps.resolve.outputs.network != 'devnet' }}
         run: |
-          echo "::error::run_stress=true but network=${{ steps.resolve.outputs.network }}; stress is DevNet-only"
+          echo "::error::test_suite=${{ steps.resolve.outputs.test_suite }} requires network=devnet (got ${{ steps.resolve.outputs.network }})"
           exit 1
 
       - name: Write run summary
@@ -85,20 +116,19 @@ jobs:
             echo "| Branch | \`${{ github.ref_name }}\` |"
             echo "| Commit | \`${{ github.sha }}\` |"
             echo "| Network | \`${{ steps.resolve.outputs.network }}\` |"
-            echo "| Run integration suites | \`${{ steps.resolve.outputs.run_integration }}\` |"
-            echo "| Run 1h stress suite | \`${{ steps.resolve.outputs.run_stress }}\` |"
+            echo "| Test suite | \`${{ steps.resolve.outputs.test_suite }}\` |"
             echo ""
             echo "### Downstream jobs"
             echo ""
             if [ "${{ steps.resolve.outputs.run_integration }}" = "true" ]; then
               echo "- \`integration\` will run (SDK + CLI + examples against \`${{ steps.resolve.outputs.network }}\`)"
             else
-              echo "- \`integration\` **skipped** (run_integration=false)"
+              echo "- \`integration\` **skipped** (test_suite=${{ steps.resolve.outputs.test_suite }})"
             fi
             if [ "${{ steps.resolve.outputs.run_stress }}" = "true" ]; then
-              echo "- \`stress\` will run (1h, DevNet only, 10 wallets concurrent upload+access)"
+              echo "- \`stress\` will run (60 min combined ephemeral-wallet stress, DevNet)"
             else
-              echo "- \`stress\` **skipped** (run_stress=false)"
+              echo "- \`stress\` **skipped** (test_suite=${{ steps.resolve.outputs.test_suite }})"
             fi
           } >> $GITHUB_STEP_SUMMARY
 
@@ -106,9 +136,12 @@ jobs:
     needs: prepare
     if: ${{ needs.prepare.outputs.run_integration == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Suite-aware timeout: 1000-wallet perf is the heaviest non-stress case
+    # (~30-50 min budgeted). Other suites finish in <15 min.
+    timeout-minutes: ${{ needs.prepare.outputs.test_suite == '1000-wallet-performance' && 90 || (needs.prepare.outputs.test_suite == 'all' && 90 || 60) }}
     env:
       NETWORK: ${{ needs.prepare.outputs.network }}
+      TEST_SUITE: ${{ needs.prepare.outputs.test_suite }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -145,9 +178,9 @@ jobs:
             exit 1
           fi
 
-      # All three suites share anvil-0 (DevNet) or the same wallet (Aeneid),
-      # so they must run sequentially — parallel would collide on the funder
-      # nonce stream.
+      # All three suites share the funder wallet (anvil-0 on DevNet, the
+      # long-lived Aeneid wallet otherwise), so they must run sequentially —
+      # parallel would collide on the nonce stream.
       - name: SDK integration
         id: sdk
         working-directory: packages/sdk
@@ -219,6 +252,7 @@ jobs:
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Network | \`${NETWORK}\` |"
+            echo "| Test suite | \`${TEST_SUITE}\` |"
             echo "| CDR_API_URL | \`${CDR_API_URL}\` |"
             echo "| CDR_RPC_URL | \`${CDR_RPC_URL}\` |"
             echo "| Branch | \`${{ github.ref_name }}\` |"
@@ -227,11 +261,11 @@ jobs:
             echo "### Per-suite results"
             echo ""
             summarize "SDK integration"      /tmp/sdk-integration.log      "$SDK_OUTCOME" \
-              "packages/sdk/__integration__ — story-api / observer / uploader / consumer (49 cases incl. stress excluded)"
+              "packages/sdk/__integration__ — story-api / observer / uploader / consumer + suite-gated ephemeral tests"
             summarize "CLI integration"      /tmp/cli-integration.log      "$CLI_OUTCOME" \
-              "apps/cli/__integration__ — DKG state + upload + access + status commands (9 cases)"
+              "apps/cli/__integration__ — DKG state + upload + access + status commands"
             summarize "Examples integration" /tmp/examples-integration.log "$EXAMPLES_OUTCOME" \
-              "apps/examples/__integration__ — query-dkg-state, upload-cdr, access-cdr, e2e-demo (4 cases)"
+              "apps/examples/__integration__ — query-dkg-state, upload-cdr, access-cdr, e2e-demo"
           } >> $GITHUB_STEP_SUMMARY
 
   stress:
@@ -241,6 +275,7 @@ jobs:
     timeout-minutes: 120
     env:
       NETWORK: ${{ needs.prepare.outputs.network }}
+      TEST_SUITE: ${{ needs.prepare.outputs.test_suite }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -261,7 +296,7 @@ jobs:
         id: started
         run: echo "ts=$(date +%s)" >> $GITHUB_OUTPUT
 
-      - name: Run stress (1h)
+      - name: Run stress (60 min)
         id: stress
         working-directory: packages/sdk
         run: |
@@ -303,10 +338,8 @@ jobs:
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Network | DevNet (\`${CDR_API_URL}\`) |"
+            echo "| Test suite | \`${TEST_SUITE}\` |"
             echo "| Funder | anvil-0 (\`${CDR_TEST_PRIVATE_KEY:+set}\`) |"
-            echo "| Wallets | 10 ephemeral, 1000 IP each from funder |"
-            echo "| Workload | every 10s, per-wallet: \`uploadCDR\` (own vault) + \`accessCDR\` (shared vault) |"
-            echo "| Concurrency | cross-wallet parallel, per-wallet sequential (viem nonce safety) |"
             echo "| Elapsed | ${mins}m${secs}s |"
             echo "| Log artifact | \`cdr-stress-log-${{ github.run_id }}\` (14-day retention) |"
             echo ""
