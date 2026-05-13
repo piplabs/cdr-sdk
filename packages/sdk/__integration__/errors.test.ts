@@ -95,7 +95,9 @@ describe(`Error-path integration tests (live: ${API_URL})`, () => {
     expect(() => cdr.consumer).toThrow(WalletClientRequiredError);
   });
 
-  it("ERR-05: write() to a non-existent uuid reverts", async () => {
+  // 30s timeout — observed 1534ms (chain tx + revert). Default 5s is
+  // technically enough today but leaves no headroom on a busy chain.
+  it("ERR-05: write() to a non-existent uuid reverts", { timeout: 30_000 }, async () => {
     const { client } = makeFullClient();
     // uuid=999_999 is well past any reasonable vault counter — the CDR
     // contract's vault-data check will revert before any condition logic.

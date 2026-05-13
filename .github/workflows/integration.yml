@@ -118,18 +118,6 @@ jobs:
             echo "| Network | \`${{ steps.resolve.outputs.network }}\` |"
             echo "| Test suite | \`${{ steps.resolve.outputs.test_suite }}\` |"
             echo ""
-            echo "### Downstream jobs"
-            echo ""
-            if [ "${{ steps.resolve.outputs.run_integration }}" = "true" ]; then
-              echo "- \`integration\` will run (SDK + CLI + examples against \`${{ steps.resolve.outputs.network }}\`)"
-            else
-              echo "- \`integration\` **skipped** (test_suite=${{ steps.resolve.outputs.test_suite }})"
-            fi
-            if [ "${{ steps.resolve.outputs.run_stress }}" = "true" ]; then
-              echo "- \`stress\` will run (60 min combined ephemeral-wallet stress, DevNet)"
-            else
-              echo "- \`stress\` **skipped** (test_suite=${{ steps.resolve.outputs.test_suite }})"
-            fi
           } >> $GITHUB_STEP_SUMMARY
 
   integration:
@@ -193,8 +181,14 @@ jobs:
             "$CDR_RPC_URL" 2>/dev/null | jq -r '.result // empty')
           if [ -n "$BLOCK_PRE_HEX" ]; then BLOCK_PRE=$(( BLOCK_PRE_HEX )); else BLOCK_PRE=""; fi
           LATEST_ACTIVE=$(curl -sS --max-time 10 "$CDR_API_URL/dkg/latest_active" 2>/dev/null)
-          ROUND_PRE=$(echo "$LATEST_ACTIVE" | jq -r '.round // empty' 2>/dev/null)
-          STAGE_PRE=$(echo "$LATEST_ACTIVE" | jq -r '.stage // empty' 2>/dev/null)
+          # Diagnostic — surfaced only in the job step log, not in the
+          # Summary. If Story-API's response shape ever shifts again
+          # (it did in PR #73 → REST), the next failure will produce
+          # `?` in Summary; this echo lets the investigator see the
+          # raw body in one click instead of curling locally.
+          echo "/dkg/latest_active raw response: $LATEST_ACTIVE"
+          ROUND_PRE=$(echo "$LATEST_ACTIVE" | jq -r '.msg.network.round // empty' 2>/dev/null)
+          STAGE_PRE=$(echo "$LATEST_ACTIVE" | jq -r '.msg.network.stage // empty' 2>/dev/null)
           TS_PRE=$(date +%s)
           echo "block=$BLOCK_PRE" >> $GITHUB_OUTPUT
           echo "round=$ROUND_PRE" >> $GITHUB_OUTPUT
@@ -206,16 +200,21 @@ jobs:
       # long-lived Aeneid wallet otherwise), so they must run sequentially —
       # parallel would collide on the nonce stream.
       #
-      # Each step emits two reporters: `default` for the human-readable log
-      # that gets tee'd to /tmp/*-integration.log, and `json` for a machine-
-      # readable file the summary step parses into a per-case ✓/✗ table.
-      # Per-reporter outputFile via `--outputFile.json=...` (vitest 2 syntax).
+      # Each step calls vitest directly via `npx` (NOT `pnpm test:integration -- …`)
+      # because pnpm passes the `--` separator through to vitest, where yargs
+      # treats it as end-of-options and the `--outputFile.json=…` flag is
+      # silently dropped. Two reporters: `default` (tee'd to *-integration.log)
+      # + `json` (parsed by the summary step into a per-case ✓/✗ table).
       - name: SDK integration
         id: sdk
         working-directory: packages/sdk
         run: |
           set -o pipefail
-          pnpm test:integration -- \
+          npx vitest run --no-file-parallelism \
+            --exclude '**/__tests__/**' \
+            --exclude '**/__integration__/ephemeral-60min-stress.test.ts' \
+            --exclude '**/node_modules/**' \
+            --exclude '**/dist/**' \
             --reporter=default --reporter=json \
             --outputFile.json=/tmp/results-sdk.json 2>&1 | tee /tmp/sdk-integration.log
 
@@ -224,7 +223,11 @@ jobs:
         working-directory: apps/cli
         run: |
           set -o pipefail
-          pnpm test:integration -- \
+          npx vitest run \
+            --exclude '**/__tests__/**' \
+            --exclude '**/node_modules/**' \
+            --exclude '**/dist/**' \
+            __integration__ \
             --reporter=default --reporter=json \
             --outputFile.json=/tmp/results-cli.json 2>&1 | tee /tmp/cli-integration.log
 
@@ -233,7 +236,10 @@ jobs:
         working-directory: apps/examples
         run: |
           set -o pipefail
-          pnpm test:integration -- \
+          npx vitest run \
+            --exclude '**/node_modules/**' \
+            --exclude '**/dist/**' \
+            __integration__ \
             --reporter=default --reporter=json \
             --outputFile.json=/tmp/results-examples.json 2>&1 | tee /tmp/examples-integration.log
 
@@ -257,8 +263,8 @@ jobs:
             "$CDR_RPC_URL" 2>/dev/null | jq -r '.result // empty' 2>/dev/null || true)
           if [ -n "$BLOCK_POST_HEX" ]; then BLOCK_POST=$(( BLOCK_POST_HEX )); else BLOCK_POST=""; fi
           LATEST_ACTIVE=$(curl -sS --max-time 10 "$CDR_API_URL/dkg/latest_active" 2>/dev/null || echo '{}')
-          ROUND_POST=$(echo "$LATEST_ACTIVE" | jq -r '.round // empty' 2>/dev/null)
-          STAGE_POST=$(echo "$LATEST_ACTIVE" | jq -r '.stage // empty' 2>/dev/null)
+          ROUND_POST=$(echo "$LATEST_ACTIVE" | jq -r '.msg.network.round // empty' 2>/dev/null)
+          STAGE_POST=$(echo "$LATEST_ACTIVE" | jq -r '.msg.network.stage // empty' 2>/dev/null)
           TS_POST=$(date +%s)
           fmt() { [ -n "$1" ] && echo "$1" || echo "?"; }
           if [ -n "$BLOCK_PRE" ] && [ -n "$BLOCK_POST" ]; then
@@ -445,8 +451,9 @@ jobs:
             "$CDR_RPC_URL" 2>/dev/null | jq -r '.result // empty')
           if [ -n "$BLOCK_PRE_HEX" ]; then BLOCK_PRE=$(( BLOCK_PRE_HEX )); else BLOCK_PRE=""; fi
           LATEST_ACTIVE=$(curl -sS --max-time 10 "$CDR_API_URL/dkg/latest_active" 2>/dev/null)
-          ROUND_PRE=$(echo "$LATEST_ACTIVE" | jq -r '.round // empty' 2>/dev/null)
-          STAGE_PRE=$(echo "$LATEST_ACTIVE" | jq -r '.stage // empty' 2>/dev/null)
+          echo "/dkg/latest_active raw response: $LATEST_ACTIVE"
+          ROUND_PRE=$(echo "$LATEST_ACTIVE" | jq -r '.msg.network.round // empty' 2>/dev/null)
+          STAGE_PRE=$(echo "$LATEST_ACTIVE" | jq -r '.msg.network.stage // empty' 2>/dev/null)
           TS_PRE=$(date +%s)
           echo "block=$BLOCK_PRE" >> $GITHUB_OUTPUT
           echo "round=$ROUND_PRE" >> $GITHUB_OUTPUT
@@ -503,8 +510,8 @@ jobs:
             "$CDR_RPC_URL" 2>/dev/null | jq -r '.result // empty' 2>/dev/null || true)
           if [ -n "$BLOCK_POST_HEX" ]; then BLOCK_POST=$(( BLOCK_POST_HEX )); else BLOCK_POST=""; fi
           LATEST_ACTIVE=$(curl -sS --max-time 10 "$CDR_API_URL/dkg/latest_active" 2>/dev/null || echo '{}')
-          ROUND_POST=$(echo "$LATEST_ACTIVE" | jq -r '.round // empty' 2>/dev/null)
-          STAGE_POST=$(echo "$LATEST_ACTIVE" | jq -r '.stage // empty' 2>/dev/null)
+          ROUND_POST=$(echo "$LATEST_ACTIVE" | jq -r '.msg.network.round // empty' 2>/dev/null)
+          STAGE_POST=$(echo "$LATEST_ACTIVE" | jq -r '.msg.network.stage // empty' 2>/dev/null)
           fmt() { [ -n "$1" ] && echo "$1" || echo "?"; }
           if [ -n "$BLOCK_PRE" ] && [ -n "$BLOCK_POST" ]; then
             BLOCK_DELTA=$(( BLOCK_POST - BLOCK_PRE ))

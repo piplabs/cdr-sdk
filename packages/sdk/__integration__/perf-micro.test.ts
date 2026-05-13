@@ -85,7 +85,10 @@ async function deployOpenCondition(
 }
 
 describe(`Perf micro-benchmarks (live: ${API_URL})`, () => {
-  it("PERF-01: initWasm() with skipHashCheck completes in < 10s", async () => {
+  // 30s timeout — the assertion is < 10s, but on a cold CI runner the
+  // WASM load itself can approach the default vitest 5s timeout before
+  // the inner assertion gets to fire.
+  it("PERF-01: initWasm() with skipHashCheck completes in < 10s", { timeout: 30_000 }, async () => {
     const start = Date.now();
     await initWasm({ skipHashCheck: true });
     const ms = Date.now() - start;
@@ -93,7 +96,8 @@ describe(`Perf micro-benchmarks (live: ${API_URL})`, () => {
     expect(ms).toBeLessThan(10_000);
   });
 
-  it("PERF-02: Observer query latencies", async () => {
+  // 30s timeout — observed 1401ms (5 REST queries serialized). Safe headroom.
+  it("PERF-02: Observer query latencies", { timeout: 30_000 }, async () => {
     await initWasm({ skipHashCheck: true });
     const { client } = makeCDRClient();
 

@@ -125,7 +125,8 @@ describe(`Security tests (live: ${API_URL})`, () => {
   // via `client.observer.getGlobalPubKey()`.
   it.skip("SEC-03: validationRpcUrls cross-validates getGlobalPubKey (Issue #19) — pending SDK API", () => {});
 
-  it("SEC-04: minThresholdRatio raises SDK-side threshold above chain default (Issue #20)", async () => {
+  // 30s timeout — observed ~725ms on DevNet; cushion for Aeneid + slow CI.
+  it("SEC-04: minThresholdRatio raises SDK-side threshold above chain default (Issue #20)", { timeout: 30_000 }, async () => {
     const { publicClient, walletClient } = makeCDRClient();
     const cdr = new CDRClient({
       network: "testnet",
@@ -145,7 +146,9 @@ describe(`Security tests (live: ${API_URL})`, () => {
     expect(typeof client.consumer.downloadFile).toBe("function");
   });
 
-  it("SEC-06: allocate validates condition contract interface (Issue #22)", async () => {
+  // 30s timeout — observed ~343ms (simulateContract revert), but a slow
+  // RPC on a bad day can stretch this past the default 5s.
+  it("SEC-06: allocate validates condition contract interface (Issue #22)", { timeout: 30_000 }, async () => {
     const { client } = makeCDRClient();
     // 0x0...01 is an EOA — no contract code, so the interface probe fails.
     const invalidAddr =
@@ -314,7 +317,9 @@ describe(`Security tests (live: ${API_URL})`, () => {
     let onChainReports: Map<string, Uint8Array> | null = null;
     let onChainAvailable = false;
 
-    it("SEC-08n: on-chain attestation reports parse + verify (skips if none)", async () => {
+    // 30s timeout — observed 497ms (getValidatorAttestations + 3-5 parses);
+    // budget for slower Aeneid validator response.
+    it("SEC-08n: on-chain attestation reports parse + verify (skips if none)", { timeout: 30_000 }, async () => {
       const { client } = makeCDRClient();
       try {
         onChainReports = await client.observer.getValidatorAttestations();
@@ -363,7 +368,10 @@ describe(`Security tests (live: ${API_URL})`, () => {
     });
   });
 
-  it("SEC-09: write() rejects ciphertext whose embedded label doesn't match the uuid (Issue #25)", async () => {
+  // 60s timeout — SEC-09 does allocate (chain tx) + encryptDataKey (local
+  // WASM) + write (chain tx that will revert). Three sequential ops, the
+  // default 5s isn't enough — a prior CI run timed out here.
+  it("SEC-09: write() rejects ciphertext whose embedded label doesn't match the uuid (Issue #25)", { timeout: 60_000 }, async () => {
     const { client, publicClient, walletClient } = makeCDRClient();
     const globalPubKey = await client.observer.getGlobalPubKey();
     const conditionAddr = await deployOpenCondition(publicClient, walletClient);
