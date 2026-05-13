@@ -105,7 +105,7 @@ jobs:
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Trigger | \`${{ github.event_name }}\` |"
-            echo "| Branch | \`${{ github.ref_name }}\` |"
+            echo "| Branch | \`${{ github.head_ref || github.ref_name }}\` |"
             echo "| Commit | \`${{ github.sha }}\` |"
             echo "| Network | \`${{ steps.resolve.outputs.network }}\` |"
             echo "| Test suite | \`${{ steps.resolve.outputs.test_suite }}\` |"
@@ -501,7 +501,7 @@ jobs:
             echo "| Test suite | \`${TEST_SUITE}\` |"
             echo "| CDR_API_URL | \`${CDR_API_URL}\` |"
             echo "| CDR_RPC_URL | \`${CDR_RPC_URL}\` |"
-            echo "| Branch | \`${{ github.ref_name }}\` |"
+            echo "| Branch | \`${{ github.head_ref || github.ref_name }}\` |"
             echo "| Commit | \`${{ github.sha }}\` |"
             if [ "$RUN_STRESS" = "true" ]; then
               echo "| Stress log artifact | \`cdr-stress-log-${{ github.run_id }}\` (14-day retention) |"
