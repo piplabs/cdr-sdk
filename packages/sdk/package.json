@@ -16,8 +16,8 @@
   "scripts": {
     "build": "tsc",
     "test": "vitest run --exclude '**/__integration__/**' --exclude '**/node_modules/**' --exclude '**/dist/**'",
-    "test:integration": "vitest run --no-file-parallelism --exclude '**/__tests__/**' --exclude '**/__integration__/stress.test.ts' --exclude '**/node_modules/**' --exclude '**/dist/**'",
-    "test:stress": "vitest run __integration__/stress.test.ts",
+    "test:integration": "vitest run --no-file-parallelism --exclude '**/__tests__/**' --exclude '**/__integration__/ephemeral-60min-stress.test.ts' --exclude '**/node_modules/**' --exclude '**/dist/**'",
+    "test:stress": "vitest run __integration__/ephemeral-60min-stress.test.ts",
     "test:coverage": "vitest run --exclude '**/__integration__/**' --coverage",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit"
