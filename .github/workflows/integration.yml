@@ -205,26 +205,37 @@ jobs:
       # All three suites share the funder wallet (anvil-0 on DevNet, the
       # long-lived Aeneid wallet otherwise), so they must run sequentially —
       # parallel would collide on the nonce stream.
+      #
+      # Each step emits two reporters: `default` for the human-readable log
+      # that gets tee'd to /tmp/*-integration.log, and `json` for a machine-
+      # readable file the summary step parses into a per-case ✓/✗ table.
+      # Per-reporter outputFile via `--outputFile.json=...` (vitest 2 syntax).
       - name: SDK integration
         id: sdk
         working-directory: packages/sdk
         run: |
           set -o pipefail
-          pnpm test:integration 2>&1 | tee /tmp/sdk-integration.log
+          pnpm test:integration -- \
+            --reporter=default --reporter=json \
+            --outputFile.json=/tmp/results-sdk.json 2>&1 | tee /tmp/sdk-integration.log
 
       - name: CLI integration
         id: cli
         working-directory: apps/cli
         run: |
           set -o pipefail
-          pnpm test:integration 2>&1 | tee /tmp/cli-integration.log
+          pnpm test:integration -- \
+            --reporter=default --reporter=json \
+            --outputFile.json=/tmp/results-cli.json 2>&1 | tee /tmp/cli-integration.log
 
       - name: Examples integration
         id: examples
         working-directory: apps/examples
         run: |
           set -o pipefail
-          pnpm test:integration 2>&1 | tee /tmp/examples-integration.log
+          pnpm test:integration -- \
+            --reporter=default --reporter=json \
+            --outputFile.json=/tmp/results-examples.json 2>&1 | tee /tmp/examples-integration.log
 
       - name: Write integration summary
         if: always()
@@ -266,31 +277,98 @@ jobs:
               *) echo "❔" ;;
             esac
           }
+          # Parse a vitest JSON reporter file ($1) into a per-case markdown
+          # table. The JSON reporter mirrors Jest's shape:
+          #   { numTotalTests, numPassedTests, numFailedTests,
+          #     testResults: [ { name, status,
+          #       assertionResults: [ { fullName, title, status, duration,
+          #                            failureMessages: [...] } ] } ] }
+          # Output:
+          #   - Roll-up counts (files passed/failed, tests passed/failed,
+          #     total duration in seconds)
+          #   - A `| File | Test | Status | Duration |` markdown table with
+          #     every assertion, ordered by file then in-file order.
+          #   - For each failing assertion, the first failureMessages line.
           summarize() {
-            local title=$1 log=$2 outcome=$3 scope=$4
+            local title=$1 outcome=$2 scope=$3 json=$4 log=$5
             local emoji; emoji=$(icon "$outcome")
             echo "### ${emoji} ${title} — \`${outcome}\`"
             echo ""
             echo "_${scope}_"
             echo ""
-            if [ -f "$log" ]; then
-              local files tests duration
-              files=$(grep -E "Test Files" "$log" | tail -1 | strip_ansi || true)
-              tests=$(grep -E "^[[:space:]]+Tests " "$log" | tail -1 | strip_ansi || true)
-              duration=$(grep -E "^[[:space:]]+Duration" "$log" | tail -1 | strip_ansi || true)
-              if [ -n "$files$tests$duration" ]; then
+            if [ ! -f "$json" ]; then
+              # JSON reporter file missing — usually means the test process
+              # crashed before vitest could write (e.g. TS compile error).
+              # Fall back to the tee'd log if present so the user has
+              # SOMETHING to read.
+              echo "_(no JSON reporter output at \`$json\` — vitest likely crashed before writing; raw log:)_"
+              if [ -f "$log" ]; then
+                echo ""
                 echo '```'
-                [ -n "$files" ]    && echo "$files"
-                [ -n "$tests" ]    && echo "$tests"
-                [ -n "$duration" ] && echo "$duration"
+                tail -40 "$log" | strip_ansi
                 echo '```'
-              else
-                echo "_(vitest summary not captured; check raw logs above)_"
+              fi
+              echo ""
+              return
+            fi
+            # Roll-up counts. `// 0` guards against missing fields on early
+            # vitest runs where a setup error short-circuits the run.
+            local files_passed files_failed tests_passed tests_failed dur_ms dur_s
+            files_passed=$(jq -r '.numPassedTestSuites // 0' "$json")
+            files_failed=$(jq -r '.numFailedTestSuites // 0' "$json")
+            tests_passed=$(jq -r '.numPassedTests // 0' "$json")
+            tests_failed=$(jq -r '.numFailedTests // 0' "$json")
+            # startTime + max(testResults[].endTime) gives total wall time
+            # — vitest doesn't emit a single "duration" field in its JSON.
+            dur_ms=$(jq -r '
+              ([.testResults[].endTime // 0] | max) as $end
+              | (.startTime // 0) as $start
+              | ($end - $start)
+            ' "$json")
+            dur_s=$(awk -v ms="$dur_ms" 'BEGIN { printf "%.1f", ms / 1000 }')
+            echo '```'
+            echo "Test Files  ${files_passed} passed | ${files_failed} failed"
+            echo "     Tests  ${tests_passed} passed | ${tests_failed} failed"
+            echo "  Duration  ${dur_s}s"
+            echo '```'
+            echo ""
+            local rows
+            rows=$(jq -r '
+              .testResults[] as $f
+              | ($f.name | split("/") | last) as $file
+              | $f.assertionResults[]
+              | "| `" + $file + "` | " + .title
+                + " | " + (if .status == "passed" then "✅" else if .status == "failed" then "❌" else "⏭️" end end)
+                + " | " + (if (.duration // 0) > 0 then ((.duration / 1000) | tostring + "s") else "—" end)
+                + " |"
+            ' "$json")
+            if [ -n "$rows" ]; then
+              echo "| File | Test | Status | Duration |"
+              echo "|---|---|---|---|"
+              echo "$rows"
+              echo ""
+              # Surface failures inline: first failure message per failing case.
+              local failures
+              failures=$(jq -r '
+                .testResults[] as $f
+                | ($f.name | split("/") | last) as $file
+                | $f.assertionResults[]
+                | select(.status == "failed")
+                | "**`" + $file + "` → " + .title + "`**\n\n```\n"
+                  + ((.failureMessages // [])[0] // "(no failureMessage)")
+                  + "\n```\n"
+              ' "$json")
+              if [ -n "$failures" ]; then
+                echo "<details><summary>Failures (${tests_failed})</summary>"
+                echo ""
+                echo "$failures"
+                echo "</details>"
+                echo ""
               fi
             else
-              echo "_(step did not run — no log)_"
+              echo "_(JSON reporter wrote but contained no assertion results)_"
+              echo ""
             fi
-            echo ""
           }
           {
             echo "## Integration test results"
@@ -321,12 +399,15 @@ jobs:
             echo ""
             echo "### Per-suite results"
             echo ""
-            summarize "SDK integration"      /tmp/sdk-integration.log      "$SDK_OUTCOME" \
-              "packages/sdk/__integration__ — story-api / observer / uploader / consumer + suite-gated ephemeral tests"
-            summarize "CLI integration"      /tmp/cli-integration.log      "$CLI_OUTCOME" \
-              "apps/cli/__integration__ — DKG state + upload + access + status commands"
-            summarize "Examples integration" /tmp/examples-integration.log "$EXAMPLES_OUTCOME" \
-              "apps/examples/__integration__ — query-dkg-state, upload-cdr, access-cdr, e2e-demo"
+            summarize "SDK integration" "$SDK_OUTCOME" \
+              "packages/sdk/__integration__ — story-api / observer / uploader / consumer + suite-gated ephemeral tests" \
+              /tmp/results-sdk.json /tmp/sdk-integration.log
+            summarize "CLI integration" "$CLI_OUTCOME" \
+              "apps/cli/__integration__ — DKG state + upload + access + status commands" \
+              /tmp/results-cli.json /tmp/cli-integration.log
+            summarize "Examples integration" "$EXAMPLES_OUTCOME" \
+              "apps/examples/__integration__ — query-dkg-state, upload-cdr, access-cdr, e2e-demo" \
+              /tmp/results-examples.json /tmp/examples-integration.log
           } >> $GITHUB_STEP_SUMMARY
 
   stress:
