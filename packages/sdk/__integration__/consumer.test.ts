@@ -752,6 +752,109 @@ describe(`Consumer integration tests (live: ${API_URL})`, () => {
   );
 
   // -------------------------------------------------------------------------
+  // ACC-04c: TOCTOU regression for #79 (pinnedCiphertext).
+  //
+  // Story:
+  //   - accessCDR preflights the vault state once (loadAndCheckVault) and
+  //     threads the captured ciphertext through `collectPartials` (bucket
+  //     filter) and `decryptDataKey`. If the vault is updated mid-flight,
+  //     the SDK MUST decrypt against the pinned ciphertext, not re-read
+  //     vault state.
+  //
+  // This test exercises that contract via the manual flow:
+  //   1. Upload updatable vault with dataKey1 (ciphertext1).
+  //   2. Submit a read tx (records the request).
+  //   3. Update vault to dataKey2 (ciphertext2) BEFORE collecting partials.
+  //   4. Call collectPartials with explicit pinnedCiphertext=ciphertext1.
+  //   5. decryptDataKey with ciphertext1 — must recover dataKey1.
+  //
+  // Pre-fix, the SDK would re-read the vault in `collectPartials` and end
+  // up trying to decrypt against ciphertext2 — either failing with a tag-
+  // verification error or (worse) yielding garbage that doesn't match
+  // dataKey1. With the fix, the pinned ciphertext1 ensures we recover
+  // dataKey1 even after the on-chain update.
+  // -------------------------------------------------------------------------
+
+  it(
+    "ACC-04c: pinnedCiphertext lets the manual flow recover the original dataKey after an on-chain vault update (regression #79)",
+    async () => {
+      const { client } = makeCDRClient();
+      const globalPubKey = await client.observer.getGlobalPubKey();
+
+      // ----- Upload v1 -----
+      const dataKey1 = crypto.getRandomValues(new Uint8Array(32));
+      const upload = await client.uploader.uploadCDR({
+        dataKey: dataKey1,
+        globalPubKey,
+        updatable: true,
+        writeConditionAddr: openCondition,
+        readConditionAddr: openCondition,
+        writeConditionData: "0x",
+        readConditionData: "0x",
+        accessAuxData: "0x",
+      });
+      const uuid = upload.uuid;
+      const label = uuidToLabel(uuid);
+      const ciphertext1 = upload.ciphertext.raw;
+
+      // ----- Reserve a stable requesterPubKey for the manual flow -----
+      const kp = generateEphemeralKeyPair();
+      const requesterPubKey = toHex(kp.publicKey);
+
+      // ----- Submit the read tx (captures the request on chain) -----
+      await client.consumer.read({
+        uuid,
+        accessAuxData: "0x",
+        requesterPubKey,
+      });
+
+      // ----- Update vault to dataKey2 / ciphertext2 BEFORE collecting -----
+      // The read tx is already mined → validators are producing partials
+      // for ciphertext1. The vault state changes underneath us, but the
+      // pinnedCiphertext path ensures collectPartials filters against
+      // ciphertext1 and decryptDataKey uses ciphertext1.
+      const dataKey2 = crypto.getRandomValues(new Uint8Array(32));
+      const ciphertext2 = await client.uploader.encryptDataKey({
+        dataKey: dataKey2,
+        globalPubKey,
+        label,
+      });
+      await client.uploader.write({
+        uuid,
+        accessAuxData: "0x",
+        encryptedData: toHex(ciphertext2.raw),
+      });
+      logCase("vault updated to dataKey2", dataKey2);
+
+      // ----- Collect with explicit pinnedCiphertext=ciphertext1 -----
+      const partials = await client.consumer.collectPartials({
+        uuid,
+        requesterPubKey,
+        timeoutMs: 120_000,
+        pinnedCiphertext: ciphertext1,
+      });
+      logCase("collected partials", {
+        count: partials.length,
+        validators: partials.map((p) => p.validator),
+      });
+
+      // ----- Decrypt against ciphertext1 — must recover dataKey1 -----
+      const recovered = await client.consumer.decryptDataKey({
+        ciphertext: { raw: ciphertext1, label },
+        partials,
+        recipientPrivKey: kp.privateKey,
+        globalPubKey,
+        label,
+      });
+      logCase("recovered", recovered);
+
+      expect(Array.from(recovered)).toEqual(Array.from(dataKey1));
+      expect(Array.from(recovered)).not.toEqual(Array.from(dataKey2));
+    },
+    300_000,
+  );
+
+  // -------------------------------------------------------------------------
   // File-based vault APIs (`Consumer.downloadFile`) are intentionally not
   // exercised here. The SDK only exposes the `StorageProvider` interface;
   // concrete adapters (Helia, Storacha, Synapse, …) are supplied by the

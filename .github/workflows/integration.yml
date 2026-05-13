@@ -1,5 +1,7 @@
 name: Integration
 
+run-name: integration-${{ inputs.network || 'devnet' }}-${{ inputs.test_suite || 'default' }}
+
 # Default to read-only token; jobs that need more should override.
 permissions:
   contents: read
@@ -7,19 +9,24 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
-      target_network:
+      network:
         type: choice
         description: Network to test against
         options: [devnet, aeneid]
         default: devnet
-      run_integration:
-        type: boolean
-        description: Run integration suites (SDK + CLI + examples)
-        default: true
-      run_stress:
-        type: boolean
-        description: Run 1h stress suite (DevNet only)
-        default: false
+      test_suite:
+        type: choice
+        description: Which suite to run (gated inside test files via TEST_SUITE env)
+        options:
+          # default          — basic SDK/CLI/Examples + 100w ephemeral tests
+          # all              — default + 1000w perf + 60min stress (stress devnet-only)
+          # 1000-wallet-performance — only the 1000-wallet perf suite
+          # 1H-stress-devnet-only   — only the 60-min combined stress (DevNet only)
+          - default
+          - all
+          - 1000-wallet-performance
+          - 1H-stress-devnet-only
+        default: default
   pull_request:
     branches: [main]
     paths:
@@ -42,7 +49,7 @@ on:
 # PR runs cancel prior runs of the same PR; manual runs don't get cancelled
 # (in particular a 1h stress run shouldn't be killed by a follow-up dispatch).
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('integration-pr-{0}', github.event.pull_request.number) || format('integration-manual-{0}', inputs.target_network) }}
+  group: ${{ github.event_name == 'pull_request' && format('integration-pr-{0}', github.event.pull_request.number) || format('integration-manual-{0}-{1}', inputs.network, inputs.test_suite) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -51,6 +58,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       network: ${{ steps.resolve.outputs.network }}
+      test_suite: ${{ steps.resolve.outputs.test_suite }}
       run_integration: ${{ steps.resolve.outputs.run_integration }}
       run_stress: ${{ steps.resolve.outputs.run_stress }}
     steps:
@@ -58,19 +66,42 @@ jobs:
         name: Resolve effective inputs
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "network=${{ inputs.target_network }}" >> $GITHUB_OUTPUT
-            echo "run_integration=${{ inputs.run_integration }}" >> $GITHUB_OUTPUT
-            echo "run_stress=${{ inputs.run_stress }}" >> $GITHUB_OUTPUT
+            NETWORK="${{ inputs.network }}"
+            SUITE="${{ inputs.test_suite }}"
           else
-            # PR trigger: always devnet, integration only, stress disabled.
-            echo "network=devnet" >> $GITHUB_OUTPUT
-            echo "run_integration=true" >> $GITHUB_OUTPUT
-            echo "run_stress=false" >> $GITHUB_OUTPUT
+            # PR trigger: always devnet, default suite (excludes perf + stress).
+            NETWORK="devnet"
+            SUITE="default"
           fi
-      - name: Validate (stress is DevNet-only)
+
+          # Job gating from suite:
+          #   - integration job covers default + 1000w perf (single vitest run
+          #     with TEST_SUITE env steering describe.skipIf inside test files).
+          #   - stress job runs only the 60-min stress (separate vitest invocation).
+          case "$SUITE" in
+            default|1000-wallet-performance)
+              RUN_INTEGRATION=true
+              RUN_STRESS=false ;;
+            all)
+              RUN_INTEGRATION=true
+              RUN_STRESS=true ;;
+            1H-stress-devnet-only)
+              RUN_INTEGRATION=false
+              RUN_STRESS=true ;;
+            *)
+              echo "::error::unknown test_suite=$SUITE"; exit 1 ;;
+          esac
+
+          echo "network=$NETWORK"        >> $GITHUB_OUTPUT
+          echo "test_suite=$SUITE"       >> $GITHUB_OUTPUT
+          echo "run_integration=$RUN_INTEGRATION" >> $GITHUB_OUTPUT
+          echo "run_stress=$RUN_STRESS"  >> $GITHUB_OUTPUT
+
+      - name: Validate (stress + 1000w-perf+all are DevNet-only)
+        # 60-min stress is DevNet-only by design (needs anvil-0 funder).
         if: ${{ steps.resolve.outputs.run_stress == 'true' && steps.resolve.outputs.network != 'devnet' }}
         run: |
-          echo "::error::run_stress=true but network=${{ steps.resolve.outputs.network }}; stress is DevNet-only"
+          echo "::error::test_suite=${{ steps.resolve.outputs.test_suite }} requires network=devnet (got ${{ steps.resolve.outputs.network }})"
           exit 1
 
       - name: Write run summary
@@ -85,30 +116,20 @@ jobs:
             echo "| Branch | \`${{ github.ref_name }}\` |"
             echo "| Commit | \`${{ github.sha }}\` |"
             echo "| Network | \`${{ steps.resolve.outputs.network }}\` |"
-            echo "| Run integration suites | \`${{ steps.resolve.outputs.run_integration }}\` |"
-            echo "| Run 1h stress suite | \`${{ steps.resolve.outputs.run_stress }}\` |"
+            echo "| Test suite | \`${{ steps.resolve.outputs.test_suite }}\` |"
             echo ""
-            echo "### Downstream jobs"
-            echo ""
-            if [ "${{ steps.resolve.outputs.run_integration }}" = "true" ]; then
-              echo "- \`integration\` will run (SDK + CLI + examples against \`${{ steps.resolve.outputs.network }}\`)"
-            else
-              echo "- \`integration\` **skipped** (run_integration=false)"
-            fi
-            if [ "${{ steps.resolve.outputs.run_stress }}" = "true" ]; then
-              echo "- \`stress\` will run (1h, DevNet only, 10 wallets concurrent upload+access)"
-            else
-              echo "- \`stress\` **skipped** (run_stress=false)"
-            fi
           } >> $GITHUB_STEP_SUMMARY
 
   integration:
     needs: prepare
     if: ${{ needs.prepare.outputs.run_integration == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Suite-aware timeout: 1000-wallet perf is the heaviest non-stress case
+    # (~30-50 min budgeted). Other suites finish in <15 min.
+    timeout-minutes: ${{ needs.prepare.outputs.test_suite == '1000-wallet-performance' && 90 || (needs.prepare.outputs.test_suite == 'all' && 90 || 60) }}
     env:
       NETWORK: ${{ needs.prepare.outputs.network }}
+      TEST_SUITE: ${{ needs.prepare.outputs.test_suite }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -145,29 +166,82 @@ jobs:
             exit 1
           fi
 
-      # All three suites share anvil-0 (DevNet) or the same wallet (Aeneid),
-      # so they must run sequentially — parallel would collide on the funder
-      # nonce stream.
+      # Capture chain state BEFORE the suite runs so the summary can show
+      # the delta (block height + DKG round) the run lived through. Story
+      # has no /dkg/params endpoint (see reference_dkg_params_immutable.md);
+      # we use /dkg/latest_active for round + stage, and eth_blockNumber for
+      # block height. Failures here are swallowed — the summary will show
+      # `?` for any field that couldn't be captured and the run continues.
+      - name: Capture pre-run chain state
+        id: env_pre
+        run: |
+          set +e
+          BLOCK_PRE_HEX=$(curl -sS --max-time 10 -X POST -H 'Content-Type: application/json' \
+            --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+            "$CDR_RPC_URL" 2>/dev/null | jq -r '.result // empty')
+          if [ -n "$BLOCK_PRE_HEX" ]; then BLOCK_PRE=$(( BLOCK_PRE_HEX )); else BLOCK_PRE=""; fi
+          LATEST_ACTIVE=$(curl -sS --max-time 10 "$CDR_API_URL/dkg/latest_active" 2>/dev/null)
+          # Diagnostic — surfaced only in the job step log, not in the
+          # Summary. If Story-API's response shape ever shifts again
+          # (it did in PR #73 → REST), the next failure will produce
+          # `?` in Summary; this echo lets the investigator see the
+          # raw body in one click instead of curling locally.
+          echo "/dkg/latest_active raw response: $LATEST_ACTIVE"
+          ROUND_PRE=$(echo "$LATEST_ACTIVE" | jq -r '.msg.network.round // empty' 2>/dev/null)
+          STAGE_PRE=$(echo "$LATEST_ACTIVE" | jq -r '.msg.network.stage // empty' 2>/dev/null)
+          TS_PRE=$(date +%s)
+          echo "block=$BLOCK_PRE" >> $GITHUB_OUTPUT
+          echo "round=$ROUND_PRE" >> $GITHUB_OUTPUT
+          echo "stage=$STAGE_PRE" >> $GITHUB_OUTPUT
+          echo "ts=$TS_PRE"       >> $GITHUB_OUTPUT
+          echo "pre-run: block=$BLOCK_PRE round=$ROUND_PRE stage=$STAGE_PRE"
+
+      # All three suites share the funder wallet (anvil-0 on DevNet, the
+      # long-lived Aeneid wallet otherwise), so they must run sequentially —
+      # parallel would collide on the nonce stream.
+      #
+      # Each step calls vitest directly via `npx` (NOT `pnpm test:integration -- …`)
+      # because pnpm passes the `--` separator through to vitest, where yargs
+      # treats it as end-of-options and the `--outputFile.json=…` flag is
+      # silently dropped. Two reporters: `default` (tee'd to *-integration.log)
+      # + `json` (parsed by the summary step into a per-case ✓/✗ table).
       - name: SDK integration
         id: sdk
         working-directory: packages/sdk
         run: |
           set -o pipefail
-          pnpm test:integration 2>&1 | tee /tmp/sdk-integration.log
+          npx vitest run --no-file-parallelism \
+            --exclude '**/__tests__/**' \
+            --exclude '**/__integration__/ephemeral-60min-stress.test.ts' \
+            --exclude '**/node_modules/**' \
+            --exclude '**/dist/**' \
+            --reporter=default --reporter=json \
+            --outputFile.json=/tmp/results-sdk.json 2>&1 | tee /tmp/sdk-integration.log
 
       - name: CLI integration
         id: cli
         working-directory: apps/cli
         run: |
           set -o pipefail
-          pnpm test:integration 2>&1 | tee /tmp/cli-integration.log
+          npx vitest run \
+            --exclude '**/__tests__/**' \
+            --exclude '**/node_modules/**' \
+            --exclude '**/dist/**' \
+            __integration__ \
+            --reporter=default --reporter=json \
+            --outputFile.json=/tmp/results-cli.json 2>&1 | tee /tmp/cli-integration.log
 
       - name: Examples integration
         id: examples
         working-directory: apps/examples
         run: |
           set -o pipefail
-          pnpm test:integration 2>&1 | tee /tmp/examples-integration.log
+          npx vitest run \
+            --exclude '**/node_modules/**' \
+            --exclude '**/dist/**' \
+            __integration__ \
+            --reporter=default --reporter=json \
+            --outputFile.json=/tmp/results-examples.json 2>&1 | tee /tmp/examples-integration.log
 
       - name: Write integration summary
         if: always()
@@ -175,9 +249,31 @@ jobs:
           SDK_OUTCOME: ${{ steps.sdk.outcome }}
           CLI_OUTCOME: ${{ steps.cli.outcome }}
           EXAMPLES_OUTCOME: ${{ steps.examples.outcome }}
+          BLOCK_PRE: ${{ steps.env_pre.outputs.block }}
+          ROUND_PRE: ${{ steps.env_pre.outputs.round }}
+          STAGE_PRE: ${{ steps.env_pre.outputs.stage }}
+          TS_PRE:    ${{ steps.env_pre.outputs.ts }}
         run: |
           # Strip ANSI color codes; capture vitest's three summary lines if present.
           strip_ansi() { sed -E $'s/\x1b\\[[0-9;]*[a-zA-Z]//g'; }
+          # Capture post-run chain state. Swallow errors so the summary
+          # still renders even if the chain is unreachable at this point.
+          BLOCK_POST_HEX=$(curl -sS --max-time 10 -X POST -H 'Content-Type: application/json' \
+            --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+            "$CDR_RPC_URL" 2>/dev/null | jq -r '.result // empty' 2>/dev/null || true)
+          if [ -n "$BLOCK_POST_HEX" ]; then BLOCK_POST=$(( BLOCK_POST_HEX )); else BLOCK_POST=""; fi
+          LATEST_ACTIVE=$(curl -sS --max-time 10 "$CDR_API_URL/dkg/latest_active" 2>/dev/null || echo '{}')
+          ROUND_POST=$(echo "$LATEST_ACTIVE" | jq -r '.msg.network.round // empty' 2>/dev/null)
+          STAGE_POST=$(echo "$LATEST_ACTIVE" | jq -r '.msg.network.stage // empty' 2>/dev/null)
+          TS_POST=$(date +%s)
+          fmt() { [ -n "$1" ] && echo "$1" || echo "?"; }
+          if [ -n "$BLOCK_PRE" ] && [ -n "$BLOCK_POST" ]; then
+            BLOCK_DELTA=$(( BLOCK_POST - BLOCK_PRE ))
+          else BLOCK_DELTA="?"; fi
+          if [ -n "$ROUND_PRE" ] && [ -n "$ROUND_POST" ]; then
+            ROUND_DELTA=$(( ROUND_POST - ROUND_PRE ))
+          else ROUND_DELTA="?"; fi
+          if [ -n "$TS_PRE" ]; then ELAPSED_S=$(( TS_POST - TS_PRE )); else ELAPSED_S="?"; fi
           icon() {
             case "$1" in
               success) echo "✅" ;;
@@ -187,31 +283,98 @@ jobs:
               *) echo "❔" ;;
             esac
           }
+          # Parse a vitest JSON reporter file ($1) into a per-case markdown
+          # table. The JSON reporter mirrors Jest's shape:
+          #   { numTotalTests, numPassedTests, numFailedTests,
+          #     testResults: [ { name, status,
+          #       assertionResults: [ { fullName, title, status, duration,
+          #                            failureMessages: [...] } ] } ] }
+          # Output:
+          #   - Roll-up counts (files passed/failed, tests passed/failed,
+          #     total duration in seconds)
+          #   - A `| File | Test | Status | Duration |` markdown table with
+          #     every assertion, ordered by file then in-file order.
+          #   - For each failing assertion, the first failureMessages line.
           summarize() {
-            local title=$1 log=$2 outcome=$3 scope=$4
+            local title=$1 outcome=$2 scope=$3 json=$4 log=$5
             local emoji; emoji=$(icon "$outcome")
             echo "### ${emoji} ${title} — \`${outcome}\`"
             echo ""
             echo "_${scope}_"
             echo ""
-            if [ -f "$log" ]; then
-              local files tests duration
-              files=$(grep -E "Test Files" "$log" | tail -1 | strip_ansi || true)
-              tests=$(grep -E "^[[:space:]]+Tests " "$log" | tail -1 | strip_ansi || true)
-              duration=$(grep -E "^[[:space:]]+Duration" "$log" | tail -1 | strip_ansi || true)
-              if [ -n "$files$tests$duration" ]; then
+            if [ ! -f "$json" ]; then
+              # JSON reporter file missing — usually means the test process
+              # crashed before vitest could write (e.g. TS compile error).
+              # Fall back to the tee'd log if present so the user has
+              # SOMETHING to read.
+              echo "_(no JSON reporter output at \`$json\` — vitest likely crashed before writing; raw log:)_"
+              if [ -f "$log" ]; then
+                echo ""
                 echo '```'
-                [ -n "$files" ]    && echo "$files"
-                [ -n "$tests" ]    && echo "$tests"
-                [ -n "$duration" ] && echo "$duration"
+                tail -40 "$log" | strip_ansi
                 echo '```'
-              else
-                echo "_(vitest summary not captured; check raw logs above)_"
+              fi
+              echo ""
+              return
+            fi
+            # Roll-up counts. `// 0` guards against missing fields on early
+            # vitest runs where a setup error short-circuits the run.
+            local files_passed files_failed tests_passed tests_failed dur_ms dur_s
+            files_passed=$(jq -r '.numPassedTestSuites // 0' "$json")
+            files_failed=$(jq -r '.numFailedTestSuites // 0' "$json")
+            tests_passed=$(jq -r '.numPassedTests // 0' "$json")
+            tests_failed=$(jq -r '.numFailedTests // 0' "$json")
+            # startTime + max(testResults[].endTime) gives total wall time
+            # — vitest doesn't emit a single "duration" field in its JSON.
+            dur_ms=$(jq -r '
+              ([.testResults[].endTime // 0] | max) as $end
+              | (.startTime // 0) as $start
+              | ($end - $start)
+            ' "$json")
+            dur_s=$(awk -v ms="$dur_ms" 'BEGIN { printf "%.1f", ms / 1000 }')
+            echo '```'
+            echo "Test Files  ${files_passed} passed | ${files_failed} failed"
+            echo "     Tests  ${tests_passed} passed | ${tests_failed} failed"
+            echo "  Duration  ${dur_s}s"
+            echo '```'
+            echo ""
+            local rows
+            rows=$(jq -r '
+              .testResults[] as $f
+              | ($f.name | split("/") | last) as $file
+              | $f.assertionResults[]
+              | "| `" + $file + "` | " + .title
+                + " | " + (if .status == "passed" then "✅" else if .status == "failed" then "❌" else "⏭️" end end)
+                + " | " + (if (.duration // 0) > 0 then ((.duration / 1000) | tostring + "s") else "—" end)
+                + " |"
+            ' "$json")
+            if [ -n "$rows" ]; then
+              echo "| File | Test | Status | Duration |"
+              echo "|---|---|---|---|"
+              echo "$rows"
+              echo ""
+              # Surface failures inline: first failure message per failing case.
+              local failures
+              failures=$(jq -r '
+                .testResults[] as $f
+                | ($f.name | split("/") | last) as $file
+                | $f.assertionResults[]
+                | select(.status == "failed")
+                | "**`" + $file + "` → " + .title + "`**\n\n```\n"
+                  + ((.failureMessages // [])[0] // "(no failureMessage)")
+                  + "\n```\n"
+              ' "$json")
+              if [ -n "$failures" ]; then
+                echo "<details><summary>Failures (${tests_failed})</summary>"
+                echo ""
+                echo "$failures"
+                echo "</details>"
+                echo ""
               fi
             else
-              echo "_(step did not run — no log)_"
+              echo "_(JSON reporter wrote but contained no assertion results)_"
+              echo ""
             fi
-            echo ""
           }
           {
             echo "## Integration test results"
@@ -219,19 +382,38 @@ jobs:
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Network | \`${NETWORK}\` |"
+            echo "| Test suite | \`${TEST_SUITE}\` |"
             echo "| CDR_API_URL | \`${CDR_API_URL}\` |"
             echo "| CDR_RPC_URL | \`${CDR_RPC_URL}\` |"
             echo "| Branch | \`${{ github.ref_name }}\` |"
             echo "| Commit | \`${{ github.sha }}\` |"
             echo ""
+            echo "### Chain state during run"
+            echo ""
+            echo "| | Pre | Post | Δ |"
+            echo "|---|---|---|---|"
+            echo "| EL block | $(fmt "$BLOCK_PRE") | $(fmt "$BLOCK_POST") | $BLOCK_DELTA |"
+            echo "| DKG round | $(fmt "$ROUND_PRE") | $(fmt "$ROUND_POST") | $ROUND_DELTA |"
+            echo "| DKG stage | $(fmt "$STAGE_PRE") | $(fmt "$STAGE_POST") | — |"
+            echo "| Wall time (s) | — | — | $ELAPSED_S |"
+            echo ""
+            echo "_DKG stage codes: 1 = Registration, 2 = Dealing, 3 = Finalization, 4 = Active._"
+            if [ "$ROUND_DELTA" != "?" ] && [ "$ROUND_DELTA" -gt 0 ]; then
+              echo ""
+              echo "> ⚠️ **DKG round rotated mid-run** (${ROUND_PRE} → ${ROUND_POST}). Vault reads spanning rotation may exercise the bucket-round filter (#75)."
+            fi
+            echo ""
             echo "### Per-suite results"
             echo ""
-            summarize "SDK integration"      /tmp/sdk-integration.log      "$SDK_OUTCOME" \
-              "packages/sdk/__integration__ — story-api / observer / uploader / consumer (49 cases incl. stress excluded)"
-            summarize "CLI integration"      /tmp/cli-integration.log      "$CLI_OUTCOME" \
-              "apps/cli/__integration__ — DKG state + upload + access + status commands (9 cases)"
-            summarize "Examples integration" /tmp/examples-integration.log "$EXAMPLES_OUTCOME" \
-              "apps/examples/__integration__ — query-dkg-state, upload-cdr, access-cdr, e2e-demo (4 cases)"
+            summarize "SDK integration" "$SDK_OUTCOME" \
+              "packages/sdk/__integration__ — story-api / observer / uploader / consumer + suite-gated ephemeral tests" \
+              /tmp/results-sdk.json /tmp/sdk-integration.log
+            summarize "CLI integration" "$CLI_OUTCOME" \
+              "apps/cli/__integration__ — DKG state + upload + access + status commands" \
+              /tmp/results-cli.json /tmp/cli-integration.log
+            summarize "Examples integration" "$EXAMPLES_OUTCOME" \
+              "apps/examples/__integration__ — query-dkg-state, upload-cdr, access-cdr, e2e-demo" \
+              /tmp/results-examples.json /tmp/examples-integration.log
           } >> $GITHUB_STEP_SUMMARY
 
   stress:
@@ -241,6 +423,7 @@ jobs:
     timeout-minutes: 120
     env:
       NETWORK: ${{ needs.prepare.outputs.network }}
+      TEST_SUITE: ${{ needs.prepare.outputs.test_suite }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -257,11 +440,32 @@ jobs:
           echo "CDR_RPC_URL=http://172.207.250.203:8545" >> $GITHUB_ENV
           echo "CDR_TEST_PRIVATE_KEY=${{ secrets.CDR_DEVNET_TEST_PRIVATE_KEY }}" >> $GITHUB_ENV
 
+      # Same env snapshot the integration job takes — gives the stress
+      # summary the same "before/after" block + round delta.
+      - name: Capture pre-run chain state
+        id: env_pre
+        run: |
+          set +e
+          BLOCK_PRE_HEX=$(curl -sS --max-time 10 -X POST -H 'Content-Type: application/json' \
+            --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+            "$CDR_RPC_URL" 2>/dev/null | jq -r '.result // empty')
+          if [ -n "$BLOCK_PRE_HEX" ]; then BLOCK_PRE=$(( BLOCK_PRE_HEX )); else BLOCK_PRE=""; fi
+          LATEST_ACTIVE=$(curl -sS --max-time 10 "$CDR_API_URL/dkg/latest_active" 2>/dev/null)
+          echo "/dkg/latest_active raw response: $LATEST_ACTIVE"
+          ROUND_PRE=$(echo "$LATEST_ACTIVE" | jq -r '.msg.network.round // empty' 2>/dev/null)
+          STAGE_PRE=$(echo "$LATEST_ACTIVE" | jq -r '.msg.network.stage // empty' 2>/dev/null)
+          TS_PRE=$(date +%s)
+          echo "block=$BLOCK_PRE" >> $GITHUB_OUTPUT
+          echo "round=$ROUND_PRE" >> $GITHUB_OUTPUT
+          echo "stage=$STAGE_PRE" >> $GITHUB_OUTPUT
+          echo "ts=$TS_PRE"       >> $GITHUB_OUTPUT
+          echo "pre-run: block=$BLOCK_PRE round=$ROUND_PRE stage=$STAGE_PRE"
+
       - name: Record stress start
         id: started
         run: echo "ts=$(date +%s)" >> $GITHUB_OUTPUT
 
-      - name: Run stress (1h)
+      - name: Run stress (60 min)
         id: stress
         working-directory: packages/sdk
         run: |
@@ -281,6 +485,10 @@ jobs:
         env:
           STRESS_OUTCOME: ${{ steps.stress.outcome }}
           STARTED_TS: ${{ steps.started.outputs.ts }}
+          BLOCK_PRE: ${{ steps.env_pre.outputs.block }}
+          ROUND_PRE: ${{ steps.env_pre.outputs.round }}
+          STAGE_PRE: ${{ steps.env_pre.outputs.stage }}
+          TS_PRE:    ${{ steps.env_pre.outputs.ts }}
         run: |
           icon() {
             case "$1" in
@@ -296,6 +504,21 @@ jobs:
           elapsed=$(( now - ${STARTED_TS:-$now} ))
           mins=$(( elapsed / 60 ))
           secs=$(( elapsed % 60 ))
+          # Post-run chain state — match the integration job's table.
+          BLOCK_POST_HEX=$(curl -sS --max-time 10 -X POST -H 'Content-Type: application/json' \
+            --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+            "$CDR_RPC_URL" 2>/dev/null | jq -r '.result // empty' 2>/dev/null || true)
+          if [ -n "$BLOCK_POST_HEX" ]; then BLOCK_POST=$(( BLOCK_POST_HEX )); else BLOCK_POST=""; fi
+          LATEST_ACTIVE=$(curl -sS --max-time 10 "$CDR_API_URL/dkg/latest_active" 2>/dev/null || echo '{}')
+          ROUND_POST=$(echo "$LATEST_ACTIVE" | jq -r '.msg.network.round // empty' 2>/dev/null)
+          STAGE_POST=$(echo "$LATEST_ACTIVE" | jq -r '.msg.network.stage // empty' 2>/dev/null)
+          fmt() { [ -n "$1" ] && echo "$1" || echo "?"; }
+          if [ -n "$BLOCK_PRE" ] && [ -n "$BLOCK_POST" ]; then
+            BLOCK_DELTA=$(( BLOCK_POST - BLOCK_PRE ))
+          else BLOCK_DELTA="?"; fi
+          if [ -n "$ROUND_PRE" ] && [ -n "$ROUND_POST" ]; then
+            ROUND_DELTA=$(( ROUND_POST - ROUND_PRE ))
+          else ROUND_DELTA="?"; fi
 
           {
             echo "## ${emoji} Stress test — \`${STRESS_OUTCOME}\`"
@@ -303,12 +526,24 @@ jobs:
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Network | DevNet (\`${CDR_API_URL}\`) |"
+            echo "| Test suite | \`${TEST_SUITE}\` |"
             echo "| Funder | anvil-0 (\`${CDR_TEST_PRIVATE_KEY:+set}\`) |"
-            echo "| Wallets | 10 ephemeral, 1000 IP each from funder |"
-            echo "| Workload | every 10s, per-wallet: \`uploadCDR\` (own vault) + \`accessCDR\` (shared vault) |"
-            echo "| Concurrency | cross-wallet parallel, per-wallet sequential (viem nonce safety) |"
             echo "| Elapsed | ${mins}m${secs}s |"
             echo "| Log artifact | \`cdr-stress-log-${{ github.run_id }}\` (14-day retention) |"
+            echo ""
+            echo "### Chain state during run"
+            echo ""
+            echo "| | Pre | Post | Δ |"
+            echo "|---|---|---|---|"
+            echo "| EL block | $(fmt "$BLOCK_PRE") | $(fmt "$BLOCK_POST") | $BLOCK_DELTA |"
+            echo "| DKG round | $(fmt "$ROUND_PRE") | $(fmt "$ROUND_POST") | $ROUND_DELTA |"
+            echo "| DKG stage | $(fmt "$STAGE_PRE") | $(fmt "$STAGE_POST") | — |"
+            echo ""
+            echo "_DKG stage codes: 1 = Registration, 2 = Dealing, 3 = Finalization, 4 = Active._"
+            if [ "$ROUND_DELTA" != "?" ] && [ "$ROUND_DELTA" -gt 0 ]; then
+              echo ""
+              echo "> ⚠️ **DKG round rotated mid-run** (${ROUND_PRE} → ${ROUND_POST})."
+            fi
             echo ""
             if [ -f /tmp/cdr-stress.log ]; then
               total=$(wc -l < /tmp/cdr-stress.log | tr -d ' ')

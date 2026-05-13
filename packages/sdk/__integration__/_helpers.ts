@@ -77,3 +77,40 @@ export function countFetchCallsTo(
 ): number {
   return dkgFetchUrls(spy).filter((u) => u.includes(path)).length;
 }
+
+/**
+ * Numeric statistics for the perf / stress / 100w suites.
+ *
+ * Quantile uses the "nearest-rank" method (no interpolation) so the
+ * returned value is always an actual sample from the input — easier to
+ * cross-check against the raw timing log.
+ */
+export function quantile(values: number[], p: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const idx = Math.min(
+    Math.max(0, Math.ceil((p / 100) * sorted.length) - 1),
+    sorted.length - 1,
+  );
+  return sorted[idx];
+}
+
+export const p50 = (v: number[]): number => quantile(v, 50);
+export const p95 = (v: number[]): number => quantile(v, 95);
+export const p99 = (v: number[]): number => quantile(v, 99);
+
+export function mean(values: number[]): number {
+  if (values.length === 0) return 0;
+  return values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+export function max(values: number[]): number {
+  if (values.length === 0) return 0;
+  return values.reduce((a, b) => (a > b ? a : b));
+}
+
+/** Format milliseconds as a short human-readable string (e.g. `12.3s`, `850ms`). */
+export function formatMs(ms: number): string {
+  if (ms < 1000) return `${ms.toFixed(0)}ms`;
+  return `${(ms / 1000).toFixed(2)}s`;
+}

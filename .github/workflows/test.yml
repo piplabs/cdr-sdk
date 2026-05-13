@@ -18,13 +18,159 @@ jobs:
           cache: pnpm
       - run: pnpm install
       - run: pnpm build
-      - name: Run tests with coverage
-        run: pnpm test:coverage
+
+      # Per-package vitest invocations: each emits BOTH a default reporter
+      # (tee'd to /tmp/unit-{pkg}.log) AND a json reporter consumed by the
+      # summary step for a per-case ✓/✗ table. We call vitest directly
+      # (NOT `pnpm test:coverage`) so the --reporter flags actually reach
+      # vitest's CLI parser — going through pnpm with `--` drops the
+      # `--outputFile.json=…` arg silently.
+      - name: packages/sdk unit tests
+        id: unit_sdk
+        working-directory: packages/sdk
+        run: |
+          set -o pipefail
+          npx vitest run --coverage \
+            --exclude '**/__integration__/**' \
+            --exclude '**/node_modules/**' \
+            --exclude '**/dist/**' \
+            --reporter=default --reporter=json \
+            --outputFile.json=/tmp/results-unit-sdk.json 2>&1 | tee /tmp/unit-sdk.log
+
+      - name: packages/crypto unit tests
+        id: unit_crypto
+        working-directory: packages/crypto
+        run: |
+          set -o pipefail
+          npx vitest run --coverage \
+            --reporter=default --reporter=json \
+            --outputFile.json=/tmp/results-unit-crypto.json 2>&1 | tee /tmp/unit-crypto.log
+
+      - name: apps/cli unit tests
+        id: unit_cli
+        working-directory: apps/cli
+        run: |
+          set -o pipefail
+          npx vitest run \
+            --exclude '**/__integration__/**' \
+            --exclude '**/node_modules/**' \
+            --exclude '**/dist/**' \
+            --reporter=default --reporter=json \
+            --outputFile.json=/tmp/results-unit-cli.json 2>&1 | tee /tmp/unit-cli.log
+
+      - name: Write unit-test summary
+        if: always()
+        env:
+          SDK_OUTCOME: ${{ steps.unit_sdk.outcome }}
+          CRYPTO_OUTCOME: ${{ steps.unit_crypto.outcome }}
+          CLI_OUTCOME: ${{ steps.unit_cli.outcome }}
+        run: |
+          strip_ansi() { sed -E $'s/\x1b\\[[0-9;]*[a-zA-Z]//g'; }
+          icon() {
+            case "$1" in
+              success) echo "✅" ;;
+              failure) echo "❌" ;;
+              skipped) echo "⏭️" ;;
+              cancelled) echo "🛑" ;;
+              *) echo "❔" ;;
+            esac
+          }
+          # Same parser as integration.yml's summary — kept inline (not
+          # factored out into a composite action) because the duplication
+          # is small and reading two workflows is simpler than chasing a
+          # shared action.
+          summarize() {
+            local title=$1 outcome=$2 scope=$3 json=$4 log=$5
+            local emoji; emoji=$(icon "$outcome")
+            echo "### ${emoji} ${title} — \`${outcome}\`"
+            echo ""
+            echo "_${scope}_"
+            echo ""
+            if [ ! -f "$json" ]; then
+              echo "_(no JSON reporter output at \`$json\` — vitest likely crashed before writing; raw log:)_"
+              if [ -f "$log" ]; then
+                echo ""
+                echo '```'
+                tail -40 "$log" | strip_ansi
+                echo '```'
+              fi
+              echo ""
+              return
+            fi
+            local files_passed files_failed tests_passed tests_failed dur_ms dur_s
+            files_passed=$(jq -r '.numPassedTestSuites // 0' "$json")
+            files_failed=$(jq -r '.numFailedTestSuites // 0' "$json")
+            tests_passed=$(jq -r '.numPassedTests // 0' "$json")
+            tests_failed=$(jq -r '.numFailedTests // 0' "$json")
+            dur_ms=$(jq -r '
+              ([.testResults[].endTime // 0] | max) as $end
+              | (.startTime // 0) as $start
+              | ($end - $start)
+            ' "$json")
+            dur_s=$(awk -v ms="$dur_ms" 'BEGIN { printf "%.1f", ms / 1000 }')
+            echo '```'
+            echo "Test Files  ${files_passed} passed | ${files_failed} failed"
+            echo "     Tests  ${tests_passed} passed | ${tests_failed} failed"
+            echo "  Duration  ${dur_s}s"
+            echo '```'
+            echo ""
+            local rows
+            rows=$(jq -r '
+              .testResults[] as $f
+              | ($f.name | split("/") | last) as $file
+              | $f.assertionResults[]
+              | "| `" + $file + "` | " + .title
+                + " | " + (if .status == "passed" then "✅" else if .status == "failed" then "❌" else "⏭️" end end)
+                + " | " + (if (.duration // 0) > 0 then ((.duration / 1000) | tostring + "s") else "—" end)
+                + " |"
+            ' "$json")
+            if [ -n "$rows" ]; then
+              echo "| File | Test | Status | Duration |"
+              echo "|---|---|---|---|"
+              echo "$rows"
+              echo ""
+              local failures
+              failures=$(jq -r '
+                .testResults[] as $f
+                | ($f.name | split("/") | last) as $file
+                | $f.assertionResults[]
+                | select(.status == "failed")
+                | "**`" + $file + "` → " + .title + "**\n\n```\n"
+                  + ((.failureMessages // [])[0] // "(no failureMessage)")
+                  + "\n```\n"
+              ' "$json")
+              if [ -n "$failures" ]; then
+                echo "<details><summary>Failures (${tests_failed})</summary>"
+                echo ""
+                echo "$failures"
+                echo "</details>"
+                echo ""
+              fi
+            fi
+          }
+          {
+            echo "## Unit-test results"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Branch | \`${{ github.ref_name }}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo ""
+            echo "### Per-package results"
+            echo ""
+            summarize "packages/sdk"    "$SDK_OUTCOME"    "src/__tests__ — observer / consumer / uploader / conditions / attestation" \
+              /tmp/results-unit-sdk.json    /tmp/unit-sdk.log
+            summarize "packages/crypto" "$CRYPTO_OUTCOME" "src/__tests__ — TDH2 + ECIES + WASM envelope helpers" \
+              /tmp/results-unit-crypto.json /tmp/unit-crypto.log
+            summarize "apps/cli"        "$CLI_OUTCOME"    "src/__tests__ — CLI command parsing + flag handling" \
+              /tmp/results-unit-cli.json    /tmp/unit-cli.log
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Generate coverage summary
         if: always()
         run: |
           {
-            echo "## Unit Test Coverage"
+            echo "## Unit-test coverage"
             echo ""
             for pkg in packages/sdk packages/crypto; do
               SUMMARY="$pkg/coverage/coverage-summary.json"

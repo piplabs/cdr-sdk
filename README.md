@@ -169,40 +169,85 @@ pnpm exec vitest story-api           # watch + path filter
 
 ### Integration Tests
 
-Integration tests in `packages/sdk/__integration__/` exercise the Story-API REST client (`packages/sdk/src/story-api/`) against a live endpoint. They are excluded from the default `pnpm test` and run via a separate command.
+Integration tests in `packages/sdk/__integration__/` exercise the SDK against a live network. Excluded from the default `pnpm test`; run via separate commands.
 
 Setup (one-time, after cloning):
 
 ```bash
 cp .env.local.example .env.local
-$EDITOR .env.local   # fill in CDR_API_URL at minimum
+$EDITOR .env.local   # fill in CDR_API_URL + CDR_RPC_URL + CDR_TEST_PRIVATE_KEY
 ```
 
-Run:
-
-```bash
-# all integration tests (from monorepo root or packages/sdk)
-pnpm test:integration
-
-# only one test file — substring match against test paths (from packages/sdk)
-cd packages/sdk
-pnpm test:integration story-api
-
-# only one test case within a file (from packages/sdk)
-pnpm test:integration story-api -t "queryCDRPartials"
-
-# temporarily override the endpoint without editing .env.local
-CDR_API_URL=http://172.207.250.203:1317 pnpm test:integration
-```
-
-Path / `-t` filters only work when running from `packages/sdk` directly (`turbo` doesn't forward extra args at the monorepo root).
-
-`.env.local` is gitignored; `.env.local.example` documents the variables. If `CDR_API_URL` is unset the test suite hard-fails with a clear error.
+`.env.local` is gitignored; `.env.local.example` documents the variables. The suites hard-fail at load time if any of the three is unset.
 
 | Endpoint | Aeneid validator5 | DevNet validator2 |
 |---|---|---|
 | Story-API REST | `http://172.192.41.96:1317` | `http://172.207.250.203:1317` |
-| EVM RPC | `http://172.192.41.96:8545` | `http://172.207.250.203:8545` |
+| EVM RPC | `https://aeneid.storyrpc.io` | `http://172.207.250.203:8545` |
+
+#### Test files
+
+The suite is structured around two axes — what the test does (functional groups) and what scale it runs at (suite gates).
+
+**Functional groups (no suite gating — always run):**
+
+| File | Coverage |
+|---|---|
+| `story-api.test.ts` | Story-API REST client wire-level: round, network, partials, registrations |
+| `observer.test.ts` | Observer methods over real REST + RPC, including per-round caching |
+| `uploader.test.ts` | `encryptDataKey`, `allocate`, `uploadCDR`, write/feeOverride/EOA-condition policies |
+| `consumer.test.ts` | `accessCDR`, `collectPartials`, `decryptDataKey`, queryCDRPartials, plus the #75 / #79 regression cases (ACC-04c TOCTOU) |
+| `dx-improvements.test.ts` | DX-01..04 — `conditions` helpers, simplified accessCDR, method aliases (DX-03 LicenseReadCondition skipped pending dep) |
+| `security.test.ts` | SEC-01..09 — WASM hash, pinned crypto deps, threshold ratio, SGX DCAP Quote v3 parse + verify, label-mismatch on write |
+| `perf-micro.test.ts` | PERF-01..05 — single-op latency benchmarks (initWasm, observer queries, upload breakdown, accessCDR, full roundtrip) |
+| `errors.test.ts` | ERR-01 / ERR-02 / ERR-05 — error-path gaps not covered by the per-class suites |
+
+**Suite-gated (`describe.skipIf(skipUnlessSuite(...))`) — ephemeral-wallet tests:**
+
+| File | Suite gate | Networks | Wall time (typ.) |
+|---|---|---|---|
+| `ephemeral-100w-shared.test.ts` | `default`, `all` | DevNet + Aeneid | ~2 min |
+| `ephemeral-100w-fresh.test.ts` | `default`, `all` | DevNet + Aeneid | ~5 min |
+| `ephemeral-1000w-perf.test.ts` | `1000-wallet-performance`, `all` | DevNet + Aeneid | ~30-50 min |
+| `ephemeral-60min-stress.test.ts` | `1H-stress-devnet-only`, `all` | **DevNet only** | 60 min |
+
+Suite gating is steered by the `TEST_SUITE` env var, defaulted to `"default"` by `_suite.ts`. The CI workflow's `test_suite` input maps 1:1 to this env var.
+
+The ephemeral-wallet suites use `_ephemeral-wallets.ts` helpers:
+- `generateEphemeralWallets(N)` — fresh in-memory keypairs.
+- `fundWallets(funder, wallets, perWalletWei)` — one Multicall3.aggregate3Value tx that batch-funds every wallet (auto-deploys Multicall3 on fresh DevNet, uses the canonical `0xcA11...` address everywhere else).
+- `refundWallets(wallets, recipient, rpcUrl)` — per-wallet concurrent sweep with a gas reserve; failures are counted, not thrown.
+
+#### Running locally
+
+```bash
+# All non-gated tests + default-suite ephemeral tests (devnet)
+pnpm test:integration
+
+# Single file (path substring; run from packages/sdk)
+cd packages/sdk
+pnpm test:integration consumer
+
+# Single test case
+pnpm test:integration consumer -t "ACC-04c"
+
+# Pick a non-default suite (steers describe.skipIf in test files)
+TEST_SUITE=1000-wallet-performance pnpm test:integration
+
+# 60-minute stress (DevNet only — uses a separate vitest entry)
+pnpm test:stress
+```
+
+Path / `-t` filters only work when running from `packages/sdk` directly; turbo doesn't forward extra args at the monorepo root.
+
+#### CI / GitHub Actions
+
+The `Integration` workflow (`.github/workflows/integration.yml`) is the canonical place to run cross-network or expensive suites:
+
+- **PR trigger** — always `network=devnet, test_suite=default`. Runs the four `default`-gated ephemeral tests + every non-gated file.
+- **Manual dispatch** — pick `network` (devnet/aeneid) × `test_suite` (default / all / 1000-wallet-performance / 1H-stress-devnet-only). The `1H-stress-devnet-only` suite is hard-rejected at the prepare step when `network != devnet`.
+
+The workflow's summary step renders per-case ✓/✗ tables (parsed from vitest's JSON reporter) and a pre/post chain-state delta (EL block + DKG round) so a long run's effect on the chain is visible at a glance.
 
 ### Running Examples
 
