@@ -359,7 +359,6 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
                   accessAuxData: "0x",
                 });
                 const uploadDur = Date.now() - tUpload;
-                uploadLats.push(uploadDur);
                 logLine(
                   `[w[${idx}] cycle=${cycleIdx} UPLOAD ok] uuid=${upload.uuid} ${uploadDur}ms`,
                 );
@@ -372,7 +371,6 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
                   timeoutMs: ACCESS_TIMEOUT_MS,
                 });
                 const accessDur = Date.now() - tAccess;
-                accessLats.push(accessDur);
                 const ok = bytesEqual(access.dataKey, sharedDataKey);
                 logLine(
                   `[w[${idx}] cycle=${cycleIdx} ACCESS ${ok ? "ok" : "MISMATCH"}] uuid=${sharedVaultUuid} tx=${access.txHash} ${accessDur}ms`,
@@ -382,6 +380,13 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
                     `w[${idx}] cycle=${cycleIdx} dataKey mismatch on shared uuid=${sharedVaultUuid}`,
                   );
                 }
+                // Push BOTH latencies together — only when the full cycle
+                // succeeded end-to-end. Pushing uploadDur eagerly above
+                // would let partially-failed cycles' upload times bias
+                // the upload p50/p95, decoupling the two arrays from
+                // `totalCycles`. Reviewer caught this on PR #83.
+                uploadLats.push(uploadDur);
+                accessLats.push(accessDur);
                 totalCycles++;
               } catch (e) {
                 failedCycles++;
@@ -398,6 +403,12 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
         );
 
         const wallClockMs = Date.now() - startTime;
+        // Use `statsOf` — same nearest-rank quantile method `writePerfStats`
+        // uses in afterAll, so the numbers in this log line match the
+        // numbers in /tmp/perf-stats-stress.json exactly. The previous
+        // inline math used floor-based indexing and produced slightly
+        // different p50/p95 from the JSON — reviewer caught the
+        // inconsistency on PR #83.
         const stats = {
           duration_min: (wallClockMs / 60_000).toFixed(1),
           total_cycles: totalCycles,
@@ -406,34 +417,8 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
             (failedCycles / Math.max(1, totalCycles + failedCycles)) *
             100
           ).toFixed(2),
-          upload: {
-            count: uploadLats.length,
-            p50_ms: Math.round(
-              [...uploadLats].sort((a, b) => a - b)[
-                Math.floor(uploadLats.length * 0.5)
-              ] ?? 0,
-            ),
-            p95_ms: Math.round(
-              [...uploadLats].sort((a, b) => a - b)[
-                Math.floor(uploadLats.length * 0.95)
-              ] ?? 0,
-            ),
-            max_ms: uploadLats.length > 0 ? Math.max(...uploadLats) : 0,
-          },
-          access: {
-            count: accessLats.length,
-            p50_ms: Math.round(
-              [...accessLats].sort((a, b) => a - b)[
-                Math.floor(accessLats.length * 0.5)
-              ] ?? 0,
-            ),
-            p95_ms: Math.round(
-              [...accessLats].sort((a, b) => a - b)[
-                Math.floor(accessLats.length * 0.95)
-              ] ?? 0,
-            ),
-            max_ms: accessLats.length > 0 ? Math.max(...accessLats) : 0,
-          },
+          upload: statsOf(uploadLats),
+          access: statsOf(accessLats),
         };
         logLine(`[stress summary] ${JSON.stringify(stats)}`);
         perfBuffer = {
