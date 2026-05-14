@@ -42,7 +42,50 @@ jobs:
         with:
           node-version: '20'
           cache: pnpm
-          registry-url: 'https://registry.npmjs.org'
+          # No `registry-url` — that input causes setup-node to write a
+          # workspace-local .npmrc with `_authToken=${NODE_AUTH_TOKEN}`.
+          # When no NODE_AUTH_TOKEN secret is provided (we want OIDC instead),
+          # the placeholder literal "XXXXX-XXXXX-XXXXX-XXXXX" gets written
+          # verbatim as the bearer token, the npm CLI never falls through to
+          # the OIDC trusted-publisher path, and every PUT returns 404.
+          # Default registry (registry.npmjs.org) is correct; no explicit
+          # registry config needed.
+
+      # Node 20 ships with npm 10.x. OIDC Trusted Publisher exchange was added
+      # in npm 11.x — without this upgrade, even with Trusted Publisher config
+      # and a clean .npmrc, the npm CLI would not know how to mint an OIDC
+      # token at publish time. `pnpm changeset publish` delegates the actual
+      # PUT to npm, so npm version is the binding constraint here.
+      - name: Upgrade npm to support OIDC Trusted Publisher
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      # Diagnostic: print the auth/OIDC-relevant state right before publish.
+      # Cheap insurance — any further regression will show us in one place
+      # whether .npmrc has stale auth, whether NODE_AUTH_TOKEN got injected,
+      # and whether the OIDC token-request env is present.
+      - name: Diagnose publish auth state
+        run: |
+          echo "--- versions ---"
+          echo "npm:  $(npm --version)"
+          echo "node: $(node --version)"
+          echo "pnpm: $(pnpm --version)"
+          echo "--- auth-related env vars (presence only, never the value) ---"
+          echo "NPM_CONFIG_USERCONFIG=${NPM_CONFIG_USERCONFIG:-unset}"
+          echo "NODE_AUTH_TOKEN=${NODE_AUTH_TOKEN:+set}"
+          echo "NPM_TOKEN=${NPM_TOKEN:+set}"
+          echo "GITHUB_ACTIONS=$GITHUB_ACTIONS"
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL=${ACTIONS_ID_TOKEN_REQUEST_URL:+set}"
+          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN=${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+set}"
+          echo "--- effective .npmrc (from NPM_CONFIG_USERCONFIG, if any) ---"
+          if [ -f "${NPM_CONFIG_USERCONFIG:-/dev/null}" ]; then
+            cat "$NPM_CONFIG_USERCONFIG"
+          else
+            echo "(no .npmrc at NPM_CONFIG_USERCONFIG)"
+          fi
+          echo "--- npm registry resolution ---"
+          npm config get registry
 
       - run: pnpm install --frozen-lockfile
 
