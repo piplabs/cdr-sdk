@@ -9,7 +9,7 @@ vi.mock("@piplabs/cdr-crypto", () => ({
 
 import { Uploader } from "../src/uploader.js";
 import { tdh2Encrypt } from "@piplabs/cdr-crypto";
-import { ContentSizeExceededError } from "../src/errors.js";
+import { ContentSizeExceededError, InvalidConditionContractError } from "../src/errors.js";
 import type { Observer } from "../src/observer.js";
 
 /**
@@ -140,6 +140,114 @@ describe("Uploader", () => {
     expect(callArgs.value).toBe(500n);
     expect(publicClient.readContract).not.toHaveBeenCalled();
     expect(result.uuid).toBe(7);
+  });
+
+  it("allocate rejects when condition contract does not implement the check function", async () => {
+    // Empty revert payload from a `ContractFunctionRevertedError` is the EVM
+    // dispatcher's fallback signal — the function selector was not routed.
+    // This is the case the previous (buggy) preflight silently accepted.
+    const { publicClient, walletClient } = mockClients();
+    publicClient.simulateContract.mockRejectedValue({
+      cause: { name: "ContractFunctionRevertedError", raw: "0x" },
+    });
+
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer: fakeObserver(),
+    });
+
+    await expect(
+      uploader.allocate({
+        updatable: false,
+        writeConditionAddr: "0x1111111111111111111111111111111111111111",
+        readConditionAddr: "0x2222222222222222222222222222222222222222",
+        writeConditionData: "0x",
+        readConditionData: "0x",
+      }),
+    ).rejects.toThrow(InvalidConditionContractError);
+
+    // Short-circuits before allocate would have been broadcast.
+    expect(walletClient.writeContract).not.toHaveBeenCalled();
+  });
+
+  it("allocate accepts when condition function body reverts with non-empty data", async () => {
+    // Function exists and reverted with an Error(string) payload —
+    // selector 0x08c379a0 + abi-encoded "demo". The preflight treats any
+    // non-empty revert payload as "selector found, body ran."
+    const { publicClient, walletClient } = mockClients();
+    publicClient.simulateContract.mockRejectedValue({
+      cause: {
+        name: "ContractFunctionRevertedError",
+        raw:
+          "0x08c379a0" +
+          "0000000000000000000000000000000000000000000000000000000000000020" +
+          "0000000000000000000000000000000000000000000000000000000000000004" +
+          "64656d6f00000000000000000000000000000000000000000000000000000000",
+      },
+    });
+    publicClient.readContract.mockResolvedValueOnce(1000n);
+    walletClient.writeContract.mockResolvedValueOnce("0xtxhash" as `0x${string}`);
+    publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
+      logs: [makeVaultAllocatedLog(99)],
+    });
+
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer: fakeObserver(),
+    });
+
+    const result = await uploader.allocate({
+      updatable: false,
+      writeConditionAddr: "0x1111111111111111111111111111111111111111",
+      readConditionAddr: "0x2222222222222222222222222222222222222222",
+      writeConditionData: "0x",
+      readConditionData: "0x",
+    });
+
+    expect(result.uuid).toBe(99);
+  });
+
+  it("allocate preflight probes condition contracts with the 4-arg signature", async () => {
+    const { publicClient, walletClient } = mockClients();
+    publicClient.readContract.mockResolvedValueOnce(1000n);
+    walletClient.writeContract.mockResolvedValueOnce("0xtxhash" as `0x${string}`);
+    publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
+      logs: [makeVaultAllocatedLog(1)],
+    });
+
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer: fakeObserver(),
+    });
+
+    await uploader.allocate({
+      updatable: false,
+      writeConditionAddr: "0x1111111111111111111111111111111111111111",
+      readConditionAddr: "0x2222222222222222222222222222222222222222",
+      writeConditionData: "0x",
+      readConditionData: "0x",
+    });
+
+    // Once per side. The exact signature matters: regressing to the 3-arg
+    // form would silently misalign with deployed condition contracts.
+    expect(publicClient.simulateContract).toHaveBeenCalledTimes(2);
+    for (const call of publicClient.simulateContract.mock.calls) {
+      const { abi, functionName, args } = call[0];
+      expect(["checkWriteCondition", "checkReadCondition"]).toContain(functionName);
+      expect(abi[0].inputs).toEqual([
+        { name: "uuid", type: "uint32" },
+        { name: "accessAuxData", type: "bytes" },
+        { name: "conditionData", type: "bytes" },
+        { name: "caller", type: "address" },
+      ]);
+      expect(args).toHaveLength(4);
+    }
   });
 
   it("write sends tx with correct fee", async () => {
