@@ -7,6 +7,19 @@ when a quorum of validators provide partial decryptions.
 
 ## Install
 
+Each package is published to npm and can be installed independently:
+
+| Package | Install | Description |
+|---|---|---|
+| [`@piplabs/cdr-sdk`](./packages/sdk) | `npm i @piplabs/cdr-sdk` | Main SDK — `CDRClient`, `Observer`, `Uploader`, `Consumer` |
+| [`@piplabs/cdr-contracts`](./packages/contracts) | `npm i @piplabs/cdr-contracts` | Contract ABIs and network addresses |
+| [`@piplabs/cdr-crypto`](./packages/crypto) | `npm i @piplabs/cdr-crypto` | TDH2 encryption, ECIES decryption, WASM loader |
+| [`@piplabs/cdr-cli`](./apps/cli) | `npm i -g @piplabs/cdr-cli` | Command-line interface |
+
+Most consumers only need `@piplabs/cdr-sdk` — it re-exports everything
+relevant from `cdr-crypto` and `cdr-contracts`. Install `viem` as a peer
+dependency:
+
 ```bash
 pnpm add @piplabs/cdr-sdk viem
 # Optional storage adapters (only the one you'll use):
@@ -136,16 +149,6 @@ Two condition contracts are deployed on Aeneid testnet:
 | LicenseReadCondition | `0xC0640AD4CF2CaA9914C8e5C44234359a9102f7a3` | Only Story Protocol license holders can read |
 
 See [Condition Contracts](./docs/CONDITIONS.md) for the interface spec, more examples, and usage details.
-
-## Packages
-
-| Package | Description |
-|---------|-------------|
-| [`@piplabs/cdr-sdk`](./packages/sdk) | Main SDK — `CDRClient`, `Observer`, `Uploader`, `Consumer` |
-| [`@piplabs/cdr-contracts`](./packages/contracts) | Contract ABIs and network addresses |
-| [`@piplabs/cdr-crypto`](./packages/crypto) | TDH2 encryption, ECIES decryption, WASM loader |
-| [`@piplabs/cdr-cli`](./apps/cli) | Command-line interface |
-| [`@piplabs/cdr-examples`](./apps/examples) | Example scripts |
 
 ## Development
 
