@@ -16,12 +16,13 @@ on:
         default: devnet
       test_suite:
         type: choice
-        description: Which suite to run (gated inside test files via TEST_SUITE env)
+        description: Which suite to run
         options:
-          # default                 — basic SDK/CLI/Examples + 100w ephemeral tests
-          # all                     — default + 1000w perf + 60min stress (stress devnet-only)
-          # 1000-wallet-performance — basic + the 1000-wallet perf suite
-          # 1H-stress-devnet-only   — only the 60-min combined stress (DevNet only)
+          # default                 — functional (SDK/CLI/Examples) + 100w ephemeral
+          # all                     — default + 1000w perf + 60min stress
+          # 1000-wallet-performance — ONLY ephemeral-1000w-perf.test.ts (strict isolation:
+          #                           no functional, no CLI, no Examples — clean perf signal)
+          # 1H-stress-devnet-only   — ONLY ephemeral-60min-stress.test.ts (DevNet only)
           - default
           - all
           - 1000-wallet-performance
@@ -202,23 +203,37 @@ jobs:
       # because pnpm passes the `--` separator through to vitest, where yargs
       # treats it as end-of-options and the `--outputFile.json=…` flag is
       # silently dropped.
+      # Strict isolation for the perf-only suites:
+      #   - 1000-wallet-performance → SDK step runs ONLY the 1000w-perf file,
+      #     CLI + Examples steps skip entirely. Goal: clean perf signal
+      #     without ~10 min of functional-test noise on the funder wallet.
+      #   - default / all → SDK step runs everything (vitest's default glob),
+      #     minus the stress file (which has its own dedicated step below).
+      # The describe.skipIf gates inside test files still apply on top, so
+      # for `all` the 1000w-perf describe runs (gate matches "all"), and
+      # for `default` it gets skipIf'd out.
       - name: SDK integration
         id: sdk
         if: ${{ env.RUN_INTEGRATION == 'true' }}
         working-directory: packages/sdk
         run: |
           set -o pipefail
+          INCLUDE_ARGS=()
+          if [ "$TEST_SUITE" = "1000-wallet-performance" ]; then
+            INCLUDE_ARGS=('__integration__/ephemeral-1000w-perf.test.ts')
+          fi
           npx vitest run --no-file-parallelism \
             --exclude '**/__tests__/**' \
             --exclude '**/__integration__/ephemeral-60min-stress.test.ts' \
             --exclude '**/node_modules/**' \
             --exclude '**/dist/**' \
+            "${INCLUDE_ARGS[@]}" \
             --reporter=default --reporter=json \
             --outputFile.json=/tmp/results-sdk.json 2>&1 | tee /tmp/sdk-integration.log
 
       - name: CLI integration
         id: cli
-        if: ${{ env.RUN_INTEGRATION == 'true' }}
+        if: ${{ env.RUN_INTEGRATION == 'true' && env.TEST_SUITE != '1000-wallet-performance' }}
         working-directory: apps/cli
         run: |
           set -o pipefail
@@ -232,7 +247,7 @@ jobs:
 
       - name: Examples integration
         id: examples
-        if: ${{ env.RUN_INTEGRATION == 'true' }}
+        if: ${{ env.RUN_INTEGRATION == 'true' && env.TEST_SUITE != '1000-wallet-performance' }}
         working-directory: apps/examples
         run: |
           set -o pipefail
