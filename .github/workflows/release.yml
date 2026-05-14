@@ -42,7 +42,14 @@ jobs:
         with:
           node-version: '20'
           cache: pnpm
-          registry-url: 'https://registry.npmjs.org'
+          # No `registry-url` — that input causes setup-node to write a
+          # workspace-local .npmrc with `_authToken=${NODE_AUTH_TOKEN}`.
+          # When no NODE_AUTH_TOKEN secret is provided (we want OIDC instead),
+          # the placeholder literal "XXXXX-XXXXX-XXXXX-XXXXX" gets written
+          # verbatim as the bearer token, the npm CLI never falls through to
+          # the OIDC trusted-publisher path, and every PUT returns 404.
+          # Default registry (registry.npmjs.org) is correct; no explicit
+          # registry config needed.
 
       - run: pnpm install --frozen-lockfile
 
