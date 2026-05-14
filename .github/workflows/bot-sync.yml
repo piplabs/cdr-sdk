@@ -44,5 +44,13 @@ jobs:
           # Version Packages PR. Actual npm publish is handled by release.yml,
           # gated by the merge commit message of that PR.
           version: pnpm changeset version
+          # Set the bot PR title (and the internal "Version Packages" commit
+          # message on the bot's branch) to the exact string release.yml's
+          # publish guard checks for. With this, squash-merging the bot PR
+          # produces a merge commit message of "chore: release packages (#N)"
+          # which contains the marker string — no need to hand-edit the
+          # squash commit message at merge time.
+          title: "chore: release packages"
+          commit: "chore: release packages"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

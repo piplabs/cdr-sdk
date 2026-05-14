@@ -27,7 +27,7 @@ The previous design ran build/test/audit AND `changesets/action` in the same job
 
 ### Load-bearing operational rule
 
-> **Do not rename the auto-generated "Version Packages" PR before merging.** The publish guard in `release.yml` checks that the merge commit message contains the literal string `"chore: release packages"`. A renamed title fails the guard closed → `release.yml` skips → no publish.
+> **Do not rename the auto-generated "chore: release packages" PR before merging.** The publish guard in `release.yml` checks that the merge commit message contains the literal string `"chore: release packages"`. A renamed title fails the guard closed → `release.yml` skips → no publish. (The bot uses that exact string as the PR title via the `title:` input on `changesets/action@v1` so the default squash-merge commit message already contains the marker — no need to hand-edit it.)
 
 For exact action behaviour see the upstream [`changesets/action` README](https://github.com/changesets/action#readme).
 
