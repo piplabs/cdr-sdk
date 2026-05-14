@@ -1,0 +1,48 @@
+name: Bot Sync
+
+# Lightweight job that runs on every push to main and lets `changesets/action`
+# open / update / close the "Version Packages" PR aggregating outstanding
+# `.changeset/*.md` files.
+#
+# Deliberately NO build / test / audit steps in this workflow — those run in
+# test.yml (unit tests on every PR + main push) and release.yml (audit + dry
+# run before npm publish on release commits). Keeping bot-sync minimal means
+# a single failing CVE or broken test on main never blocks the bot from
+# maintaining the Version Packages PR — it just blocks the actual publish.
+
+on:
+  push:
+    branches: [main]
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write       # commit version bumps for the auto-PR
+      pull-requests: write  # open / update / close the "Version Packages" PR
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # full history needed for changelog generation
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Open / update / close Version Packages PR
+        uses: changesets/action@v1
+        with:
+          # Intentionally NO `publish` input. This workflow only manages the
+          # Version Packages PR. Actual npm publish is handled by release.yml,
+          # gated by the merge commit message of that PR.
+          version: pnpm changeset version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
