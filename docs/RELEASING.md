@@ -1,27 +1,33 @@
 # Releasing @piplabs/cdr-sdk
 
-Maintainer-facing guide for cutting a new version of `@piplabs/cdr-contracts`, `@piplabs/cdr-crypto`, and `@piplabs/cdr-sdk` to the npm public registry.
+Maintainer-facing guide for cutting a new version of `@piplabs/cdr-contracts`, `@piplabs/cdr-crypto`, `@piplabs/cdr-sdk`, and `@piplabs/cdr-cli` to the npm public registry.
 
 > The release pipeline is fully automated by [Changesets](https://github.com/changesets/changesets) + [`changesets/action`](https://github.com/changesets/action), gated by a GitHub `npm-publish` environment with required reviewers. **Do not run `pnpm publish` manually.** All releases go through `main` and the gates below.
 
-## Pipeline gates
+## Pipeline architecture
 
-Every push to `main` triggers `.github/workflows/release.yml`, which runs in two stages:
+Two **independent** workflows trigger on every push to `main`. They are split so a single failure in one workflow (e.g., audit catches a new CVE) never blocks the other.
 
-**Stage 1 — `changesets` job** (always runs, no approval gate, no npm contact)
-- `pnpm install --frozen-lockfile` — reproducible install
-- `pnpm -r run build` — TypeScript compiles
-- `pnpm -r run test` — vitest unit suites pass
-- `changesets/action@v1` — opens / updates the "Version Packages" PR when unreleased changesets exist; otherwise no-op
+**`.github/workflows/bot-sync.yml` — Version Packages PR manager** (runs on every main push)
+- `pnpm install --frozen-lockfile` — minimal install (needed by `changesets/action`)
+- `changesets/action@v1` — opens / updates / closes the "Version Packages" PR depending on whether unreleased `.changeset/*.md` files exist
+- No build, no test, no audit. Cannot publish (no `publish` input passed to the action).
 
-**Stage 2 — `publish` job** (runs only on actual release commits)
-- Conditional `if`: `hasChangesets == 'false' && contains(commit message, 'chore: release packages')`
-- `environment: npm-publish` — required reviewer must click **Approve and deploy** before any step runs
-- `pnpm install --frozen-lockfile` + `pnpm -r run build` + `pnpm changeset publish` (with OIDC provenance)
+**`.github/workflows/release.yml` — npm publish** (runs only on release commits)
+- Job-level guard: `if: contains(github.event.head_commit.message, 'chore: release packages')`. Any main push whose merge commit message lacks this marker is skipped before the runner starts.
+- `pnpm install --frozen-lockfile` + audit (high+ severity prod-dep gate) + `pnpm -r run build` + `pnpm -r publish --dry-run` + `pnpm changeset publish` (with OIDC provenance).
+- `environment: npm-publish` — required reviewer must click **Approve and deploy** before any step runs.
 
-The two-stage split means ordinary chore / docs / fix commits never request reviewer approval — they finish in stage 1 and never reach the publish job. Approval is requested only when the merged commit is the auto-generated Version Packages PR (default title `chore: release packages`).
+**`.github/workflows/test.yml` — unit tests** (runs on every PR + main push)
+- Independent of the release pipeline. Branch-protection-required for PR merges to `main`, so by the time a commit reaches `main` the unit tests are known to be green.
 
-> **Important constraint**: do not rename the Version Packages PR title before merging. The publish guard checks the merge commit message contains `"chore: release packages"`. A renamed title fails the guard closed → the publish job is skipped → no release.
+### Why the split
+
+The previous design ran build/test/audit AND `changesets/action` in the same job, meaning a failing audit step short-circuited the bot — no Version Packages PR could be opened or updated until the audit-blocking CVE was hotfixed. With the split: audit only blocks the actual publish; the bot keeps maintaining the Version Packages PR regardless of audit / test state.
+
+### Load-bearing operational rule
+
+> **Do not rename the auto-generated "Version Packages" PR before merging.** The publish guard in `release.yml` checks that the merge commit message contains the literal string `"chore: release packages"`. A renamed title fails the guard closed → `release.yml` skips → no publish.
 
 For exact action behaviour see the upstream [`changesets/action` README](https://github.com/changesets/action#readme).
 
@@ -51,13 +57,14 @@ A PR with no `.changeset/*.md` is fine for pure docs / chore work that should no
 
 After your PR merges to `main`:
 
-1. release.yml `changesets` job runs install / build / test, then `changesets/action` sees your `.md` file and opens (or updates) a PR titled **"chore: release packages"** that:
+1. **`bot-sync.yml`** runs (install + `changesets/action`). It sees your `.md` file and opens (or updates) a PR titled **"chore: release packages"** that:
    - Bumps the affected packages' `version` fields in `package.json`
    - Appends a CHANGELOG entry per package using `@changesets/changelog-github` (auto-links your PR + handle)
    - Deletes the consumed `.changeset/*.md`
-2. The `publish` job's `if` guard evaluates false on this commit (the merge commit message is your feature PR's title, not `chore: release packages`), so the job is skipped and no environment approval is requested.
+   `test.yml` also runs in parallel to verify unit tests still pass on the new `main` commit.
+2. **`release.yml`** triggers but its `if` guard evaluates false (the merge commit message is your feature PR's title, not `chore: release packages`), so the job is skipped before the runner starts. No environment approval is requested.
 3. Maintainer reviews the "chore: release packages" PR (see [Reviewing the Version Packages PR](#reviewing-the-version-packages-pr) below) and merges it. **Do not rename the PR title** — the publish guard depends on it.
-4. release.yml runs again. `changesets` job no-ops (no `.md` files left). `publish` job's `if` guard evaluates true → reaches the `environment: npm-publish` gate.
+4. On that merge, **`bot-sync.yml`** runs again and no-ops (no `.md` files left). **`release.yml`** triggers, its `if` guard evaluates true, the runner starts, and the `publish` job reaches the `environment: npm-publish` gate.
 5. A reviewer (someone in the environment's required reviewers list, not yourself due to **Prevent self-review**) approves in the Actions UI.
 6. `pnpm changeset publish` runs, which:
    - Publishes each bumped package (whose `package.json.version > npm dist-tags.latest`)

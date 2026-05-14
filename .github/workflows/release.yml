@@ -1,32 +1,40 @@
 name: Release
 
+# Publish to npm. Triggers ONLY on main pushes whose commit message contains
+# the marker string "chore: release packages" — the default title of the auto-
+# generated Version Packages PR (changesets/action input `title`, default
+# value). Ordinary chore / docs / feature / CI commits to main are filtered
+# out at the job-level `if` guard and do not consume environment approval.
+#
+# The Version Packages PR itself is opened and maintained by bot-sync.yml
+# (a separate workflow that runs on every main push). Splitting the two
+# workflows means a single failing audit / test on main never blocks the
+# bot — only the actual publish path is gated.
+
 on:
   push:
     branches: [main]
 
-# Avoid two release jobs racing on rapid main commits.
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Stage 1: Version Packages PR management. Runs on every main push, no
-  # environment gate, no npm contact. If unreleased `.changeset/*.md` files
-  # exist, opens or updates a "Version Packages" PR. Otherwise no-op. This
-  # stage never publishes — chore / docs / bug-fix-without-release commits
-  # land here and exit cleanly without requesting reviewer approval.
-  # ---------------------------------------------------------------------------
-  changesets:
+  publish:
+    # The publish job is gated entirely on the commit message marker. If a
+    # maintainer manually renames the auto-PR title before merging, this
+    # guard fails closed and no publish happens — RELEASING.md documents
+    # this constraint as a load-bearing operational rule.
+    if: |
+      contains(github.event.head_commit.message, 'chore: release packages')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    environment: npm-publish
     permissions:
-      contents: write       # commit version bumps for the auto-PR
-      pull-requests: write  # open / update the "Version Packages" PR
-    outputs:
-      hasChangesets: ${{ steps.changesets.outputs.hasChangesets }}
+      contents: write   # push git tags + create GitHub Releases
+      id-token: write   # mint OIDC token for npm provenance
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0    # full history needed for changelog generation
+          fetch-depth: 0
 
       - uses: pnpm/action-setup@v4
 
@@ -34,6 +42,7 @@ jobs:
         with:
           node-version: '20'
           cache: pnpm
+          registry-url: 'https://registry.npmjs.org'
 
       - run: pnpm install --frozen-lockfile
 
@@ -56,60 +65,6 @@ jobs:
             exit 1
           fi
           echo "No high+ severity vulnerabilities in production deps."
-
-      - run: pnpm -r run build
-
-      # Vitest unit tests across all packages that declare a `test` script.
-      # Failure aborts the release pipeline before any publish.
-      - run: pnpm -r run test
-
-      - name: Open / update Version Packages PR
-        id: changesets
-        uses: changesets/action@v1
-        with:
-          # Intentionally NO `publish` input. This stage only opens PRs;
-          # publishing is gated by the separate `publish` job below.
-          version: pnpm changeset version
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ---------------------------------------------------------------------------
-  # Stage 2: Publish to npm. Runs only when:
-  #   1. The previous stage saw no unreleased changesets (hasChangesets=false),
-  #      AND
-  #   2. The merge commit message contains "chore: release packages" — the
-  #      default title of the auto-generated Version Packages PR
-  #      (changesets/action input `title`, default value).
-  # Both conditions are required so that ordinary chore / docs / fix commits
-  # to main never trigger publish, only the merge of an actual release PR
-  # does. If a maintainer manually renames the auto-PR title, this guard
-  # fails closed — RELEASING.md documents this constraint.
-  # ---------------------------------------------------------------------------
-  publish:
-    needs: changesets
-    if: |
-      needs.changesets.outputs.hasChangesets == 'false' &&
-      contains(github.event.head_commit.message, 'chore: release packages')
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment: npm-publish
-    permissions:
-      contents: write   # push git tags
-      id-token: write   # mint OIDC token for npm provenance
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: pnpm/action-setup@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: pnpm
-          registry-url: 'https://registry.npmjs.org'
-
-      - run: pnpm install --frozen-lockfile
 
       - run: pnpm -r run build
 
