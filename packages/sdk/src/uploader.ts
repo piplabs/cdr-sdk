@@ -369,30 +369,39 @@ export class Uploader {
       type: "function" as const,
       name: functionName,
       inputs: [
-        { name: "caller", type: "address" },
-        { name: "conditionData", type: "bytes" },
+        { name: "uuid", type: "uint32" },
         { name: "accessAuxData", type: "bytes" },
+        { name: "conditionData", type: "bytes" },
+        { name: "caller", type: "address" },
       ],
       outputs: [{ name: "", type: "bool" }],
       stateMutability: "view" as const,
     }];
+
+    // Zero-padded dummy bytes (256 bytes each) so well-formed conditions can
+    // run their body to completion under abi.decode of common shapes and
+    // return a value, rather than reverting on truncated input. That keeps
+    // the empty-revert-data signal specific to "selector not found on this
+    // contract" (dispatcher fallback path).
+    const dummyBytes = `0x${"00".repeat(256)}` as `0x${string}`;
+    const zeroAddr = "0x0000000000000000000000000000000000000000" as `0x${string}`;
 
     try {
       await this.publicClient.simulateContract({
         address,
         abi: conditionAbi,
         functionName,
-        args: [
-          "0x0000000000000000000000000000000000000000",
-          "0x",
-          "0x",
-        ],
+        args: [0, dummyBytes, dummyBytes, zeroAddr],
       });
     } catch (e: any) {
-      // A revert inside the function body means the function exists — contract is valid.
-      // Only throw if the function selector itself is missing (zero data / execution error).
-      if (e?.cause?.name === "ContractFunctionRevertedError") {
-        return; // Function exists but reverted with dummy args — expected
+      // Function exists iff the call reverted with a non-empty revert payload
+      // (Error string, custom error, Panic, etc.). An empty `0x` revert is
+      // the EVM dispatcher fallback path — the selector isn't routed.
+      // ContractFunctionZeroDataError (EOA / no code at all) and any other
+      // error surface as invalid too.
+      const cause = e?.cause;
+      if (cause?.name === "ContractFunctionRevertedError" && cause.raw !== "0x") {
+        return;
       }
       throw new InvalidConditionContractError(address, type);
     }
