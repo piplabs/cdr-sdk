@@ -152,9 +152,11 @@ export function statsOf(samples: number[]): LatencyStats {
  * these files and renders one table row per file in the Step Summary, so
  * a single CI run lists every suite's latency distribution side by side.
  *
- * `accessMs` is always present; `uploadMs` is null for read-only suites
- * (e.g. 100w-shared, 1000w-perf). `refund` is null for suites that don't
- * sweep wallets (none today, but reserved).
+ * `accessMs` is present for suites that read a single uuid (100w-shared,
+ * 100w-fresh, 1000w-perf). `uploadMs` is null for read-only suites.
+ * The stress suite uses `accessSharedMs` + `accessFreshMs` instead of
+ * `accessMs` to separate same-uuid vs fresh-uuid read latency in one
+ * cycle. `refund` is null for suites that don't sweep wallets.
  */
 export interface PerfStatsFile {
   label: string;
@@ -166,6 +168,10 @@ export interface PerfStatsFile {
   accessMs: LatencyStats | null;
   uploadMs: LatencyStats | null;
   tickMs: LatencyStats | null;
+  /** Stress suite only: same-uuid read latency (validator cache benefit). */
+  accessSharedMs: LatencyStats | null;
+  /** Stress suite only: fresh-uuid read latency (no caching). */
+  accessFreshMs: LatencyStats | null;
   refund: {
     funded_wei: string;
     refunded_wei: string;

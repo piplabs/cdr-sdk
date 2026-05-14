@@ -511,9 +511,14 @@ jobs:
                   end;
                 # Ordered list of (op_name, stats) pairs for this suite,
                 # filtered to only those present. Upload first if present.
+                # Stress emits separate accessShared + accessFresh rows
+                # (no accessMs); other suites emit a single access row
+                # from accessMs.
                 [
-                  (if .uploadMs != null then {op: "upload", lat: .uploadMs} else empty end),
-                  (if .accessMs != null then {op: "access", lat: .accessMs} else empty end)
+                  (if .uploadMs       != null then {op: "upload",          lat: .uploadMs}       else empty end),
+                  (if .accessMs       != null then {op: "access",          lat: .accessMs}       else empty end),
+                  (if .accessSharedMs != null then {op: "access (shared)", lat: .accessSharedMs} else empty end),
+                  (if .accessFreshMs  != null then {op: "access (fresh)",  lat: .accessFreshMs}  else empty end)
                 ] as $ops |
                 # Suite-level summary columns are emitted on row 0 only.
                 ([$ops | length] | add) as $n_ops |

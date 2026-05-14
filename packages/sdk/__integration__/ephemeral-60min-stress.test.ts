@@ -7,14 +7,22 @@
  *
  * Pattern (1 hour total, **no artificial pacing**):
  *   1. Funder deploys an open-condition contract + uploads 1 shared CDR
- *      vault with a random dataKey.
+ *      vault with a random dataKey (the "old shared uuid" all wallets
+ *      will read every cycle).
  *   2. 10 ephemeral wallets, Multicall3 batch-funded with 1000 IP each
  *      (deliberately oversized — pipeline mode does hundreds of cycles
  *      per wallet over the hour).
- *   3. **Pipeline mode:** each wallet runs an independent async loop —
- *      `while (elapsed < 60min) { uploadCDR(fresh vault); accessCDR(shared); }` —
+ *   3. **Pipeline mode (3 ops per cycle):** each wallet runs an
+ *      independent async loop covering both read patterns —
+ *      `while (elapsed < 60min) {
+ *         uploadCDR(fresh vault);          // write fresh-uuid
+ *         accessCDR(sharedVault);          // read same-uuid (validator cache benefit)
+ *         accessCDR(ownFreshVault);        // read fresh-uuid (no caching)
+ *       }`
  *      with no sleep between cycles. 10 wallet loops in parallel via
- *      `Promise.all`. The chain + DKG path see steady back-to-back load.
+ *      `Promise.all`. Replaces the deleted Workflow A
+ *      (cdr-sdk-stress-test.yml) from the e2e repo — same-uuid +
+ *      fresh-uuid coverage in a single 1h run.
  *   4. **Soft failures:** a single cycle that throws (or recovers a
  *      mismatched dataKey on the shared vault) is recorded in a failure
  *      counter, but does NOT abort the wallet — the loop moves on to the
@@ -38,9 +46,11 @@
  * (`cdr-stress-log-<run_id>`).
  *
  * Perf-stats JSON: `/tmp/perf-stats-stress.json` is written in afterAll
- * with the `PerfStatsFile` shape (uploadMs, accessMs, refund summary,
- * extra.total_cycles / extra.failed_cycles), so the workflow's summary
- * step renders the same per-suite perf row as the 100w/1000w suites.
+ * with the `PerfStatsFile` shape (uploadMs, accessSharedMs, accessFreshMs,
+ * refund summary, extra.total_cycles / extra.failed_cycles). The
+ * workflow's summary step renders 3 perf rows for stress (upload +
+ * access (shared) + access (fresh)) so the latency gap between
+ * cached same-uuid reads and uncached fresh-uuid reads is visible.
  *
  * Run locally (DevNet only):
  *   pnpm test:stress
@@ -183,7 +193,7 @@ function logLine(line: string): void {
 }
 
 describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
-  `60-min pipelined stress: ${CONCURRENCY} wallets upload+access loop on DevNet`,
+  `60-min pipelined stress: ${CONCURRENCY} wallets 3-op (upload + read shared + read fresh) loop on DevNet`,
   () => {
     let funderPublic: PublicClient;
     let funderWallet: WalletClient;
@@ -200,7 +210,8 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
     // before reaching the workload).
     let perfBuffer: {
       uploadLats: number[];
-      accessLats: number[];
+      accessSharedLats: number[];
+      accessFreshLats: number[];
       totalCycles: number;
       failedCycles: number;
       wallClockMs: number;
@@ -303,7 +314,12 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
           failed: perfBuffer.failedCycles,
           wall_clock_ms: perfBuffer.wallClockMs,
           uploadMs: statsOf(perfBuffer.uploadLats),
-          accessMs: statsOf(perfBuffer.accessLats),
+          // Stress emits 2 access rows (shared + fresh); accessMs is
+          // left null so the workflow's perf-table jq skips the
+          // unified single-access row branch for this suite.
+          accessMs: null,
+          accessSharedMs: statsOf(perfBuffer.accessSharedLats),
+          accessFreshMs: statsOf(perfBuffer.accessFreshLats),
           tickMs: null,
           refund: {
             funded_wei: totalFundedWei.toString(),
@@ -326,25 +342,27 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
     }, 10 * 60 * 1000);
 
     it(
-      `${CONCURRENCY} wallets pipeline upload+access for 1h, no inter-cycle delay`,
+      `${CONCURRENCY} wallets pipeline upload + read(shared) + read(fresh) for 1h, no inter-cycle delay`,
       async () => {
         const startTime = Date.now();
         const uploadLats: number[] = [];
-        const accessLats: number[] = [];
+        const accessSharedLats: number[] = [];
+        const accessFreshLats: number[] = [];
         let totalCycles = 0;
         let failedCycles = 0;
 
         // Each wallet's loop is independent — Promise.all runs all 10 in
-        // parallel. Within a wallet the cycle is sequential (upload then
-        // access) so the wallet's nonce stream stays monotonic; across
-        // wallets there's no synchronization (no tick boundary).
+        // parallel. Within a wallet the cycle is strictly sequential
+        // (upload → read shared → read own fresh) so the wallet's nonce
+        // stream stays monotonic; across wallets there's no
+        // synchronization (no tick boundary, no phase barrier).
         await Promise.all(
           stressWallets.map(async (w, idx) => {
             let cycleIdx = 0;
             while (Date.now() - startTime < DURATION_MS) {
               cycleIdx++;
               try {
-                // ----- UPLOAD (own fresh vault) -----
+                // ----- PHASE 1: UPLOAD (own fresh vault) -----
                 const dataKey = crypto.getRandomValues(new Uint8Array(32));
                 const globalPubKey = await w.client.observer.getGlobalPubKey();
                 const tUpload = Date.now();
@@ -363,30 +381,51 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
                   `[w[${idx}] cycle=${cycleIdx} UPLOAD ok] uuid=${upload.uuid} ${uploadDur}ms`,
                 );
 
-                // ----- ACCESS shared vault -----
-                const tAccess = Date.now();
-                const access = await w.client.consumer.accessCDR({
+                // ----- PHASE 2: ACCESS shared vault (same-uuid read) -----
+                const tShared = Date.now();
+                const sharedAccess = await w.client.consumer.accessCDR({
                   uuid: sharedVaultUuid,
                   accessAuxData: "0x",
                   timeoutMs: ACCESS_TIMEOUT_MS,
                 });
-                const accessDur = Date.now() - tAccess;
-                const ok = bytesEqual(access.dataKey, sharedDataKey);
+                const sharedDur = Date.now() - tShared;
+                const sharedOk = bytesEqual(sharedAccess.dataKey, sharedDataKey);
                 logLine(
-                  `[w[${idx}] cycle=${cycleIdx} ACCESS ${ok ? "ok" : "MISMATCH"}] uuid=${sharedVaultUuid} tx=${access.txHash} ${accessDur}ms`,
+                  `[w[${idx}] cycle=${cycleIdx} ACCESS_SHARED ${sharedOk ? "ok" : "MISMATCH"}] uuid=${sharedVaultUuid} tx=${sharedAccess.txHash} ${sharedDur}ms`,
                 );
-                if (!ok) {
+                if (!sharedOk) {
                   throw new Error(
                     `w[${idx}] cycle=${cycleIdx} dataKey mismatch on shared uuid=${sharedVaultUuid}`,
                   );
                 }
-                // Push BOTH latencies together — only when the full cycle
-                // succeeded end-to-end. Pushing uploadDur eagerly above
-                // would let partially-failed cycles' upload times bias
-                // the upload p50/p95, decoupling the two arrays from
-                // `totalCycles`. Reviewer caught this on PR #83.
+
+                // ----- PHASE 3: ACCESS own fresh vault (fresh-uuid read) -----
+                const tFresh = Date.now();
+                const freshAccess = await w.client.consumer.accessCDR({
+                  uuid: upload.uuid,
+                  accessAuxData: "0x",
+                  timeoutMs: ACCESS_TIMEOUT_MS,
+                });
+                const freshDur = Date.now() - tFresh;
+                const freshOk = bytesEqual(freshAccess.dataKey, dataKey);
+                logLine(
+                  `[w[${idx}] cycle=${cycleIdx} ACCESS_FRESH ${freshOk ? "ok" : "MISMATCH"}] uuid=${upload.uuid} tx=${freshAccess.txHash} ${freshDur}ms`,
+                );
+                if (!freshOk) {
+                  throw new Error(
+                    `w[${idx}] cycle=${cycleIdx} dataKey mismatch on fresh uuid=${upload.uuid}`,
+                  );
+                }
+
+                // Push ALL THREE latencies in lockstep — only when the
+                // full cycle (upload + read shared + read own fresh)
+                // succeeded end-to-end. Pushing eagerly per-phase would
+                // let partially-failed cycles bias one array's p50/p95
+                // and decouple lengths from `totalCycles`. Same fix as
+                // PR #83's 1b9a80d, extended to 3 arrays.
                 uploadLats.push(uploadDur);
-                accessLats.push(accessDur);
+                accessSharedLats.push(sharedDur);
+                accessFreshLats.push(freshDur);
                 totalCycles++;
               } catch (e) {
                 failedCycles++;
@@ -418,12 +457,14 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
             100
           ).toFixed(2),
           upload: statsOf(uploadLats),
-          access: statsOf(accessLats),
+          access_shared: statsOf(accessSharedLats),
+          access_fresh: statsOf(accessFreshLats),
         };
         logLine(`[stress summary] ${JSON.stringify(stats)}`);
         perfBuffer = {
           uploadLats,
-          accessLats,
+          accessSharedLats,
+          accessFreshLats,
           totalCycles,
           failedCycles,
           wallClockMs,
