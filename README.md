@@ -199,17 +199,17 @@ pnpm test:integration story-api
 pnpm test:integration story-api -t "queryCDRPartials"
 
 # temporarily override the endpoint without editing .env.local
-CDR_API_URL=http://172.207.250.203:1317 pnpm test:integration
+CDR_API_URL=<your-story-api-url> pnpm test:integration
 ```
 
 Path / `-t` filters only work when running from `packages/sdk` directly (`turbo` doesn't forward extra args at the monorepo root).
 
 `.env.local` is gitignored; `.env.local.example` documents the variables. If `CDR_API_URL` is unset the test suite hard-fails with a clear error.
 
-| Endpoint | Aeneid validator5 | DevNet validator2 |
-|---|---|---|
-| Story-API REST | `http://172.192.41.96:1317` | `http://172.207.250.203:1317` |
-| EVM RPC | `https://aeneid.storyrpc.io` | `http://172.207.250.203:8545` |
+| Endpoint | Aeneid (testnet) |
+|---|---|
+| Story-API REST | `http://172.192.41.96:1317` |
+| EVM RPC | `https://aeneid.storyrpc.io` |
 
 ### Running Examples
 
