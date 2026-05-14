@@ -182,7 +182,13 @@ Setup (one-time, after cloning):
 
 ```bash
 cp .env.local.example .env.local
-$EDITOR .env.local   # fill in CDR_API_URL at minimum
+$EDITOR .env.local
+# Required for the full suite:
+#   CDR_API_URL           Story-API REST URL (port 1317)
+#   CDR_RPC_URL           EVM JSON-RPC URL on the same chain (port 8545)
+#   CDR_TEST_PRIVATE_KEY  Funded test-wallet private key (0x-prefixed hex)
+# Only `story-api.test.ts` can run with `CDR_API_URL` alone; every other
+# test file throws at module-load time if any of the three is missing.
 ```
 
 Run:
@@ -204,7 +210,7 @@ CDR_API_URL=<your-story-api-url> pnpm test:integration
 
 Path / `-t` filters only work when running from `packages/sdk` directly (`turbo` doesn't forward extra args at the monorepo root).
 
-`.env.local` is gitignored; `.env.local.example` documents the variables. If `CDR_API_URL` is unset the test suite hard-fails with a clear error.
+`.env.local` is gitignored; `.env.local.example` documents the variables. Missing any of `CDR_API_URL` / `CDR_RPC_URL` / `CDR_TEST_PRIVATE_KEY` hard-fails the suite at module-load time with a clear error.
 
 | Endpoint | Aeneid (testnet) |
 |---|---|
@@ -213,20 +219,29 @@ Path / `-t` filters only work when running from `packages/sdk` directly (`turbo`
 
 ### Running Examples
 
+All examples read `CDR_API_URL` + `CDR_RPC_URL` from env. Tx-sending
+examples (`upload` / `access` / `e2e`) additionally need
+`CDR_TEST_PRIVATE_KEY`. Easiest is to export them once, then each
+command line only has to spell out what's specific to that script:
+
 ```bash
+export CDR_API_URL=http://172.192.41.96:1317           # Story-API REST
+export CDR_RPC_URL=https://aeneid.storyrpc.io          # EVM JSON-RPC
+export CDR_TEST_PRIVATE_KEY=0xYOUR_KEY                 # required for upload/access/e2e
+
 # Query DKG state (no wallet needed)
 pnpm --filter @piplabs/cdr-examples query
 
 # Upload encrypted data
-CDR_PRIVATE_KEY=0x... WRITE_CONDITION=0x... READ_CONDITION=0x... \
+WRITE_CONDITION=0x... READ_CONDITION=0x... \
   pnpm --filter @piplabs/cdr-examples upload
 
-# Access and decrypt vault data
-CDR_PRIVATE_KEY=0x... VAULT_UUID=1 \
+# Access and decrypt a vault (replace with a uuid the wallet can read)
+VAULT_UUID=1 \
   pnpm --filter @piplabs/cdr-examples access
 
-# Full end-to-end demo
-CDR_PRIVATE_KEY=0x... WRITE_CONDITION=0x... READ_CONDITION=0x... \
+# Full end-to-end demo (upload + access in one script)
+WRITE_CONDITION=0x... READ_CONDITION=0x... \
   pnpm --filter @piplabs/cdr-examples e2e
 ```
 
