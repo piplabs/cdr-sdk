@@ -1,7 +1,19 @@
 # CDR SDK
 
-TypeScript SDK for **Confidential Data Rails (CDR)** on Story L1. Encrypt data to a threshold DKG public key, store it in on-chain vaults, and recover it when a quorum of validators provide partial decryptions.
+TypeScript SDK for **Confidential Data Rails (CDR)** on Story L1. Encrypt data
+to a threshold DKG public key, store it in on-chain vaults, and recover it
+when a quorum of validators provide partial decryptions.
 
+
+## Install
+
+```bash
+pnpm add @piplabs/cdr-sdk viem
+# Optional storage adapters (only the one you'll use):
+pnpm add helia @helia/unixfs multiformats          # for HeliaProvider
+pnpm add @storacha/client                           # for StorachaProvider
+pnpm add @filoz/synapse-sdk                         # for SynapseProvider
+```
 
 ## Quick Start
 
@@ -16,7 +28,12 @@ const account = privateKeyToAccount("0xYOUR_PRIVATE_KEY");
 const publicClient = createPublicClient({ transport: http("https://aeneid.storyrpc.io") });
 const walletClient = createWalletClient({ account, transport: http("https://aeneid.storyrpc.io") });
 
-const client = new CDRClient({ network: "testnet", publicClient, walletClient });
+const client = new CDRClient({
+  network: "testnet",
+  publicClient,
+  walletClient,
+  apiUrl: "http://172.192.41.96:1317", // Story-API REST endpoint — see "Networks" below
+});
 
 // Upload encrypted data
 const globalPubKey = await client.observer.getGlobalPubKey();
@@ -27,13 +44,14 @@ const { uuid } = await client.uploader.uploadCDR({
   globalPubKey,
   updatable: false,
   writeConditionAddr: "0xYOUR_WRITE_CONDITION",
-  readConditionAddr: "0xYOUR_READ_CONDITION",
+  readConditionAddr:  "0xYOUR_READ_CONDITION",
   writeConditionData: "0x",
-  readConditionData: "0x",
-  accessAuxData: "0x",
+  readConditionData:  "0x",
+  accessAuxData:      "0x",
 });
 
-// Access and decrypt
+// Access and decrypt — auto-generates ephemeral keypair, polls partials,
+// combines via TDH2, and decrypts.
 const { dataKey: recovered } = await client.consumer.accessCDR({
   uuid,
   accessAuxData: "0x",
@@ -44,43 +62,27 @@ const { dataKey: recovered } = await client.consumer.accessCDR({
 ## Features
 
 - **Data key vaults**: `uploadCDR` / `accessCDR` — encrypt and store small data (keys, secrets) directly on-chain
-- **File encryption**: `uploadFile` / `downloadFile` — AES-encrypt large files, store off-chain (IPFS/Filecoin), protect the key on-chain
-- **DKG Observer**: query global public key, threshold, participant count, validators, attestations, fees
-- **Dual DKG query mode**: `evm-events` (default) and `cosmos-abci` (6–20x faster via CometBFT RPC)
-- **Condition helpers**: `conditions.open()`, `ownerOnly()`, `tokenGate()`, `merkle()`, `custom()`
-- **SGX attestation verification**: `verifyAttestation()` with MRENCLAVE/MRSIGNER/SVN checks
-- **Storage providers**: `HeliaProvider` (IPFS), `GatewayProvider`, `StorachaProvider`, `SynapseProvider`
-- **Validation RPC**: cross-node `globalPubKey` verification via `validationRpcUrls`
+- **File encryption**: `uploadFile` / `downloadFile` — AES-encrypt large files, store off-chain (IPFS / Storacha / Filecoin), protect the key on-chain
+- **DKG Observer**: query global public key, threshold, participant count, validators, attestations, fees — all over Story-API REST (`apiUrl`)
+- **Threshold customization**: `minThresholdRatio` raises the SDK-side threshold above the chain default (e.g. require partials from all validators, not just the chain minimum)
+- **Condition helpers**: `conditions.open()`, `conditions.ownerOnly()`, `conditions.tokenGate()`, `conditions.merkle()`, `conditions.custom()`
+- **SGX attestation verification**: `verifyAttestation()` with MRENCLAVE / MRSIGNER / SVN checks against on-chain `enclaveTypeData`
+- **Storage providers**: `HeliaProvider` (IPFS), `GatewayProvider` (HTTP gateway), `StorachaProvider` (web3.storage), `SynapseProvider` (Filecoin)
 
 ## Networks
 
-| Network  | `network` param | RPC URL                          |
-|----------|-----------------|----------------------------------|
-| Testnet  | `"testnet"`     | `https://aeneid.storyrpc.io`    |
-| Mainnet  | `"mainnet"`     | `https://rpc.story.foundation`   |
+| Network | `network` param | EVM RPC | Story-API REST (`apiUrl`) |
+|---|---|---|---|
+| Testnet (Aeneid) | `"testnet"` | `https://aeneid.storyrpc.io` | `http://172.192.41.96:1317` ⚠️ plain HTTP — see note |
+| Mainnet | `"mainnet"` | `https://rpc.story.foundation` | _TBD — public REST endpoint pending_ |
 
+⚠️ **About `apiUrl`:** The SDK queries DKG state (active round, global public
+key, registered validators, partials) over Story-API REST. Today's Aeneid
+endpoint is the validator-5 IP on plain HTTP; a TLS-fronted subdomain on
+`aeneid.storyrpc.io` is being requested from infra. For production you can also
+point this at your own Story node's `:1317` REST gateway.
 
 See the [User Guide](./USER_GUIDE.md) for full network configuration details.
-
-## DKG Query Modes
-
-The SDK supports two backends for querying DKG state:
-
-| Mode | How | Speed |
-|------|-----|-------|
-| `evm-events` (default) | Scans DKG contract events via `eth_getLogs` | Baseline |
-| `cosmos-abci` | Queries x/dkg keeper via CometBFT `abci_query` | 6–20x faster |
-
-```typescript
-// Use cosmos-abci mode for faster queries
-const client = new CDRClient({
-  network: "testnet",
-  publicClient,
-  walletClient,
-  dkgSource: "cosmos-abci",
-  cometRpcUrl: "http://your-node:26657",
-});
-```
 
 ## File Operations
 
@@ -94,7 +96,8 @@ import { CID } from "multiformats/cid";
 
 const helia = await createHelia();
 const storage = new HeliaProvider({
-  helia, unixfs: unixfs(helia),
+  helia,
+  unixfs: unixfs(helia),
   CID: (s) => CID.parse(s),
 });
 
@@ -104,20 +107,24 @@ const { uuid, cid } = await client.uploader.uploadFile({
   storageProvider: storage,
   globalPubKey,
   updatable: false,
-  writeConditionAddr: "0x...", readConditionAddr: "0x...",
-  writeConditionData: "0x", readConditionData: "0x",
-  accessAuxData: "0x",
+  writeConditionAddr: "0x...",
+  readConditionAddr:  "0x...",
+  writeConditionData: "0x",
+  readConditionData:  "0x",
+  accessAuxData:      "0x",
 });
 
 // Download
 const { content } = await client.consumer.downloadFile({
-  uuid, accessAuxData: "0x",
+  uuid,
+  accessAuxData: "0x",
   storageProvider: storage,
   timeoutMs: 120_000,
 });
 ```
 
-Other storage providers: `GatewayProvider` (IPFS HTTP API), `StorachaProvider` (web3.storage), `SynapseProvider` (Filecoin).
+Other storage providers: `GatewayProvider` (IPFS HTTP API), `StorachaProvider`
+(web3.storage), `SynapseProvider` (Filecoin).
 
 ## Condition Contracts (Aeneid)
 
@@ -169,102 +176,72 @@ pnpm exec vitest story-api           # watch + path filter
 
 ### Integration Tests
 
-Integration tests in `packages/sdk/__integration__/` exercise the SDK against a live network. Excluded from the default `pnpm test`; run via separate commands.
+Integration tests in `packages/sdk/__integration__/` exercise the Story-API REST client (`packages/sdk/src/story-api/`) against a live endpoint. They are excluded from the default `pnpm test` and run via a separate command.
 
 Setup (one-time, after cloning):
 
 ```bash
 cp .env.local.example .env.local
-$EDITOR .env.local   # fill in CDR_API_URL + CDR_RPC_URL + CDR_TEST_PRIVATE_KEY
+$EDITOR .env.local
+# Required for the full suite:
+#   CDR_API_URL           Story-API REST URL (port 1317)
+#   CDR_RPC_URL           EVM JSON-RPC URL on the same chain (port 8545)
+#   CDR_TEST_PRIVATE_KEY  Funded test-wallet private key (0x-prefixed hex)
+# Only `story-api.test.ts` can run with `CDR_API_URL` alone; every other
+# test file throws at module-load time if any of the three is missing.
 ```
 
-`.env.local` is gitignored; `.env.local.example` documents the variables. The suites hard-fail at load time if any of the three is unset.
-
-| Endpoint | Aeneid validator5 | DevNet validator2 |
-|---|---|---|
-| Story-API REST | `http://172.192.41.96:1317` | `http://172.207.250.203:1317` |
-| EVM RPC | `https://aeneid.storyrpc.io` | `http://172.207.250.203:8545` |
-
-#### Test files
-
-The suite is structured around two axes — what the test does (functional groups) and what scale it runs at (suite gates).
-
-**Functional groups (no suite gating — always run):**
-
-| File | Coverage |
-|---|---|
-| `story-api.test.ts` | Story-API REST client wire-level: round, network, partials, registrations |
-| `observer.test.ts` | Observer methods over real REST + RPC, including per-round caching |
-| `uploader.test.ts` | `encryptDataKey`, `allocate`, `uploadCDR`, write/feeOverride/EOA-condition policies |
-| `consumer.test.ts` | `accessCDR`, `collectPartials`, `decryptDataKey`, queryCDRPartials, plus the #75 / #79 regression cases (ACC-04c TOCTOU) |
-| `dx-improvements.test.ts` | DX-01..04 — `conditions` helpers, simplified accessCDR, method aliases (DX-03 LicenseReadCondition skipped pending dep) |
-| `security.test.ts` | SEC-01..09 — WASM hash, pinned crypto deps, threshold ratio, SGX DCAP Quote v3 parse + verify, label-mismatch on write |
-| `perf-micro.test.ts` | PERF-01..05 — single-op latency benchmarks (initWasm, observer queries, upload breakdown, accessCDR, full roundtrip) |
-| `errors.test.ts` | ERR-01 / ERR-02 / ERR-05 — error-path gaps not covered by the per-class suites |
-
-**Suite-gated (`describe.skipIf(skipUnlessSuite(...))`) — ephemeral-wallet tests:**
-
-| File | Suite gate | Networks | Wall time (typ.) |
-|---|---|---|---|
-| `ephemeral-100w-shared.test.ts` | `default`, `all` | DevNet + Aeneid | ~2 min |
-| `ephemeral-100w-fresh.test.ts` | `default`, `all` | DevNet + Aeneid | ~5 min |
-| `ephemeral-1000w-perf.test.ts` | `1000-wallet-performance`, `all` | DevNet + Aeneid | ~30-50 min |
-| `ephemeral-60min-stress.test.ts` | `1H-stress-devnet-only`, `all` | **DevNet only** | 60 min |
-
-Suite gating is steered by the `TEST_SUITE` env var, defaulted to `"default"` by `_suite.ts`. The CI workflow's `test_suite` input maps 1:1 to this env var.
-
-The ephemeral-wallet suites use `_ephemeral-wallets.ts` helpers:
-- `generateEphemeralWallets(N)` — fresh in-memory keypairs.
-- `fundWallets(funder, wallets, perWalletWei)` — one Multicall3.aggregate3Value tx that batch-funds every wallet (auto-deploys Multicall3 on fresh DevNet, uses the canonical `0xcA11...` address everywhere else).
-- `refundWallets(wallets, recipient, rpcUrl)` — per-wallet concurrent sweep with a gas reserve; failures are counted, not thrown.
-
-#### Running locally
+Run:
 
 ```bash
-# All non-gated tests + default-suite ephemeral tests (devnet)
+# all integration tests (from monorepo root or packages/sdk)
 pnpm test:integration
 
-# Single file (path substring; run from packages/sdk)
+# only one test file — substring match against test paths (from packages/sdk)
 cd packages/sdk
-pnpm test:integration consumer
+pnpm test:integration story-api
 
-# Single test case
-pnpm test:integration consumer -t "ACC-04c"
+# only one test case within a file (from packages/sdk)
+pnpm test:integration story-api -t "queryCDRPartials"
 
-# Pick a non-default suite (steers describe.skipIf in test files)
-TEST_SUITE=1000-wallet-performance pnpm test:integration
-
-# 60-minute stress (DevNet only — uses a separate vitest entry)
-pnpm test:stress
+# temporarily override the endpoint without editing .env.local
+CDR_API_URL=<your-story-api-url> pnpm test:integration
 ```
 
-Path / `-t` filters only work when running from `packages/sdk` directly; turbo doesn't forward extra args at the monorepo root.
+Path / `-t` filters only work when running from `packages/sdk` directly (`turbo` doesn't forward extra args at the monorepo root).
 
-#### CI / GitHub Actions
+`.env.local` is gitignored; `.env.local.example` documents the variables. Missing any of `CDR_API_URL` / `CDR_RPC_URL` / `CDR_TEST_PRIVATE_KEY` hard-fails the suite at module-load time with a clear error.
 
-The `Integration` workflow (`.github/workflows/integration.yml`) is the canonical place to run cross-network or expensive suites:
-
-- **PR trigger** — always `network=devnet, test_suite=default`. Runs the four `default`-gated ephemeral tests + every non-gated file.
-- **Manual dispatch** — pick `network` (devnet/aeneid) × `test_suite` (default / all / 1000-wallet-performance / 1H-stress-devnet-only). The `1H-stress-devnet-only` suite is hard-rejected at the prepare step when `network != devnet`.
-
-The workflow's summary step renders per-case ✓/✗ tables (parsed from vitest's JSON reporter) and a pre/post chain-state delta (EL block + DKG round) so a long run's effect on the chain is visible at a glance.
+| Endpoint | Aeneid (testnet) |
+|---|---|
+| Story-API REST | `http://172.192.41.96:1317` |
+| EVM RPC | `https://aeneid.storyrpc.io` |
 
 ### Running Examples
 
+All examples read `CDR_API_URL` + `CDR_RPC_URL` from env. Tx-sending
+examples (`upload` / `access` / `e2e`) additionally need
+`CDR_TEST_PRIVATE_KEY`. Easiest is to export them once, then each
+command line only has to spell out what's specific to that script:
+
 ```bash
+export CDR_API_URL=http://172.192.41.96:1317           # Story-API REST
+export CDR_RPC_URL=https://aeneid.storyrpc.io          # EVM JSON-RPC
+export CDR_TEST_PRIVATE_KEY=0xYOUR_KEY                 # required for upload/access/e2e
+
 # Query DKG state (no wallet needed)
 pnpm --filter @piplabs/cdr-examples query
 
 # Upload encrypted data
-CDR_PRIVATE_KEY=0x... WRITE_CONDITION=0x... READ_CONDITION=0x... \
+WRITE_CONDITION=0x... READ_CONDITION=0x... \
   pnpm --filter @piplabs/cdr-examples upload
 
-# Access and decrypt vault data
-CDR_PRIVATE_KEY=0x... VAULT_UUID=1 \
+# Access and decrypt a vault (replace with a uuid the wallet can read)
+VAULT_UUID=1 \
   pnpm --filter @piplabs/cdr-examples access
 
-# Full end-to-end demo
-CDR_PRIVATE_KEY=0x... WRITE_CONDITION=0x... READ_CONDITION=0x... \
+# Full end-to-end demo (upload + access in one script)
+WRITE_CONDITION=0x... READ_CONDITION=0x... \
   pnpm --filter @piplabs/cdr-examples e2e
 ```
 
