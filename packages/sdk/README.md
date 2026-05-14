@@ -18,6 +18,21 @@ npm install @storacha/client                     # Storacha
 npm install @filoz/synapse-sdk                   # Filecoin via Synapse
 ```
 
+## Compatibility & known issues
+
+### Requirements
+
+- **Node.js ≥ 20.19** — transitive dependencies (`@noble/ciphers`, `@noble/hashes`) require this. Older Node versions install with `EBADENGINE` warnings; the SDK functions but the warning will be raised in the future. Tracked in [#98](https://github.com/piplabs/cdr-sdk/issues/98).
+- **ESM-only** — all `@piplabs/*` packages are `"type": "module"`. CommonJS consumers must use dynamic `import()`; plain `require()` returns `ERR_REQUIRE_ESM`. CJS dual-publish is under discussion in [#97](https://github.com/piplabs/cdr-sdk/issues/97).
+
+### Known issues queued for v0.2.2
+
+- `@piplabs/cdr-cli --version` reports a stale `0.1.2` — the CLI binary itself works correctly. See [#96](https://github.com/piplabs/cdr-sdk/issues/96).
+- `engines` field is not yet declared on any package — see [#98](https://github.com/piplabs/cdr-sdk/issues/98).
+- ESM-only packaging without an explicit `"exports"` field — see [#97](https://github.com/piplabs/cdr-sdk/issues/97).
+
+None of these affect SDK or CLI functionality. v0.2.1 was validated end-to-end on Aeneid (upload + access round-trip) prior to release.
+
 ## Quick start
 
 ```ts
@@ -32,6 +47,7 @@ const client = new CDRClient({
   network: "testnet",
   publicClient: createPublicClient({ transport: http("https://aeneid.storyrpc.io") }),
   walletClient: createWalletClient({ account, transport: http("https://aeneid.storyrpc.io") }),
+  apiUrl: "http://172.192.41.96:1317", // Story-API REST endpoint — see Networks table in repo README
 });
 
 const globalPubKey = await client.observer.getGlobalPubKey();
