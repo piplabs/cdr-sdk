@@ -30,5 +30,10 @@
     "@vitest/coverage-v8": "^2",
     "typescript": "^5.5",
     "vitest": "^2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/piplabs/cdr-sdk.git",
+    "directory": "packages/crypto"
   }
 }
