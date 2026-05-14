@@ -54,7 +54,7 @@ import {
   generateEphemeralWallets,
   refundWallets,
 } from "./_ephemeral-wallets.js";
-import { formatMs, logCase, mean, p50, p95 } from "./_helpers.js";
+import { formatMs, logCase, mean, p50, p95, statsOf, writePerfStats } from "./_helpers.js";
 
 const WALLET_COUNT = 100;
 const PER_WALLET_FUND = parseEther("0.05");
@@ -143,6 +143,18 @@ describe.skipIf(skipUnlessSuite("default"))(
     let sharedVaultUuid: number;
     let sharedDataKey: Uint8Array;
     let wallets: EphemeralWallet[];
+    let totalFundedWei = 0n;
+    // Captured by `it`, written to /tmp/perf-stats-100w-shared.json by
+    // `afterAll` (so the workflow can render a perf table). null until
+    // the workload completes; afterAll skips the write when it's null
+    // (e.g. when `it` is skipped or the suite errored before reaching
+    // the workload).
+    let perfBuffer: {
+      fulfilled: number;
+      failed: number;
+      wallClockMs: number;
+      accessLats: number[];
+    } | null = null;
 
     beforeAll(async () => {
       await initWasm();
@@ -177,6 +189,7 @@ describe.skipIf(skipUnlessSuite("default"))(
         wallets,
         PER_WALLET_FUND,
       );
+      totalFundedWei = fund.totalFundedWei;
       logCase("multicall3 batch fund", {
         multicall3: fund.multicall3Address,
         wallets: wallets.length,
@@ -198,6 +211,26 @@ describe.skipIf(skipUnlessSuite("default"))(
         totalRefundedWei: refund.totalRefundedWei.toString(),
         failedRefunds: refund.failedRefunds,
       });
+      if (perfBuffer) {
+        writePerfStats({
+          label: "100w-shared",
+          network: NETWORK,
+          wallets: WALLET_COUNT,
+          fulfilled: perfBuffer.fulfilled,
+          failed: perfBuffer.failed,
+          wall_clock_ms: perfBuffer.wallClockMs,
+          accessMs: statsOf(perfBuffer.accessLats),
+          uploadMs: null,
+          tickMs: null,
+          refund: {
+            funded_wei: totalFundedWei.toString(),
+            refunded_wei: refund.totalRefundedWei.toString(),
+            burned_wei: (totalFundedWei - refund.totalRefundedWei).toString(),
+            failed_sweeps: refund.failedRefunds,
+          },
+          extra: null,
+        });
+      }
     }, 5 * 60 * 1000);
 
     it(
@@ -249,6 +282,12 @@ describe.skipIf(skipUnlessSuite("default"))(
           },
           failedReasons: failed.slice(0, 5),
         });
+        perfBuffer = {
+          fulfilled: fulfilled.length,
+          failed: failed.length,
+          wallClockMs: totalMs,
+          accessLats: lats,
+        };
 
         expect(failed.length, `${failed.length} wallets failed accessCDR`).toBe(0);
         expect(fulfilled.length).toBe(WALLET_COUNT);

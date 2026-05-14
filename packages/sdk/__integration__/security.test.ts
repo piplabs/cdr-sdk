@@ -7,7 +7,6 @@
  *
  *   SEC-01 (#17) WASM binary hash verified at initWasm()
  *   SEC-02 (#18) cdr-crypto deps use exact-version pinning
- *   SEC-03 (#19) validationRpcUrls cross-validates getGlobalPubKey
  *   SEC-04 (#20) minThresholdRatio raises SDK-side threshold
  *   SEC-05 (#21) Consumer.downloadFile method surface exists
  *   SEC-06 (#22) allocate validates condition contract interface
@@ -15,6 +14,12 @@
  *   SEC-08 (#24) SGX DCAP Quote v3 parse + verify (positive + negative
  *                + on-chain attestation reports)
  *   SEC-09 (#25) write() validates ciphertext-embedded label vs uuid
+ *
+ * SEC-03 (#19, multi-RPC validationRpcUrls) was previously kept as an
+ * `it.skip` placeholder. The current CDRClient constructor doesn't
+ * accept that knob, and the skipped stub added noise without coverage
+ * — dropped entirely. Re-add it (without `.skip`) only after the SDK
+ * grows a real multi-RPC validation hook.
  */
 
 import { readFileSync } from "node:fs";
@@ -115,15 +120,6 @@ describe(`Security tests (live: ${API_URL})`, () => {
       );
     }
   });
-
-  // SEC-03 (Issue #19) tests multi-RPC cross-validation of getGlobalPubKey.
-  // The current CDRClient constructor doesn't accept `validationRpcUrls`
-  // — that knob was on a prior API surface in story-cdr-e2e's setup.ts
-  // shim. Until the SDK re-introduces a multi-RPC validation hook this
-  // case stays skipped. The fundamental sanity-check (getGlobalPubKey
-  // returns non-empty bytes) is exercised by every test in this file
-  // via `client.observer.getGlobalPubKey()`.
-  it.skip("SEC-03: validationRpcUrls cross-validates getGlobalPubKey (Issue #19) — pending SDK API", () => {});
 
   // 30s timeout — observed ~725ms on DevNet; cushion for Aeneid + slow CI.
   it("SEC-04: minThresholdRatio raises SDK-side threshold above chain default (Issue #20)", { timeout: 30_000 }, async () => {

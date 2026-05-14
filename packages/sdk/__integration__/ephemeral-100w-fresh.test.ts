@@ -46,7 +46,7 @@ import {
   generateEphemeralWallets,
   refundWallets,
 } from "./_ephemeral-wallets.js";
-import { formatMs, logCase, mean, p50, p95 } from "./_helpers.js";
+import { formatMs, logCase, mean, p50, p95, statsOf, writePerfStats } from "./_helpers.js";
 
 const WALLET_COUNT = 100;
 const PER_WALLET_FUND = parseEther("0.1");
@@ -126,6 +126,14 @@ describe.skipIf(skipUnlessSuite("default"))(
     let funderAddress: `0x${string}`;
     let openCondition: `0x${string}`;
     let wallets: EphemeralWallet[];
+    let totalFundedWei = 0n;
+    let perfBuffer: {
+      fulfilled: number;
+      failed: number;
+      wallClockMs: number;
+      uploadLats: number[];
+      accessLats: number[];
+    } | null = null;
 
     beforeAll(async () => {
       await initWasm();
@@ -144,6 +152,7 @@ describe.skipIf(skipUnlessSuite("default"))(
         wallets,
         PER_WALLET_FUND,
       );
+      totalFundedWei = fund.totalFundedWei;
       logCase("multicall3 batch fund", {
         multicall3: fund.multicall3Address,
         wallets: wallets.length,
@@ -165,6 +174,26 @@ describe.skipIf(skipUnlessSuite("default"))(
         totalRefundedWei: refund.totalRefundedWei.toString(),
         failedRefunds: refund.failedRefunds,
       });
+      if (perfBuffer) {
+        writePerfStats({
+          label: "100w-fresh",
+          network: NETWORK,
+          wallets: WALLET_COUNT,
+          fulfilled: perfBuffer.fulfilled,
+          failed: perfBuffer.failed,
+          wall_clock_ms: perfBuffer.wallClockMs,
+          accessMs: statsOf(perfBuffer.accessLats),
+          uploadMs: statsOf(perfBuffer.uploadLats),
+          tickMs: null,
+          refund: {
+            funded_wei: totalFundedWei.toString(),
+            refunded_wei: refund.totalRefundedWei.toString(),
+            burned_wei: (totalFundedWei - refund.totalRefundedWei).toString(),
+            failed_sweeps: refund.failedRefunds,
+          },
+          extra: null,
+        });
+      }
     }, 5 * 60 * 1000);
 
     it(
@@ -246,6 +275,13 @@ describe.skipIf(skipUnlessSuite("default"))(
           },
           failedReasons: failed.slice(0, 5),
         });
+        perfBuffer = {
+          fulfilled: fulfilled.length,
+          failed: failed.length,
+          wallClockMs: totalMs,
+          uploadLats,
+          accessLats,
+        };
 
         expect(failed.length, `${failed.length} wallets failed`).toBe(0);
         expect(fulfilled.length).toBe(WALLET_COUNT);
