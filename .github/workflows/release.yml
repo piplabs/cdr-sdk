@@ -73,15 +73,24 @@ jobs:
       # write. Catches regressions in `files` whitelists or workspace dep
       # resolution before any tarball is irrevocably uploaded.
       - name: Verify publish tarballs (dry-run)
+        # Dry-run does not contact the registry; no auth needed.
         run: pnpm -r publish --dry-run --no-git-checks
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish to npm
+        # Authentication is via npm Trusted Publishing: each of the four
+        # packages has this workflow (piplabs/cdr-sdk, release.yml,
+        # environment=npm-publish) configured as a trusted publisher in its
+        # npm package settings. The GHA OIDC token (id-token: write below) is
+        # exchanged for a short-lived npm publish token at publish time —
+        # no long-lived NPM_TOKEN secret is needed in this repo.
+        #
+        # NOTE: NPM_TOKEN must NOT be set in the env block. If both an
+        # NPM_TOKEN and an OIDC trusted-publisher path are available, npm
+        # CLI preferentially uses NPM_TOKEN, which bypasses the trusted-
+        # publisher contract and reintroduces the 404/provenance failure.
         run: pnpm changeset publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           # Emit OIDC-signed provenance so consumers can verify the tarball
           # was produced by this workflow.
           NPM_CONFIG_PROVENANCE: "true"
