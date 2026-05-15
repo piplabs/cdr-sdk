@@ -97,6 +97,15 @@ jobs:
           echo "::error::test_suite=${{ steps.resolve.outputs.test_suite }} requires network=devnet (got ${{ steps.resolve.outputs.network }})"
           exit 1
 
+      - name: Validate (1000-wallet-performance is DevNet-only)
+        # 1000-way burst saturates any public RPC; the test gate inside the
+        # file also enforces this, but failing fast in `prepare` is friendlier
+        # than letting `integration` schedule a job that ends up all-skipped.
+        if: ${{ steps.resolve.outputs.test_suite == '1000-wallet-performance' && steps.resolve.outputs.network != 'devnet' }}
+        run: |
+          echo "::error::test_suite=1000-wallet-performance requires network=devnet (got ${{ steps.resolve.outputs.network }})"
+          exit 1
+
       - name: Write run summary
         if: always()
         # head_ref is attacker-controlled (any PR opener picks the

@@ -155,7 +155,7 @@ async function fundInBatches(
   return totalFunded;
 }
 
-describe.skipIf(skipUnlessSuite("1000-wallet-performance"))(
+describe.skipIf(skipUnlessSuite("1000-wallet-performance") || NETWORK !== "devnet")(
   `1000 ephemeral wallets → shared vault read perf (network=${NETWORK})`,
   () => {
     let funderPublic: PublicClient;
