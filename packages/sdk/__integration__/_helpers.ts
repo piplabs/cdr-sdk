@@ -130,9 +130,15 @@ export interface LatencyStats {
   max_ms: number;
 }
 
-export function statsOf(samples: number[]): LatencyStats {
+export function statsOf(samples: number[]): LatencyStats | null {
+  // Empty samples → null, not zero-valued stats. Returning a "0ms across
+  // the board" object would let the workflow's perf-table jq (which
+  // gates on `!= null`) render rows reading "0ms" for every percentile,
+  // which a casual reader can misinterpret as a real (and suspiciously
+  // fast) latency rather than "no data". Forcing null here makes the
+  // zero-sample case skipped in the table, which is the truthful signal.
   if (samples.length === 0) {
-    return { count: 0, min_ms: 0, p50_ms: 0, mean_ms: 0, p95_ms: 0, p99_ms: 0, max_ms: 0 };
+    return null;
   }
   const sorted = [...samples].sort((a, b) => a - b);
   return {
@@ -152,9 +158,11 @@ export function statsOf(samples: number[]): LatencyStats {
  * these files and renders one table row per file in the Step Summary, so
  * a single CI run lists every suite's latency distribution side by side.
  *
- * `accessMs` is always present; `uploadMs` is null for read-only suites
- * (e.g. 100w-shared, 1000w-perf). `refund` is null for suites that don't
- * sweep wallets (none today, but reserved).
+ * `accessMs` is present for suites that read a single uuid (100w-shared,
+ * 100w-fresh, 1000w-perf). `uploadMs` is null for read-only suites.
+ * The stress suite uses `accessSharedMs` + `accessFreshMs` instead of
+ * `accessMs` to separate same-uuid vs fresh-uuid read latency in one
+ * cycle. `refund` is null for suites that don't sweep wallets.
  */
 export interface PerfStatsFile {
   label: string;
@@ -166,6 +174,10 @@ export interface PerfStatsFile {
   accessMs: LatencyStats | null;
   uploadMs: LatencyStats | null;
   tickMs: LatencyStats | null;
+  /** Stress suite only: same-uuid read latency (validator cache benefit). */
+  accessSharedMs: LatencyStats | null;
+  /** Stress suite only: fresh-uuid read latency (no caching). */
+  accessFreshMs: LatencyStats | null;
   refund: {
     funded_wei: string;
     refunded_wei: string;
