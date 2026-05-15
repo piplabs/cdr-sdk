@@ -130,9 +130,15 @@ export interface LatencyStats {
   max_ms: number;
 }
 
-export function statsOf(samples: number[]): LatencyStats {
+export function statsOf(samples: number[]): LatencyStats | null {
+  // Empty samples → null, not zero-valued stats. Returning a "0ms across
+  // the board" object would let the workflow's perf-table jq (which
+  // gates on `!= null`) render rows reading "0ms" for every percentile,
+  // which a casual reader can misinterpret as a real (and suspiciously
+  // fast) latency rather than "no data". Forcing null here makes the
+  // zero-sample case skipped in the table, which is the truthful signal.
   if (samples.length === 0) {
-    return { count: 0, min_ms: 0, p50_ms: 0, mean_ms: 0, p95_ms: 0, p99_ms: 0, max_ms: 0 };
+    return null;
   }
   const sorted = [...samples].sort((a, b) => a - b);
   return {

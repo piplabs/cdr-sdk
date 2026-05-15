@@ -400,6 +400,18 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
                 }
 
                 // ----- PHASE 3: ACCESS own fresh vault (fresh-uuid read) -----
+                // The settlement window between Phase 1's write tx and
+                // this read is implicit — whatever Phase 2's shared
+                // read happened to take (typically 10-120s). When Phase
+                // 2 hits a hot validator cache it can return in just a
+                // few seconds, in which case `upload.uuid` may still be
+                // propagating across validators when this call fires.
+                // `ACCESS_TIMEOUT_MS` (120s) is LOAD-BEARING here: it's
+                // not a generic safety margin but the actual headroom
+                // accessCDR uses to poll until the new uuid lands. Do
+                // not shrink it without explicit fresh-uuid propagation
+                // benchmarks — a "fast" timeout would turn occasional
+                // hot-cache cycles into spurious failures.
                 const tFresh = Date.now();
                 const freshAccess = await w.client.consumer.accessCDR({
                   uuid: upload.uuid,
