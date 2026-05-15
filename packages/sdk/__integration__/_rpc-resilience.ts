@@ -37,6 +37,22 @@ export function resilientHttp(rpcUrl: string, opts?: {
  * Used to cap burst pressure on a public RPC: the test still launches
  * N logical workers, but the RPC sees at most `maxConcurrency`
  * outstanding requests at a time.
+ *
+ * **Usage contract (closed-system)**: every caller of `run()` must
+ * enter inside a single synchronous tick (e.g. `wallets.map(w =>
+ * run(...))`). No new `run()` calls may interleave with already-running
+ * or already-queued workers' completions. In this mode, the first
+ * `maxConcurrency` callers admit immediately and the rest queue;
+ * thereafter the system is closed and each completion admits exactly
+ * one waiter — `active` is provably bounded by `maxConcurrency`.
+ *
+ * The `active++` after the await deliberately omits a re-check (jinn
+ * #L54). A streaming/open-system caller arriving between a releaser's
+ * `next()` and the awaiting waiter's resume could read a stale `active`
+ * and admit itself, leaving the resumed waiter to over-increment past
+ * `maxConcurrency`. If this helper is ever reused in a streaming
+ * pattern, replace this with a pre-increment-on-admit design (releaser
+ * does `active++` before `next()`, waiter skips the post-await `active++`).
  */
 export function pLimit(maxConcurrency: number) {
   if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1) {

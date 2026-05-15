@@ -163,11 +163,15 @@ describe.skipIf(skipUnlessSuite("default") || NETWORK !== "aeneid")(
 
     afterAll(async () => {
       if (!wallets || wallets.length === 0) return;
+      // Public-RPC sweep also benefits from the retry envelope —
+      // otherwise refund 429s silently inflate `failedRefunds`.
       const refund = await refundWallets(
         funderPublic,
         wallets,
         funderAddress,
         RPC_URL!,
+        undefined,
+        resilientHttp,
       );
       logCase("refund summary", {
         totalRefundedWei: refund.totalRefundedWei.toString(),
