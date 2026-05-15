@@ -1,31 +1,29 @@
 /**
  * 100 ephemeral wallets, each doing their own allocate + write + read
- * against fresh vaults.
+ * against fresh vaults — Aeneid-flavored variant.
  *
- * Suite gating: `default` (and `all`). Runs on both DevNet + Aeneid.
+ * Suite gating: `default` (and `all`), Aeneid ONLY (the DevNet counterpart
+ * lives in `ephemeral-100w-fresh.test.ts` and runs at full concurrency).
  *
- * Pattern:
- *   1. Funder deploys one open-condition contract (shared across wallets
- *      — the contract is stateless, just an "always allow" check).
- *   2. Generate 100 ephemeral wallets, Multicall3 batch-fund them.
- *   3. Each wallet runs PER-WALLET SEQUENTIAL:
- *        uploadCDR(ownDataKey) → accessCDR(ownVaultUuid)
- *      The two txs go in series so the wallet's nonce stream stays
- *      monotonic (no two concurrent txs from the same account).
- *   4. CROSS-WALLET PARALLEL: all 100 wallets fire their sequential
- *      flow simultaneously via Promise.allSettled. Cross-wallet there
- *      are no nonce dependencies, so this exercises 100-way concurrent
- *      load on the chain + DKG validators.
- *   5. Refund pass.
+ * What's different from the DevNet version:
+ *   - Transport goes through `resilientHttp()` instead of bare `http()` —
+ *     bumps viem's retry envelope from ~1s to ~31s so HTTP 429 / 408 /
+ *     5xx from `aeneid.storyrpc.io` get absorbed (viem already retries
+ *     these status codes; we only widen the budget).
+ *   - Cross-wallet parallelism gated by `pLimit(25)` so the public RPC
+ *     sees at most 25 in-flight requests at a time. The test still
+ *     launches all 100 wallets logically; only the burst pressure is
+ *     capped. WALLET_COUNT, per-wallet sequential semantics, assertion
+ *     bar (`failed.length === 0`), and the recovered-dataKey checks
+ *     are byte-identical to the DevNet version.
+ *   - Timeout 60 min (vs 45 min DevNet) — public RPC tail latencies
+ *     stretch p99 well beyond the private validator.
+ *   - `writePerfStats` label is `"100w-fresh-aeneid"` so the aggregate
+ *     perf-stats JSON doesn't collide with the DevNet run's slot.
  *
- * What this proves (different from `ephemeral-100w-shared.test.ts`):
- *   - 100 INDEPENDENT vault lifecycles concurrently — the validator
- *     partial path must handle distinct (uuid, requesterPubKey) buckets
- *     in parallel without cross-talk.
- *   - The uploader's chain interaction (alloc + write txs) scales to
- *     100 distinct senders without nonce-collision failure modes.
- *   - Each wallet recovers the SAME dataKey it wrote — proves the
- *     keeper indexes vaults by uuid correctly under load.
+ * What's the same:
+ *   - 100 fresh wallets, Multicall3 batch fund, per-wallet sequential
+ *     upload→read, cross-wallet parallel, refund pass, same assertions.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -34,7 +32,6 @@ import {
   type WalletClient,
   createPublicClient,
   createWalletClient,
-  http,
   parseEther,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -47,10 +44,12 @@ import {
   refundWallets,
 } from "./_ephemeral-wallets.js";
 import { formatMs, logCase, mean, p50, p95, statsOf, writePerfStats } from "./_helpers.js";
+import { pLimit, resilientHttp } from "./_rpc-resilience.js";
 
 const WALLET_COUNT = 100;
 const PER_WALLET_FUND = parseEther("0.1");
 const ACCESS_TIMEOUT_MS = 180_000;
+const MAX_INFLIGHT = 25;
 
 const API_URL = process.env.CDR_API_URL;
 const RPC_URL = process.env.CDR_RPC_URL;
@@ -69,11 +68,11 @@ function makeFunderClient(): {
 } {
   const account = privateKeyToAccount(FUNDER_KEY!);
   const publicClient = createPublicClient({
-    transport: http(RPC_URL),
+    transport: resilientHttp(RPC_URL!),
   }) as unknown as PublicClient;
   const walletClient = createWalletClient({
     account,
-    transport: http(RPC_URL),
+    transport: resilientHttp(RPC_URL!),
   }) as unknown as WalletClient;
   const client = new CDRClient({
     network: "testnet",
@@ -86,11 +85,11 @@ function makeFunderClient(): {
 
 function makeWalletClient(wallet: EphemeralWallet): CDRClient {
   const publicClient = createPublicClient({
-    transport: http(RPC_URL),
+    transport: resilientHttp(RPC_URL!),
   }) as unknown as PublicClient;
   const walletClient = createWalletClient({
     account: wallet.account,
-    transport: http(RPC_URL),
+    transport: resilientHttp(RPC_URL!),
   }) as unknown as WalletClient;
   return new CDRClient({
     network: "testnet",
@@ -118,8 +117,8 @@ async function deployOpenCondition(
   return receipt.contractAddress;
 }
 
-describe.skipIf(skipUnlessSuite("default") || NETWORK !== "devnet")(
-  `100 ephemeral wallets → fresh vault per wallet (network=${NETWORK})`,
+describe.skipIf(skipUnlessSuite("default") || NETWORK !== "aeneid")(
+  `100 ephemeral wallets → fresh vault per wallet, throttled (network=${NETWORK})`,
   () => {
     let funderPublic: PublicClient;
     let funderWallet: WalletClient;
@@ -164,11 +163,15 @@ describe.skipIf(skipUnlessSuite("default") || NETWORK !== "devnet")(
 
     afterAll(async () => {
       if (!wallets || wallets.length === 0) return;
+      // Public-RPC sweep also benefits from the retry envelope —
+      // otherwise refund 429s silently inflate `failedRefunds`.
       const refund = await refundWallets(
         funderPublic,
         wallets,
         funderAddress,
         RPC_URL!,
+        undefined,
+        resilientHttp,
       );
       logCase("refund summary", {
         totalRefundedWei: refund.totalRefundedWei.toString(),
@@ -176,7 +179,7 @@ describe.skipIf(skipUnlessSuite("default") || NETWORK !== "devnet")(
       });
       if (perfBuffer) {
         writePerfStats({
-          label: "100w-fresh",
+          label: "100w-fresh-aeneid",
           network: NETWORK,
           wallets: WALLET_COUNT,
           fulfilled: perfBuffer.fulfilled,
@@ -191,53 +194,56 @@ describe.skipIf(skipUnlessSuite("default") || NETWORK !== "devnet")(
             burned_wei: (totalFundedWei - refund.totalRefundedWei).toString(),
             failed_sweeps: refund.failedRefunds,
           },
-          extra: null,
+          extra: { maxInflight: MAX_INFLIGHT },
         });
       }
     }, 5 * 60 * 1000);
 
     it(
-      `${WALLET_COUNT} wallets each do upload→read on their own vault, in parallel`,
+      `${WALLET_COUNT} wallets each do upload→read on their own vault, capped at ${MAX_INFLIGHT} in-flight`,
       async () => {
+        const limit = pLimit(MAX_INFLIGHT);
         const start = Date.now();
         const results = await Promise.allSettled(
-          wallets.map(async (w) => {
-            const client = makeWalletClient(w);
+          wallets.map((w) =>
+            limit(async () => {
+              const client = makeWalletClient(w);
 
-            // ----- per-wallet sequential: upload, then read -----
-            const dataKey = crypto.getRandomValues(new Uint8Array(32));
-            const globalPubKey = await client.observer.getGlobalPubKey();
+              // ----- per-wallet sequential: upload, then read -----
+              const dataKey = crypto.getRandomValues(new Uint8Array(32));
+              const globalPubKey = await client.observer.getGlobalPubKey();
 
-            const tUploadStart = Date.now();
-            const upload = await client.uploader.uploadCDR({
-              dataKey,
-              globalPubKey,
-              updatable: false,
-              writeConditionAddr: openCondition,
-              readConditionAddr: openCondition,
-              writeConditionData: "0x",
-              readConditionData: "0x",
-              accessAuxData: "0x",
-            });
-            const uploadMs = Date.now() - tUploadStart;
+              const tUploadStart = Date.now();
+              const upload = await client.uploader.uploadCDR({
+                dataKey,
+                globalPubKey,
+                updatable: false,
+                writeConditionAddr: openCondition,
+                readConditionAddr: openCondition,
+                writeConditionData: "0x",
+                readConditionData: "0x",
+                accessAuxData: "0x",
+              });
+              const uploadMs = Date.now() - tUploadStart;
 
-            const tAccessStart = Date.now();
-            const access = await client.consumer.accessCDR({
-              uuid: upload.uuid,
-              accessAuxData: "0x",
-              timeoutMs: ACCESS_TIMEOUT_MS,
-            });
-            const accessMs = Date.now() - tAccessStart;
+              const tAccessStart = Date.now();
+              const access = await client.consumer.accessCDR({
+                uuid: upload.uuid,
+                accessAuxData: "0x",
+                timeoutMs: ACCESS_TIMEOUT_MS,
+              });
+              const accessMs = Date.now() - tAccessStart;
 
-            return {
-              address: w.address,
-              uuid: upload.uuid,
-              uploadMs,
-              accessMs,
-              expected: dataKey,
-              recovered: access.dataKey,
-            };
-          }),
+              return {
+                address: w.address,
+                uuid: upload.uuid,
+                uploadMs,
+                accessMs,
+                expected: dataKey,
+                recovered: access.dataKey,
+              };
+            }),
+          ),
         );
 
         const fulfilled = results.flatMap((r) =>
@@ -259,10 +265,11 @@ describe.skipIf(skipUnlessSuite("default") || NETWORK !== "devnet")(
         const totalMs = Date.now() - start;
         const uploadLats = fulfilled.map((r) => r.uploadMs);
         const accessLats = fulfilled.map((r) => r.accessMs);
-        logCase("100-fresh summary", {
+        logCase("100-fresh-aeneid summary", {
           fulfilled: fulfilled.length,
           failed: failed.length,
           totalMs: formatMs(totalMs),
+          maxInflight: MAX_INFLIGHT,
           uploadMs: {
             p50: formatMs(p50(uploadLats)),
             p95: formatMs(p95(uploadLats)),
@@ -290,10 +297,10 @@ describe.skipIf(skipUnlessSuite("default") || NETWORK !== "devnet")(
           expect(Array.from(r.recovered)).toEqual(Array.from(r.expected));
         }
       },
-      // Two sequential txs per wallet (upload + read) under 100-way
-      // contention can stretch the tail well past a single-vault test.
-      // Allow 45 min worst-case.
-      45 * 60 * 1000,
+      // Public RPC tail latencies stretch p99 well beyond the private
+      // validator's; 100 wallets × (upload + read) under pLimit(25)
+      // contention easily reach the 30-40 min mark on a busy Aeneid.
+      60 * 60 * 1000,
     );
   },
 );
