@@ -4,7 +4,7 @@
  * same shape, 10x the fan-out, plus a final summary block that breaks
  * out the cost model and latency distribution.
  *
- * Suite gating: `1000-wallet-performance` (and `all`). DevNet + Aeneid.
+ * Suite gating: `1000-wallet-performance-devnet-only` (and `all`), DevNet only.
  *
  * Why batch the funding:
  *   Multicall3.aggregate3Value with 1000 inner calls costs ~50M gas — past
@@ -155,7 +155,7 @@ async function fundInBatches(
   return totalFunded;
 }
 
-describe.skipIf(skipUnlessSuite("1000-wallet-performance") || NETWORK !== "devnet")(
+describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only") || NETWORK !== "devnet")(
   `1000 ephemeral wallets → shared vault read perf (network=${NETWORK})`,
   () => {
     let funderPublic: PublicClient;
@@ -332,7 +332,7 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance") || NETWORK !== "devne
       // 1000 concurrent reads against the validator partial path can stretch
       // well past the per-call timeout if the chain or DKG nodes throttle.
       // 75 min outer bound matches the workflow's 90-min timeout-minutes for
-      // the 1000-wallet-performance suite with slack for setup + teardown.
+      // the 1000-wallet-performance-devnet-only suite with slack for setup + teardown.
       75 * 60 * 1000,
     );
   },

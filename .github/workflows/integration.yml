@@ -20,12 +20,12 @@ on:
         options:
           # default                 — functional (SDK/CLI/Examples) + 100w ephemeral
           # all                     — default + 1000w perf + 60min stress
-          # 1000-wallet-performance — ONLY ephemeral-1000w-perf.test.ts (strict isolation:
+          # 1000-wallet-performance-devnet-only — ONLY ephemeral-1000w-perf.test.ts (strict isolation:
           #                           no functional, no CLI, no Examples — clean perf signal)
           # 1H-stress-devnet-only   — ONLY ephemeral-60min-stress.test.ts (DevNet only)
           - default
           - all
-          - 1000-wallet-performance
+          - 1000-wallet-performance-devnet-only
           - 1H-stress-devnet-only
         default: default
   pull_request:
@@ -73,7 +73,7 @@ jobs:
           # `run_integration` / `run_stress` flags steer which step blocks
           # inside it run. There is no separate `stress` job anymore.
           case "$SUITE" in
-            default|1000-wallet-performance)
+            default|1000-wallet-performance-devnet-only)
               RUN_INTEGRATION=true
               RUN_STRESS=false ;;
             all)
@@ -95,15 +95,6 @@ jobs:
         if: ${{ steps.resolve.outputs.run_stress == 'true' && steps.resolve.outputs.network != 'devnet' }}
         run: |
           echo "::error::test_suite=${{ steps.resolve.outputs.test_suite }} requires network=devnet (got ${{ steps.resolve.outputs.network }})"
-          exit 1
-
-      - name: Validate (1000-wallet-performance is DevNet-only)
-        # 1000-way burst saturates any public RPC; the test gate inside the
-        # file also enforces this, but failing fast in `prepare` is friendlier
-        # than letting `integration` schedule a job that ends up all-skipped.
-        if: ${{ steps.resolve.outputs.test_suite == '1000-wallet-performance' && steps.resolve.outputs.network != 'devnet' }}
-        run: |
-          echo "::error::test_suite=1000-wallet-performance requires network=devnet (got ${{ steps.resolve.outputs.network }})"
           exit 1
 
       - name: Write run summary
@@ -139,9 +130,9 @@ jobs:
     runs-on: ubuntu-latest
     # Timeout sized to the heaviest suite in play. Stress alone is 60 min
     # wall time + ~15 min setup/teardown; `all` adds another 30-50 min
-    # for the 1000-wallet perf suite. `1000-wallet-performance` is 90 min
+    # for the 1000-wallet perf suite. `1000-wallet-performance-devnet-only` is 90 min
     # without stress.
-    timeout-minutes: ${{ needs.prepare.outputs.test_suite == 'all' && 180 || (needs.prepare.outputs.test_suite == '1H-stress-devnet-only' && 120 || (needs.prepare.outputs.test_suite == '1000-wallet-performance' && 90 || 60)) }}
+    timeout-minutes: ${{ needs.prepare.outputs.test_suite == 'all' && 180 || (needs.prepare.outputs.test_suite == '1H-stress-devnet-only' && 120 || (needs.prepare.outputs.test_suite == '1000-wallet-performance-devnet-only' && 90 || 60)) }}
     env:
       NETWORK: ${{ needs.prepare.outputs.network }}
       TEST_SUITE: ${{ needs.prepare.outputs.test_suite }}
@@ -213,7 +204,7 @@ jobs:
       # treats it as end-of-options and the `--outputFile.json=…` flag is
       # silently dropped.
       # Strict isolation for the perf-only suites:
-      #   - 1000-wallet-performance → SDK step runs ONLY the 1000w-perf file,
+      #   - 1000-wallet-performance-devnet-only → SDK step runs ONLY the 1000w-perf file,
       #     CLI + Examples steps skip entirely. Goal: clean perf signal
       #     without ~10 min of functional-test noise on the funder wallet.
       #   - default / all → SDK step runs everything (vitest's default glob),
@@ -228,7 +219,7 @@ jobs:
         run: |
           set -o pipefail
           INCLUDE_ARGS=()
-          if [ "$TEST_SUITE" = "1000-wallet-performance" ]; then
+          if [ "$TEST_SUITE" = "1000-wallet-performance-devnet-only" ]; then
             INCLUDE_ARGS=('__integration__/ephemeral-1000w-perf.test.ts')
           fi
           npx vitest run --no-file-parallelism \
@@ -242,7 +233,7 @@ jobs:
 
       - name: CLI integration
         id: cli
-        if: ${{ env.RUN_INTEGRATION == 'true' && env.TEST_SUITE != '1000-wallet-performance' }}
+        if: ${{ env.RUN_INTEGRATION == 'true' && env.TEST_SUITE != '1000-wallet-performance-devnet-only' }}
         working-directory: apps/cli
         run: |
           set -o pipefail
@@ -256,7 +247,7 @@ jobs:
 
       - name: Examples integration
         id: examples
-        if: ${{ env.RUN_INTEGRATION == 'true' && env.TEST_SUITE != '1000-wallet-performance' }}
+        if: ${{ env.RUN_INTEGRATION == 'true' && env.TEST_SUITE != '1000-wallet-performance-devnet-only' }}
         working-directory: apps/examples
         run: |
           set -o pipefail
