@@ -23,14 +23,17 @@
  *      `Promise.all`. Replaces the deleted Workflow A
  *      (cdr-sdk-stress-test.yml) from the e2e repo — same-uuid +
  *      fresh-uuid coverage in a single 1h run.
- *   4. **Soft failures:** a single cycle that throws (or recovers a
+ *   4. **Failure handling:** a single cycle that throws (or recovers a
  *      mismatched dataKey on the shared vault) is recorded in a failure
- *      counter, but does NOT abort the wallet — the loop moves on to the
- *      next cycle. This matches what stress is for: surface failure
- *      rates under load, not assert zero failures.
- *   5. Final assertion: at least some cycles completed (smoke check).
- *      The real signal is the perf-stats JSON output: upload + access
- *      latency distribution, total cycles, failure ratio.
+ *      counter and the wallet's loop continues so we collect ALL
+ *      failures across the wave (not just the first one). At the end of
+ *      the run the test asserts `failedCycles === 0` — any non-zero
+ *      count fails the test. To diagnose, grep the output for
+ *      `[w[N] cycle=M FAILED] <msg>`.
+ *   5. Final assertions: (a) at least one cycle was attempted, (b)
+ *      zero cycles failed. The perf-stats JSON output (upload + access
+ *      latency distributions, total cycles, failure ratio) remains
+ *      available for trend analysis.
  *
  * Why pipeline (vs the old 10s-tick model):
  *   The previous version slept up to 10s between batches to maintain a
@@ -350,6 +353,15 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
         const accessFreshLats: number[] = [];
         let totalCycles = 0;
         let failedCycles = 0;
+        // First-failure capture for the zero-tolerance assert at the
+        // end. The `[w[N] cycle=M FAILED]` log lines go to
+        // /tmp/cdr-stress.log which the workflow archives as an
+        // artifact, but vitest's CI failure surface usually just shows
+        // the assertion message — operators shouldn't have to download
+        // an artifact to find the first failing wallet/cycle. JS is
+        // single-threaded so the `if (!firstFailure)` check + assign
+        // can't race even though 10 wallets run concurrently.
+        let firstFailure: string | null = null;
 
         // Each wallet's loop is independent — Promise.all runs all 10 in
         // parallel. Within a wallet the cycle is strictly sequential
@@ -445,8 +457,13 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
                 logLine(
                   `[w[${idx}] cycle=${cycleIdx} FAILED] ${msg.slice(0, 240)}`,
                 );
-                // Continue to next cycle — stress measures failure rate,
-                // not absence of failures.
+                if (!firstFailure) {
+                  firstFailure = `w[${idx}] cycle=${cycleIdx}: ${msg.slice(0, 240)}`;
+                }
+                // Continue the loop so other wallets keep running and we
+                // get a full picture of failures across the wave; the
+                // final `expect(failedCycles).toBe(0)` after the loop
+                // turns any non-zero count into a test failure.
               }
             }
             logLine(`[w[${idx}] done] cycles_attempted=${cycleIdx}`);
@@ -482,12 +499,31 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
           wallClockMs,
         };
 
-        // Smoke check only — stress doesn't assert zero failures. The
-        // signal is in the perf-stats JSON.
+        // 1) Driver liveness — wallets must have attempted at least one cycle.
         expect(
           totalCycles + failedCycles,
           "stress test finished with zero cycle attempts — wallets didn't even reach the first try",
         ).toBeGreaterThan(0);
+
+        // 2) Zero-tolerance for cycle failures. Every per-wallet 3-op
+        //    cycle (upload + read shared + read fresh) must succeed.
+        //    Individual cycle failures are logged with the
+        //    `[w[N] cycle=M FAILED] <msg>` pattern — grep the test
+        //    output to find the first failing cycle. Common causes seen
+        //    on this stack:
+        //      - "Timed out collecting partials after 120000ms: got X/Y"
+        //        → TDH2 threshold not met: one or more DKG vals didn't
+        //          respond within the access timeout. Check
+        //          /dkg/latest_active.{total,threshold} and validator
+        //          kernel logs for `Kernel partial decrypt failed`.
+        //      - dataKey MISMATCH → wrong-key delivery; chain GPK drift
+        //        or wrong DKG round captured during upload.
+        expect(
+          failedCycles,
+          `stress test had ${failedCycles}/${totalCycles + failedCycles} cycles fail. ` +
+            `First failure: ${firstFailure ?? "(none captured — likely a logic bug, failedCycles>0 but firstFailure is null)"}. ` +
+            `Full per-cycle log: /tmp/cdr-stress.log (uploaded as cdr-stress-log-<run_id> artifact).`,
+        ).toBe(0);
       },
       DURATION_MS + 15 * 60 * 1000,
     );
