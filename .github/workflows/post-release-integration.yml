@@ -490,3 +490,135 @@ jobs:
             echo "| \`${VERSION:-?}\` | \`${CLI_ACTUAL:-(no output)}\` | $(icon "${CLI_OUTCOME:-skipped}") ${CLI_RESULT:-skipped} |"
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
+
+  e2e-aeneid:
+    # End-to-end gate against a live Aeneid validator set, using a fresh
+    # subwallet funded from the CI funder. The subwallet pattern avoids
+    # nonce collisions with the existing `ephemeral-100w-fresh-aeneid`
+    # suite (and any concurrent manual dispatches), both of which share
+    # the same CDR_AENEID_TEST_PRIVATE_KEY funder.
+    #
+    # Sequential after `verify` (not parallel): if the install / field
+    # audit / smoke gates already failed, the artifact is known-broken
+    # and we don't want to burn Aeneid test IP confirming the obvious.
+    needs: [prepare, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      # Aeneid endpoint constants — copied verbatim from
+      # integration.yml:160-161 (single source of truth would be nicer
+      # but GHA doesn't let workflows share top-level env across jobs
+      # via inheritance, and a reusable-workflow indirection isn't
+      # worth it for two URLs).
+      CDR_API_URL: http://172.192.41.96:1317
+      CDR_RPC_URL: https://aeneid.storyrpc.io
+      CDR_AENEID_TEST_PRIVATE_KEY: ${{ secrets.CDR_AENEID_TEST_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Verify Aeneid secret populated
+        run: |
+          if [ -z "$CDR_AENEID_TEST_PRIVATE_KEY" ]; then
+            echo "::error::CDR_AENEID_TEST_PRIVATE_KEY is empty (missing repo secret)"
+            exit 1
+          fi
+
+      - name: Install SDK in clean temp dir
+        id: install
+        run: |
+          set -euo pipefail
+          INSTALL_DIR="$(mktemp -d -t cdr-release-e2e-XXXXXX)"
+          echo "INSTALL_DIR=$INSTALL_DIR" >> "$GITHUB_ENV"
+          cd "$INSTALL_DIR"
+          npm init -y > /dev/null
+          # Explicit viem alongside the SDK: viem is a peerDependency
+          # (packages/sdk/package.json line "peerDependencies.viem"),
+          # so we pin a known-compatible version rather than relying on
+          # npm's peer-auto-install heuristic to pick the right minor.
+          npm install --no-package-lock \
+            "@piplabs/cdr-sdk@${VERSION}" \
+            "viem@^2.47"
+          cp "$GITHUB_WORKSPACE/.github/scripts/post-release-aeneid-e2e.mjs" .
+          echo "Installed in: $INSTALL_DIR"
+
+      - name: Run e2e — upload + access via subwallet
+        id: e2e
+        # The script writes status.json on every code path (success +
+        # failure) before exiting. We let the script's exit code surface
+        # as the step outcome; the summary step (if: always()) reads
+        # status.json regardless and renders diagnostics.
+        run: |
+          set -uo pipefail
+          cd "$INSTALL_DIR"
+          node post-release-aeneid-e2e.mjs
+
+      - name: Write e2e summary
+        if: always()
+        env:
+          E2E_OUTCOME: ${{ steps.e2e.outcome }}
+        run: |
+          set -u
+          icon() {
+            case "$1" in
+              success) echo "✅" ;;
+              failure) echo "❌" ;;
+              skipped) echo "⏭️" ;;
+              *)       echo "❔" ;;
+            esac
+          }
+          STATUS_FILE="${INSTALL_DIR:-}/status.json"
+          {
+            echo "## End-to-end Aeneid — \`${VERSION}\`"
+            echo ""
+            echo "| Gate | Status |"
+            echo "|---|---|"
+            echo "| Aeneid e2e | $(icon "${E2E_OUTCOME:-skipped}") \`${E2E_OUTCOME:-skipped}\` |"
+            echo ""
+            if [ -n "${INSTALL_DIR:-}" ] && [ -f "$STATUS_FILE" ]; then
+              echo "### Run details"
+              echo ""
+              echo "| Field | Value |"
+              echo "|---|---|"
+              echo "| Outcome | \`$(jq -r '.outcome' "$STATUS_FILE")\` |"
+              echo "| Wall time | $(jq -r '.totalWallClockMs // "—"' "$STATUS_FILE") ms |"
+              echo "| Subwallet | \`$(jq -r '.subwalletAddress // "—"' "$STATUS_FILE")\` |"
+              echo "| Funder | \`$(jq -r '.funder.address // "—"' "$STATUS_FILE")\` |"
+              echo "| Fund tx | \`$(jq -r '.funder.fundTx // "—"' "$STATUS_FILE")\` |"
+              echo "| Open-condition | \`$(jq -r '.deploy.openCondition // "—"' "$STATUS_FILE")\` |"
+              echo "| Vault UUID | \`$(jq -r '.upload.uuid // "—"' "$STATUS_FILE")\` |"
+              echo "| Upload — allocate tx | \`$(jq -r '.upload.txAllocate // "—"' "$STATUS_FILE")\` |"
+              echo "| Upload — write tx | \`$(jq -r '.upload.txWrite // "—"' "$STATUS_FILE")\` |"
+              echo "| Upload latency | $(jq -r '.upload.latencyMs // "—"' "$STATUS_FILE") ms |"
+              echo "| Access — read tx | \`$(jq -r '.access.txRead // "—"' "$STATUS_FILE")\` |"
+              echo "| Access latency | $(jq -r '.access.latencyMs // "—"' "$STATUS_FILE") ms |"
+              echo "| DataKey recovered | $(jq -r 'if .access.recovered then "✅" else "❌" end' "$STATUS_FILE") |"
+              echo "| Refund tx | \`$(jq -r '.refund.tx // "—"' "$STATUS_FILE")\` |"
+              echo "| Refund amount | $(jq -r '.refund.refundedWei // "—"' "$STATUS_FILE") wei |"
+              echo ""
+              ERR=$(jq -r '.error // ""' "$STATUS_FILE")
+              if [ -n "$ERR" ] && [ "$ERR" != "null" ]; then
+                echo "### Error"
+                echo ""
+                echo '```'
+                echo "$ERR"
+                echo '```'
+                echo ""
+              fi
+              REFUND_ERR=$(jq -r '.refund.error // ""' "$STATUS_FILE")
+              if [ -n "$REFUND_ERR" ] && [ "$REFUND_ERR" != "null" ]; then
+                echo "### Refund error (non-fatal)"
+                echo ""
+                echo '```'
+                echo "$REFUND_ERR"
+                echo '```'
+                echo ""
+              fi
+            else
+              echo "_(no status.json — script exited before writing diagnostics)_"
+              echo ""
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
