@@ -1,0 +1,169 @@
+name: Post-Release Integration
+
+# Smoke-tests the actually-published npm tarballs (NOT the workspace source
+# tree that integration.yml exercises). Catches consumer-only defects like
+# missing exports/engines fields, version-stamp drift, and partial / non-
+# lockstep releases. See issue #102 for the full motivation.
+#
+# Triggers:
+#   - workflow_run: fires after every Release workflow completion. The
+#     job-level `if` further gates on (a) the upstream run succeeded and
+#     (b) the head commit carried the publish marker — mirroring the gate
+#     in release.yml — so non-publish main pushes don't spam empty runs.
+#   - workflow_dispatch: manual rerun. Optional `version` input overrides
+#     the registry-latest lookup; useful for re-verifying an older release
+#     or for testing this workflow from a feature branch before merge.
+#
+# Testing from a branch: once this file lands on a branch in origin,
+# Actions → "Post-Release Integration" → Run workflow → pick the branch.
+# Pushing the workflow file to origin/main is NOT a prerequisite for the
+# manual dispatch path; only the workflow_run path requires the file to
+# be on the default branch.
+
+run-name: post-release-${{ inputs.version || github.event.workflow_run.head_sha || 'latest' }}
+
+permissions:
+  contents: read
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to verify (empty = resolve from npm latest)'
+        required: false
+        default: ''
+
+# Coalesce concurrent runs that target the same version. We don't
+# cancel-in-progress — a manual rerun while the auto-run is still going
+# should queue, not kill, so we still get the auto-trigger's signal.
+concurrency:
+  group: post-release-${{ inputs.version || github.event.workflow_run.head_sha || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    # workflow_dispatch is always allowed. workflow_run fires for every
+    # Release completion (including main pushes that didn't publish — the
+    # publish job in release.yml is gated on the commit-message marker and
+    # skips quietly otherwise), so we additionally require both upstream
+    # success and the publish marker to be present.
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (github.event.workflow_run.conclusion == 'success' &&
+         contains(github.event.workflow_run.head_commit.message, 'chore: release packages'))
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve canonical version
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            VERSION="$INPUT_VERSION"
+            SOURCE="workflow_dispatch input"
+          else
+            # npm view writes the version string to stdout and exits 0 on
+            # success, exits 1 with an E404 if the package is missing. We
+            # treat any non-zero exit or empty stdout as a hard failure —
+            # this is the canonical source of truth for "what was just
+            # released" and anything else means the registry is in a state
+            # we don't understand.
+            VERSION="$(npm view @piplabs/cdr-sdk version)"
+            SOURCE="npm view @piplabs/cdr-sdk (latest)"
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "::error::failed to resolve canonical version"
+            exit 1
+          fi
+          echo "Resolved version: $VERSION (source: $SOURCE)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "source=$SOURCE"   >> "$GITHUB_OUTPUT"
+
+      - name: Verify lockstep release across all four packages
+        id: lockstep
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -uo pipefail
+          PACKAGES=(@piplabs/cdr-contracts @piplabs/cdr-crypto @piplabs/cdr-sdk @piplabs/cdr-cli)
+          FAILED=()
+          ROWS=()
+          for pkg in "${PACKAGES[@]}"; do
+            # Require BOTH: `npm view <pkg>@<ver> version` exits 0 AND its
+            # stdout exactly equals the requested version. A registry mirror
+            # lag or cache quirk could in principle return a different
+            # version string under the same query — comparing the value
+            # belt-and-braces guards against that.
+            ACTUAL="$(npm view "${pkg}@${VERSION}" version 2>/dev/null || true)"
+            if [ "$ACTUAL" = "$VERSION" ]; then
+              ROWS+=("| \`${pkg}\` | \`${VERSION}\` | ✅ |")
+            else
+              ROWS+=("| \`${pkg}\` | \`${ACTUAL:-(not found)}\` | ❌ |")
+              FAILED+=("$pkg")
+            fi
+          done
+          {
+            echo "rows<<ROWS_EOF"
+            printf '%s\n' "${ROWS[@]}"
+            echo "ROWS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          if [ "${#FAILED[@]}" -gt 0 ]; then
+            echo "::error::Lockstep verification failed — these packages are not published at ${VERSION}: ${FAILED[*]}"
+            exit 1
+          fi
+          echo "Lockstep verified: all four packages published at ${VERSION}"
+
+      - name: Write run summary
+        if: always()
+        # GH_EVENT_NAME / GH_SHA are GH-controlled so they're safe inline,
+        # but threading them through env is the house style (see
+        # integration.yml:108) so a future copy-paste doesn't accidentally
+        # introduce an untrusted-input injection.
+        env:
+          GH_EVENT_NAME: ${{ github.event_name }}
+          GH_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          SOURCE: ${{ steps.resolve.outputs.source }}
+          LOCKSTEP_OUTCOME: ${{ steps.lockstep.outcome }}
+          ROWS: ${{ steps.lockstep.outputs.rows }}
+        run: |
+          set -u
+          icon() {
+            case "$1" in
+              success) echo "✅" ;;
+              failure) echo "❌" ;;
+              skipped) echo "⏭️" ;;
+              *)       echo "❔" ;;
+            esac
+          }
+          {
+            echo "## Post-release integration — \`${VERSION:-(unresolved)}\`"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Trigger | \`${GH_EVENT_NAME}\` |"
+            echo "| Commit | \`${GH_SHA}\` |"
+            echo "| Version | \`${VERSION:-(unresolved)}\` |"
+            echo "| Version source | ${SOURCE:-(n/a)} |"
+            echo "| Lockstep | $(icon "${LOCKSTEP_OUTCOME:-skipped}") \`${LOCKSTEP_OUTCOME:-skipped}\` |"
+            echo ""
+            echo "### Lockstep verification"
+            echo ""
+            if [ -n "${ROWS:-}" ]; then
+              echo "| Package | Found | Status |"
+              echo "|---|---|---|"
+              echo "${ROWS}"
+            else
+              echo "_(lockstep step did not run — version resolution likely failed)_"
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
