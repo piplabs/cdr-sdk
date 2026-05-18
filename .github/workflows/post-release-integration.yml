@@ -28,7 +28,7 @@ on:
 # cancel-in-progress — a manual rerun while the auto-run is still going
 # should queue, not kill, so we still get the auto-trigger's signal.
 concurrency:
-  group: post-release-${{ inputs.version || github.event.workflow_run.head_sha || github.run_id }}
+  group: post-release-${{ inputs.version || 'auto-latest' }}
   cancel-in-progress: false
 
 jobs:
@@ -344,13 +344,16 @@ jobs:
         run: |
           set -uo pipefail
           cd "$INSTALL_DIR"
-          # `--package=…@<ver>` pins the exact version so a stale globally
-          # cached cdr-cli on the runner can't shadow what we just installed.
-          ACTUAL_RAW=$(npx --package="@piplabs/cdr-cli@${VERSION}" cdr-cli --version 2>&1 || true)
+          # Invoke the binary directly from node_modules/.bin 
+          ACTUAL_RAW=$(./node_modules/.bin/cdr-cli --version 2>&1 || true)
           # Strict equality catches the #96 class of drift (0.1.2 stamped
           # into a 0.2.1 binary).
           TRIMMED=$(printf '%s' "$ACTUAL_RAW" | tr -d '[:space:]')
-          echo "actual=${ACTUAL_RAW}" >> "$GITHUB_OUTPUT"
+          {
+            echo "actual<<ACTUAL_EOF"
+            printf '%s\n' "$ACTUAL_RAW"
+            echo "ACTUAL_EOF"
+          } >> "$GITHUB_OUTPUT"
           echo "trimmed=${TRIMMED}" >> "$GITHUB_OUTPUT"
           if [ "$TRIMMED" = "$VERSION" ]; then
             echo "result=match" >> "$GITHUB_OUTPUT"
@@ -461,7 +464,11 @@ jobs:
       CDR_RPC_URL: https://aeneid.storyrpc.io
       CDR_AENEID_TEST_PRIVATE_KEY: ${{ secrets.CDR_AENEID_TEST_PRIVATE_KEY }}
     steps:
+      # Pin checkout to the release revision so the harness file is
+      # always the one that shipped with the tarball under test. 
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || format('v{0}', needs.prepare.outputs.version) }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
