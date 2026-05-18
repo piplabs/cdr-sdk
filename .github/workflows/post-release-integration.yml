@@ -167,3 +167,326 @@ jobs:
             fi
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    # Clean-room verification: install the actually-published tarballs into
+    # a temp dir OUTSIDE the workspace, then run the gates the workspace
+    # build can't catch — package.json field audit (#97/#98), CJS + ESM
+    # import smoke, and `cdr-cli --version` strict equality (#96).
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      # Pin Node 20 (LTS, matches integration.yml:144-147). Without this,
+      # the runner's default Node version drifts and changes the CJS-bridge
+      # behavior in the smoke step below — see the comment on the CJS smoke
+      # step for the full reasoning.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install packages in clean temp dir
+        id: install
+        run: |
+          set -euo pipefail
+          # mktemp outside $GITHUB_WORKSPACE so pnpm/npm workspace
+          # resolution can't influence anything — we want the same
+          # conditions a fresh consumer machine would see.
+          INSTALL_DIR="$(mktemp -d -t cdr-release-XXXXXX)"
+          echo "INSTALL_DIR=$INSTALL_DIR" >> "$GITHUB_ENV"
+          cd "$INSTALL_DIR"
+          npm init -y > /dev/null
+          # --no-package-lock: we don't care about reproducibility, we
+          # care about "what does `npm install @piplabs/...@$VERSION`
+          # give a consumer right now". Skipping the lockfile keeps the
+          # temp dir slim and removes a moving part.
+          npm install --no-package-lock \
+            "@piplabs/cdr-contracts@${VERSION}" \
+            "@piplabs/cdr-crypto@${VERSION}" \
+            "@piplabs/cdr-sdk@${VERSION}" \
+            "@piplabs/cdr-cli@${VERSION}"
+          echo "Installed in: $INSTALL_DIR"
+          ls -la node_modules/@piplabs/
+
+      - name: Audit package.json fields
+        id: audit
+        run: |
+          set -uo pipefail
+          # Per-package required fields:
+          #   libraries (contracts/crypto/sdk): engines, exports, main, types
+          #   cli:                              engines, bin
+          # `module` is reported separately as informational — it's a
+          # legacy bundler convention that modern ESM packages with a
+          # proper `exports` map don't need, so we don't fail on it.
+          FAILED=()
+          ROWS=()
+
+          # Returns "OK" if the field is present and non-empty, else "FAIL".
+          # Empty objects (`{}`) and empty strings count as missing — they
+          # indicate the field was declared but left blank, which is the
+          # same consumer-visible state as omission.
+          check_field() {
+            local pkg="$1"
+            local field="$2"
+            local pkgjson="${INSTALL_DIR}/node_modules/${pkg}/package.json"
+            if [ ! -f "$pkgjson" ]; then echo "MISSING_FILE"; return; fi
+            local val
+            val=$(jq -c --arg f "$field" '.[$f] // empty' "$pkgjson")
+            if [ -z "$val" ] || [ "$val" = "null" ] || [ "$val" = "{}" ] || [ "$val" = "\"\"" ]; then
+              echo "FAIL"
+            else
+              echo "OK"
+            fi
+          }
+
+          # Libraries
+          for pkg in @piplabs/cdr-contracts @piplabs/cdr-crypto @piplabs/cdr-sdk; do
+            for field in engines exports main types; do
+              status=$(check_field "$pkg" "$field")
+              if [ "$status" = "OK" ]; then
+                ROWS+=("| \`${pkg}\` | \`${field}\` | required | ✅ |")
+              else
+                ROWS+=("| \`${pkg}\` | \`${field}\` | required | ❌ |")
+                FAILED+=("${pkg}#${field}")
+              fi
+            done
+            # module: report only, don't fail
+            mod_status=$(check_field "$pkg" "module")
+            if [ "$mod_status" = "OK" ]; then
+              ROWS+=("| \`${pkg}\` | \`module\` | informational | ✅ |")
+            else
+              ROWS+=("| \`${pkg}\` | \`module\` | informational | ⚠️ missing |")
+            fi
+          done
+
+          # CLI
+          for field in engines bin; do
+            status=$(check_field "@piplabs/cdr-cli" "$field")
+            if [ "$status" = "OK" ]; then
+              ROWS+=("| \`@piplabs/cdr-cli\` | \`${field}\` | required | ✅ |")
+            else
+              ROWS+=("| \`@piplabs/cdr-cli\` | \`${field}\` | required | ❌ |")
+              FAILED+=("@piplabs/cdr-cli#${field}")
+            fi
+          done
+
+          {
+            echo "rows<<ROWS_EOF"
+            printf '%s\n' "${ROWS[@]}"
+            echo "ROWS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "${#FAILED[@]}" -gt 0 ]; then
+            echo "::error::Field audit failed for: ${FAILED[*]}"
+            exit 1
+          fi
+          echo "Field audit passed"
+
+      - name: 'Smoke: ESM imports'
+        id: esm_smoke
+        if: always() && steps.install.outcome == 'success'
+        run: |
+          set -uo pipefail
+          cd "$INSTALL_DIR"
+          # Dynamic import lets one .mjs file smoke-test any package by
+          # name. Top-level await is fine on Node 20 (the runner default).
+          cat > smoke.mjs <<'JSEOF'
+          const pkgName = process.argv[2];
+          try {
+            const pkg = await import(pkgName);
+            const keys = Object.keys(pkg);
+            if (keys.length === 0) {
+              throw new Error(`empty namespace from ${pkgName}`);
+            }
+            console.log(`OK ${pkgName}: ${keys.length} export(s) — ${keys.slice(0, 4).join(", ")}${keys.length > 4 ? ", ..." : ""}`);
+          } catch (err) {
+            console.error(`FAIL ${pkgName}: ${err && err.message ? err.message : err}`);
+            process.exit(1);
+          }
+          JSEOF
+          FAILED=()
+          ROWS=()
+          for pkg in @piplabs/cdr-contracts @piplabs/cdr-crypto @piplabs/cdr-sdk; do
+            if OUTPUT=$(node smoke.mjs "$pkg" 2>&1); then
+              SHORT=$(echo "$OUTPUT" | head -1 | tr -d '`' | tr '|' '/')
+              ROWS+=("| \`${pkg}\` | ✅ | ${SHORT:0:140} |")
+            else
+              SHORT=$(echo "$OUTPUT" | head -1 | tr -d '`' | tr '|' '/')
+              ROWS+=("| \`${pkg}\` | ❌ | ${SHORT:0:140} |")
+              FAILED+=("$pkg")
+            fi
+          done
+          {
+            echo "rows<<ROWS_EOF"
+            printf '%s\n' "${ROWS[@]}"
+            echo "ROWS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          if [ "${#FAILED[@]}" -gt 0 ]; then
+            echo "::error::ESM smoke failed for: ${FAILED[*]}"
+            exit 1
+          fi
+          echo "ESM smoke passed for all libraries"
+
+      - name: 'Smoke: CJS imports'
+        id: cjs_smoke
+        # Hard-fail per design — even though the v0.2.1 packages don't
+        # support require() yet (issue #97), the team's stated direction
+        # is to dual-publish CJS + ESM, so this gate must enforce that
+        # contract once shipped.
+        #
+        # NODE_OPTIONS=--no-experimental-require-module disables Node's
+        # implicit ESM-bridge for require(). Without it, Node 20.19+ and
+        # 22.12+ will silently bridge `require("@piplabs/cdr-sdk")` even
+        # when the package is ESM-only with no exports.require — defeating
+        # the gate. With the flag, require() returns the original
+        # ERR_REQUIRE_ESM if the package hasn't declared CJS support, so
+        # we catch the missing exports.require / .cjs main entry that
+        # consumers on Node <20.19 (still LTS-supported) actually need.
+        if: always() && steps.install.outcome == 'success'
+        env:
+          NODE_OPTIONS: --no-experimental-require-module
+        run: |
+          set -uo pipefail
+          cd "$INSTALL_DIR"
+          # .cjs forces CommonJS regardless of the nearest package.json's
+          # `type` field — so this test exercises the require() resolution
+          # path even when the temp dir's package.json gets `type: module`.
+          cat > smoke.cjs <<'JSEOF'
+          const pkgName = process.argv[2];
+          try {
+            const pkg = require(pkgName);
+            if (!pkg || (typeof pkg === "object" && Object.keys(pkg).length === 0)) {
+              throw new Error(`empty exports from ${pkgName}`);
+            }
+            const keys = typeof pkg === "object" ? Object.keys(pkg) : [typeof pkg];
+            console.log(`OK ${pkgName}: ${keys.length} export(s) — ${keys.slice(0, 4).join(", ")}${keys.length > 4 ? ", ..." : ""}`);
+          } catch (err) {
+            console.error(`FAIL ${pkgName}: ${err && err.code ? err.code + ": " : ""}${err && err.message ? err.message : err}`);
+            process.exit(1);
+          }
+          JSEOF
+          FAILED=()
+          ROWS=()
+          for pkg in @piplabs/cdr-contracts @piplabs/cdr-crypto @piplabs/cdr-sdk; do
+            if OUTPUT=$(node smoke.cjs "$pkg" 2>&1); then
+              SHORT=$(echo "$OUTPUT" | head -1 | tr -d '`' | tr '|' '/')
+              ROWS+=("| \`${pkg}\` | ✅ | ${SHORT:0:140} |")
+            else
+              SHORT=$(echo "$OUTPUT" | head -1 | tr -d '`' | tr '|' '/')
+              ROWS+=("| \`${pkg}\` | ❌ | ${SHORT:0:140} |")
+              FAILED+=("$pkg")
+            fi
+          done
+          {
+            echo "rows<<ROWS_EOF"
+            printf '%s\n' "${ROWS[@]}"
+            echo "ROWS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          if [ "${#FAILED[@]}" -gt 0 ]; then
+            echo "::error::CJS smoke failed for: ${FAILED[*]}"
+            exit 1
+          fi
+          echo "CJS smoke passed for all libraries"
+
+      - name: 'Verify cdr-cli --version'
+        id: cli_version
+        if: always() && steps.install.outcome == 'success'
+        run: |
+          set -uo pipefail
+          cd "$INSTALL_DIR"
+          # `npx --package=…@<ver>` pins the exact version so a stale
+          # globally-cached cdr-cli on the runner can't shadow what we
+          # just installed. The `cdr-cli` token after --package is the
+          # bin name; `--version` is passed through to the bin.
+          ACTUAL_RAW=$(npx --package="@piplabs/cdr-cli@${VERSION}" cdr-cli --version 2>&1 || true)
+          # Strict equality per issue #102: stdout (trimmed) must equal
+          # the resolved version. The motivating bug (#96) shipped
+          # "0.1.2" against a 0.2.1 package — exact match is the only
+          # check that catches that class of drift.
+          TRIMMED=$(printf '%s' "$ACTUAL_RAW" | tr -d '[:space:]')
+          echo "actual=${ACTUAL_RAW}" >> "$GITHUB_OUTPUT"
+          echo "trimmed=${TRIMMED}" >> "$GITHUB_OUTPUT"
+          if [ "$TRIMMED" = "$VERSION" ]; then
+            echo "result=match" >> "$GITHUB_OUTPUT"
+            echo "cdr-cli --version matches: ${TRIMMED}"
+          else
+            echo "result=mismatch" >> "$GITHUB_OUTPUT"
+            echo "::error::cdr-cli --version mismatch — expected '${VERSION}', got '${ACTUAL_RAW}'"
+            exit 1
+          fi
+
+      - name: Write verify summary
+        if: always()
+        env:
+          AUDIT_OUTCOME: ${{ steps.audit.outcome }}
+          AUDIT_ROWS: ${{ steps.audit.outputs.rows }}
+          ESM_OUTCOME: ${{ steps.esm_smoke.outcome }}
+          ESM_ROWS: ${{ steps.esm_smoke.outputs.rows }}
+          CJS_OUTCOME: ${{ steps.cjs_smoke.outcome }}
+          CJS_ROWS: ${{ steps.cjs_smoke.outputs.rows }}
+          CLI_OUTCOME: ${{ steps.cli_version.outcome }}
+          CLI_ACTUAL: ${{ steps.cli_version.outputs.actual }}
+          CLI_RESULT: ${{ steps.cli_version.outputs.result }}
+        run: |
+          set -u
+          icon() {
+            case "$1" in
+              success) echo "✅" ;;
+              failure) echo "❌" ;;
+              skipped) echo "⏭️" ;;
+              *)       echo "❔" ;;
+            esac
+          }
+          {
+            echo "## Clean-room verification — \`${VERSION:-(unresolved)}\`"
+            echo ""
+            echo "| Gate | Status |"
+            echo "|---|---|"
+            echo "| Field audit | $(icon "${AUDIT_OUTCOME:-skipped}") \`${AUDIT_OUTCOME:-skipped}\` |"
+            echo "| ESM import smoke | $(icon "${ESM_OUTCOME:-skipped}") \`${ESM_OUTCOME:-skipped}\` |"
+            echo "| CJS import smoke | $(icon "${CJS_OUTCOME:-skipped}") \`${CJS_OUTCOME:-skipped}\` |"
+            echo "| \`cdr-cli --version\` | $(icon "${CLI_OUTCOME:-skipped}") \`${CLI_OUTCOME:-skipped}\` |"
+            echo ""
+
+            echo "### Field audit"
+            echo ""
+            if [ -n "${AUDIT_ROWS:-}" ]; then
+              echo "| Package | Field | Tier | Status |"
+              echo "|---|---|---|---|"
+              echo "${AUDIT_ROWS}"
+            else
+              echo "_(field audit did not run — install likely failed)_"
+            fi
+            echo ""
+
+            echo "### ESM import smoke"
+            echo ""
+            if [ -n "${ESM_ROWS:-}" ]; then
+              echo "| Package | Status | Output |"
+              echo "|---|---|---|"
+              echo "${ESM_ROWS}"
+            else
+              echo "_(ESM smoke did not run)_"
+            fi
+            echo ""
+
+            echo "### CJS import smoke"
+            echo ""
+            if [ -n "${CJS_ROWS:-}" ]; then
+              echo "| Package | Status | Output |"
+              echo "|---|---|---|"
+              echo "${CJS_ROWS}"
+            else
+              echo "_(CJS smoke did not run)_"
+            fi
+            echo ""
+
+            echo "### CLI version check"
+            echo ""
+            echo "| Expected | Got | Result |"
+            echo "|---|---|---|"
+            echo "| \`${VERSION:-?}\` | \`${CLI_ACTUAL:-(no output)}\` | $(icon "${CLI_OUTCOME:-skipped}") ${CLI_RESULT:-skipped} |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
