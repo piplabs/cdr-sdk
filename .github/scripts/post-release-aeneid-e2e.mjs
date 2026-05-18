@@ -59,21 +59,15 @@ const FUNDER_KEY = RAW_FUNDER_KEY.startsWith("0x")
   ? RAW_FUNDER_KEY
   : `0x${RAW_FUNDER_KEY}`;
 
-// Fund / reserve amounts mirror the closest existing precedent:
-// `ephemeral-100w-fresh-aeneid.test.ts:50` funds each per-wallet at 0.1 IP
-// (same workload shape — fresh upload+access per wallet on Aeneid).
-// Gas reserve mirrors `_ephemeral-wallets.ts:190` default.
+// 0.1 IP / 0.001 IP — match the precedent in
+// `ephemeral-100w-fresh-aeneid.test.ts` and `_ephemeral-wallets.ts`
+// (same workload shape, same gas reserve).
 const FUND_AMOUNT_WEI = 100_000_000_000_000_000n; // 0.1 IP
 const GAS_RESERVE_WEI = 1_000_000_000_000_000n; //   0.001 IP
 
-/**
- * `resilientHttp` equivalent — viem's default retryCount=3 / retryDelay=150
- * exhausts the retry budget in ~1s, which is too tight for public Aeneid
- * RPC throttling. 5 retries × 500ms exponential gives a ~31s envelope,
- * identical to packages/sdk/__integration__/_rpc-resilience.ts. The
- * helper isn't exported from the published tarball, so we inline its
- * single line of behavior here rather than reach into internals.
- */
+// Mirrors `resilientHttp` from `packages/sdk/__integration__/_rpc-resilience.ts`
+// — viem's default ~1s retry budget is too tight for Aeneid's public RPC.
+// The helper isn't in the published tarball so we inline the one line here.
 function resilientHttp() {
   return http(RPC_URL, { retryCount: 5, retryDelay: 500 });
 }
@@ -113,10 +107,8 @@ try {
   status.funder.address = funderAccount.address;
   console.log(`funder address: ${funderAccount.address}`);
 
-  // Fail fast with a useful message if the funder is out of IP. Without
-  // this, the fund tx would revert with a generic "insufficient funds"
-  // deep inside viem and the operator would have to chase down which
-  // wallet was empty.
+  // Fail fast with a useful message if the funder is empty — otherwise
+  // the operator chases down a generic "insufficient funds" deep in viem.
   const funderBalance = await funderPublic.getBalance({
     address: funderAccount.address,
   });
@@ -155,11 +147,9 @@ try {
     apiUrl: API_URL,
   });
 
-  // 10-byte returns-1 bytecode — same open-condition fixture used by
-  // packages/sdk/__integration__/_ephemeral-wallets and the examples
-  // suite. Always returns 1 for both read and write predicates, so the
-  // upload/access flow is gated only by the CDR contract logic itself,
-  // not by any external condition check.
+  // 10-byte returns-1 bytecode — open-condition fixture matching the
+  // examples / ephemeral-wallets suites. Always returns 1, so the
+  // upload/access flow is gated only by CDR contract logic itself.
   const openConditionBytecode =
     "0x600a600c600039600a6000f3600160005260206000f3";
   const deployTx = await subWallet.sendTransaction({
@@ -226,10 +216,9 @@ try {
   status.error = err && err.message ? err.message : String(err);
   console.error(`::error::${status.error}`);
 } finally {
-  // Refund pass — runs on success AND failure so we never bleed test
-  // IP into a dead ephemeral wallet. Wrapped in its own try/catch so a
-  // refund failure doesn't override the main outcome (we still want to
-  // know if upload+access succeeded even if the refund hit a 429 storm).
+  // Refund runs on both success and failure paths so we don't bleed test
+  // IP into a dead ephemeral wallet. Inner try/catch ensures a refund
+  // failure doesn't override the main outcome.
   if (subKey && status.funder.address) {
     try {
       const subAccount = privateKeyToAccount(subKey);

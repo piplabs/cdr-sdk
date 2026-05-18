@@ -3,22 +3,10 @@ name: Post-Release Integration
 # Smoke-tests the actually-published npm tarballs (NOT the workspace source
 # tree that integration.yml exercises). Catches consumer-only defects like
 # missing exports/engines fields, version-stamp drift, and partial / non-
-# lockstep releases. See issue #102 for the full motivation.
+# lockstep releases. See issue #102 for motivation.
 #
-# Triggers:
-#   - workflow_run: fires after every Release workflow completion. The
-#     job-level `if` further gates on (a) the upstream run succeeded and
-#     (b) the head commit carried the publish marker — mirroring the gate
-#     in release.yml — so non-publish main pushes don't spam empty runs.
-#   - workflow_dispatch: manual rerun. Optional `version` input overrides
-#     the registry-latest lookup; useful for re-verifying an older release
-#     or for testing this workflow from a feature branch before merge.
-#
-# Testing from a branch: once this file lands on a branch in origin,
-# Actions → "Post-Release Integration" → Run workflow → pick the branch.
-# Pushing the workflow file to origin/main is NOT a prerequisite for the
-# manual dispatch path; only the workflow_run path requires the file to
-# be on the default branch.
+# Triggers: workflow_run after every Release completion (gated to the
+# publish commit marker), or workflow_dispatch with optional version input.
 
 run-name: post-release-${{ inputs.version || github.event.workflow_run.head_sha || 'latest' }}
 
@@ -71,12 +59,9 @@ jobs:
             VERSION="$INPUT_VERSION"
             SOURCE="workflow_dispatch input"
           else
-            # npm view writes the version string to stdout and exits 0 on
-            # success, exits 1 with an E404 if the package is missing. We
-            # treat any non-zero exit or empty stdout as a hard failure —
-            # this is the canonical source of truth for "what was just
-            # released" and anything else means the registry is in a state
-            # we don't understand.
+            # Canonical source of truth — any non-zero exit or empty
+            # stdout below means the registry is in a state we don't
+            # understand and we fail closed.
             VERSION="$(npm view @piplabs/cdr-sdk version)"
             SOURCE="npm view @piplabs/cdr-sdk (latest)"
           fi
@@ -98,11 +83,9 @@ jobs:
           FAILED=()
           ROWS=()
           for pkg in "${PACKAGES[@]}"; do
-            # Require BOTH: `npm view <pkg>@<ver> version` exits 0 AND its
-            # stdout exactly equals the requested version. A registry mirror
-            # lag or cache quirk could in principle return a different
-            # version string under the same query — comparing the value
-            # belt-and-braces guards against that.
+            # Belt-and-braces: assert stdout equals the requested version,
+            # not just that npm view exited 0 — guards against a mirror
+            # quirk returning a different value under the same query.
             ACTUAL="$(npm view "${pkg}@${VERSION}" version 2>/dev/null || true)"
             if [ "$ACTUAL" = "$VERSION" ]; then
               ROWS+=("| \`${pkg}\` | \`${VERSION}\` | ✅ |")
@@ -124,10 +107,6 @@ jobs:
 
       - name: Write run summary
         if: always()
-        # GH_EVENT_NAME / GH_SHA are GH-controlled so they're safe inline,
-        # but threading them through env is the house style (see
-        # integration.yml:108) so a future copy-paste doesn't accidentally
-        # introduce an untrusted-input injection.
         env:
           GH_EVENT_NAME: ${{ github.event_name }}
           GH_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
@@ -169,20 +148,14 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   verify:
-    # Clean-room verification: install the actually-published tarballs into
-    # a temp dir OUTSIDE the workspace, then run the gates the workspace
-    # build can't catch — package.json field audit (#97/#98), CJS + ESM
-    # import smoke, and `cdr-cli --version` strict equality (#96).
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
-      # Pin Node 20 (LTS, matches integration.yml:144-147). Without this,
-      # the runner's default Node version drifts and changes the CJS-bridge
-      # behavior in the smoke step below — see the comment on the CJS smoke
-      # step for the full reasoning.
+      # Pin Node 20 LTS — the runner's default version drifts and changes
+      # the CJS-bridge behavior the smoke step below depends on.
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -191,17 +164,10 @@ jobs:
         id: install
         run: |
           set -euo pipefail
-          # mktemp outside $GITHUB_WORKSPACE so pnpm/npm workspace
-          # resolution can't influence anything — we want the same
-          # conditions a fresh consumer machine would see.
           INSTALL_DIR="$(mktemp -d -t cdr-release-XXXXXX)"
           echo "INSTALL_DIR=$INSTALL_DIR" >> "$GITHUB_ENV"
           cd "$INSTALL_DIR"
           npm init -y > /dev/null
-          # --no-package-lock: we don't care about reproducibility, we
-          # care about "what does `npm install @piplabs/...@$VERSION`
-          # give a consumer right now". Skipping the lockfile keeps the
-          # temp dir slim and removes a moving part.
           npm install --no-package-lock \
             "@piplabs/cdr-contracts@${VERSION}" \
             "@piplabs/cdr-crypto@${VERSION}" \
@@ -214,19 +180,12 @@ jobs:
         id: audit
         run: |
           set -uo pipefail
-          # Per-package required fields:
-          #   libraries (contracts/crypto/sdk): engines, exports, main, types
-          #   cli:                              engines, bin
-          # `module` is reported separately as informational — it's a
-          # legacy bundler convention that modern ESM packages with a
-          # proper `exports` map don't need, so we don't fail on it.
           FAILED=()
           ROWS=()
 
-          # Returns "OK" if the field is present and non-empty, else "FAIL".
-          # Empty objects (`{}`) and empty strings count as missing — they
-          # indicate the field was declared but left blank, which is the
-          # same consumer-visible state as omission.
+          # Empty objects and empty strings count as missing — the field
+          # was declared but left blank, consumer-visibly identical to
+          # omission.
           check_field() {
             local pkg="$1"
             local field="$2"
@@ -290,8 +249,6 @@ jobs:
         run: |
           set -uo pipefail
           cd "$INSTALL_DIR"
-          # Dynamic import lets one .mjs file smoke-test any package by
-          # name. Top-level await is fine on Node 20 (the runner default).
           cat > smoke.mjs <<'JSEOF'
           const pkgName = process.argv[2];
           try {
@@ -331,28 +288,19 @@ jobs:
 
       - name: 'Smoke: CJS imports'
         id: cjs_smoke
-        # Hard-fail per design — even though the v0.2.1 packages don't
-        # support require() yet (issue #97), the team's stated direction
-        # is to dual-publish CJS + ESM, so this gate must enforce that
-        # contract once shipped.
-        #
         # NODE_OPTIONS=--no-experimental-require-module disables Node's
         # implicit ESM-bridge for require(). Without it, Node 20.19+ and
-        # 22.12+ will silently bridge `require("@piplabs/cdr-sdk")` even
-        # when the package is ESM-only with no exports.require — defeating
-        # the gate. With the flag, require() returns the original
-        # ERR_REQUIRE_ESM if the package hasn't declared CJS support, so
-        # we catch the missing exports.require / .cjs main entry that
-        # consumers on Node <20.19 (still LTS-supported) actually need.
+        # 22.12+ silently bridge `require("@piplabs/cdr-sdk")` even when
+        # the package is ESM-only with no exports.require — defeating the
+        # gate. With the flag, require() returns the original
+        # ERR_REQUIRE_ESM, catching the missing CJS entry that consumers
+        # on Node <20.19 (still LTS-supported) actually hit.
         if: always() && steps.install.outcome == 'success'
         env:
           NODE_OPTIONS: --no-experimental-require-module
         run: |
           set -uo pipefail
           cd "$INSTALL_DIR"
-          # .cjs forces CommonJS regardless of the nearest package.json's
-          # `type` field — so this test exercises the require() resolution
-          # path even when the temp dir's package.json gets `type: module`.
           cat > smoke.cjs <<'JSEOF'
           const pkgName = process.argv[2];
           try {
@@ -396,15 +344,11 @@ jobs:
         run: |
           set -uo pipefail
           cd "$INSTALL_DIR"
-          # `npx --package=…@<ver>` pins the exact version so a stale
-          # globally-cached cdr-cli on the runner can't shadow what we
-          # just installed. The `cdr-cli` token after --package is the
-          # bin name; `--version` is passed through to the bin.
+          # `--package=…@<ver>` pins the exact version so a stale globally
+          # cached cdr-cli on the runner can't shadow what we just installed.
           ACTUAL_RAW=$(npx --package="@piplabs/cdr-cli@${VERSION}" cdr-cli --version 2>&1 || true)
-          # Strict equality per issue #102: stdout (trimmed) must equal
-          # the resolved version. The motivating bug (#96) shipped
-          # "0.1.2" against a 0.2.1 package — exact match is the only
-          # check that catches that class of drift.
+          # Strict equality catches the #96 class of drift (0.1.2 stamped
+          # into a 0.2.1 binary).
           TRIMMED=$(printf '%s' "$ACTUAL_RAW" | tr -d '[:space:]')
           echo "actual=${ACTUAL_RAW}" >> "$GITHUB_OUTPUT"
           echo "trimmed=${TRIMMED}" >> "$GITHUB_OUTPUT"
@@ -416,6 +360,18 @@ jobs:
             echo "::error::cdr-cli --version mismatch — expected '${VERSION}', got '${ACTUAL_RAW}'"
             exit 1
           fi
+
+      - name: Upload verify diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-release-verify-${{ github.run_id }}
+          path: |
+            ${{ env.INSTALL_DIR }}/node_modules/@piplabs/*/package.json
+            ${{ env.INSTALL_DIR }}/smoke.mjs
+            ${{ env.INSTALL_DIR }}/smoke.cjs
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Write verify summary
         if: always()
@@ -492,25 +448,15 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   e2e-aeneid:
-    # End-to-end gate against a live Aeneid validator set, using a fresh
-    # subwallet funded from the CI funder. The subwallet pattern avoids
-    # nonce collisions with the existing `ephemeral-100w-fresh-aeneid`
-    # suite (and any concurrent manual dispatches), both of which share
-    # the same CDR_AENEID_TEST_PRIVATE_KEY funder.
-    #
-    # Sequential after `verify` (not parallel): if the install / field
-    # audit / smoke gates already failed, the artifact is known-broken
-    # and we don't want to burn Aeneid test IP confirming the obvious.
+    # Sequential after `verify` (not parallel): if the install / audit /
+    # smoke gates already failed, the artifact is known-broken and we
+    # don't want to burn Aeneid test IP confirming the obvious.
     needs: [prepare, verify]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
-      # Aeneid endpoint constants — copied verbatim from
-      # integration.yml:160-161 (single source of truth would be nicer
-      # but GHA doesn't let workflows share top-level env across jobs
-      # via inheritance, and a reusable-workflow indirection isn't
-      # worth it for two URLs).
+      # Aeneid endpoint constants — copied from integration.yml.
       CDR_API_URL: http://172.192.41.96:1317
       CDR_RPC_URL: https://aeneid.storyrpc.io
       CDR_AENEID_TEST_PRIVATE_KEY: ${{ secrets.CDR_AENEID_TEST_PRIVATE_KEY }}
@@ -535,26 +481,30 @@ jobs:
           echo "INSTALL_DIR=$INSTALL_DIR" >> "$GITHUB_ENV"
           cd "$INSTALL_DIR"
           npm init -y > /dev/null
-          # Explicit viem alongside the SDK: viem is a peerDependency
-          # (packages/sdk/package.json line "peerDependencies.viem"),
-          # so we pin a known-compatible version rather than relying on
-          # npm's peer-auto-install heuristic to pick the right minor.
+          # viem is pinned explicitly — it's a peerDependency of cdr-sdk,
+          # so let-npm-pick can land on an unintended minor.
           npm install --no-package-lock \
             "@piplabs/cdr-sdk@${VERSION}" \
             "viem@^2.47"
           cp "$GITHUB_WORKSPACE/.github/scripts/post-release-aeneid-e2e.mjs" .
-          echo "Installed in: $INSTALL_DIR"
 
       - name: Run e2e — upload + access via subwallet
         id: e2e
-        # The script writes status.json on every code path (success +
-        # failure) before exiting. We let the script's exit code surface
-        # as the step outcome; the summary step (if: always()) reads
-        # status.json regardless and renders diagnostics.
         run: |
           set -uo pipefail
           cd "$INSTALL_DIR"
           node post-release-aeneid-e2e.mjs
+
+      - name: Upload e2e diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-release-e2e-${{ github.run_id }}
+          path: |
+            ${{ env.INSTALL_DIR }}/status.json
+            ${{ env.INSTALL_DIR }}/post-release-aeneid-e2e.mjs
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Write e2e summary
         if: always()
@@ -622,3 +572,70 @@ jobs:
               echo ""
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  summary:
+    # Appends a top-level pass/fail block at the bottom of the rendered
+    # run summary (multi-job workflows can't put it at the top — GHA
+    # orders per-job summaries by completion time).
+    needs: [prepare, verify, e2e-aeneid]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Write overall summary
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          E2E_RESULT: ${{ needs.e2e-aeneid.result }}
+        run: |
+          set -u
+          icon() {
+            case "$1" in
+              success)   echo "✅" ;;
+              failure)   echo "❌" ;;
+              cancelled) echo "🛑" ;;
+              skipped)   echo "⏭️" ;;
+              *)         echo "❔" ;;
+            esac
+          }
+          PASS=0; FAIL=0; SKIP=0
+          for r in "$PREPARE_RESULT" "$VERIFY_RESULT" "$E2E_RESULT"; do
+            case "$r" in
+              success)            PASS=$((PASS+1)) ;;
+              failure|cancelled)  FAIL=$((FAIL+1)) ;;
+              *)                  SKIP=$((SKIP+1)) ;;
+            esac
+          done
+          # Non-publish workflow_run triggers cause `prepare` to skip
+          # via its job-level if-guard; verify + e2e then skip via
+          # needs-chain. All three skipped = workflow legitimately
+          # bailed at the gate, not a failure.
+          if [ "$PREPARE_RESULT" = "skipped" ] && [ "$VERIFY_RESULT" = "skipped" ] && [ "$E2E_RESULT" = "skipped" ]; then
+            {
+              echo "## ⏭️ Workflow gated out — non-release trigger"
+              echo ""
+              echo "The \`prepare\` job's if-guard rejected this trigger (e.g. a main push without the \`chore: release packages\` marker). No gates ran. This is the expected outcome for non-publish commits."
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$FAIL" -gt 0 ]; then HEADLINE="❌"; else HEADLINE="✅"; fi
+          {
+            echo "---"
+            echo ""
+            echo "## ${HEADLINE} Overall — post-release verification — \`${VERSION:-(unresolved)}\`"
+            echo ""
+            echo "**${PASS} passed | ${FAIL} failed | ${SKIP} skipped** (3 gates total)"
+            echo ""
+            echo "| Gate | Result |"
+            echo "|---|---|"
+            echo "| Version + lockstep | $(icon "$PREPARE_RESULT") \`$PREPARE_RESULT\` |"
+            echo "| Clean-room install + audit + smoke | $(icon "$VERIFY_RESULT") \`$VERIFY_RESULT\` |"
+            echo "| End-to-end Aeneid | $(icon "$E2E_RESULT") \`$E2E_RESULT\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$FAIL" -gt 0 ]; then
+            echo "::error::post-release verification failed — ${FAIL} of 3 gates"
+            exit 1
+          fi

@@ -21,6 +21,11 @@ Two **independent** workflows trigger on every push to `main`. They are split so
 **`.github/workflows/test.yml` — unit tests** (runs on every PR + main push)
 - Independent of the release pipeline. Branch-protection-required for PR merges to `main`, so by the time a commit reaches `main` the unit tests are known to be green.
 
+**`.github/workflows/post-release-integration.yml` — published-artifact smoke** (runs after every successful `release.yml`; also `workflow_dispatch` for manual re-runs)
+- `workflow_run` trigger gated on the upstream's `chore: release packages` marker. Manual dispatch accepts an optional `version` input (empty = npm-latest).
+- Three sequential gates that exercise the **published tarballs**, not the workspace tree: `prepare` (version resolution + 4-package lockstep), `verify` (clean-room `npm install` + `package.json` field audit + ESM/CJS import smoke + `cdr-cli --version`), `e2e-aeneid` (`uploadCDR` + `accessCDR` on Aeneid via funded subwallet).
+- Failures upload diagnostic artifacts and write per-gate tables to the run summary. Recovery flow below.
+
 ### Why the split
 
 The previous design ran build/test/audit AND `changesets/action` in the same job, meaning a failing audit step short-circuited the bot — no Version Packages PR could be opened or updated until the audit-blocking CVE was hotfixed. With the split: audit only blocks the actual publish; the bot keeps maintaining the Version Packages PR regardless of audit / test state.
@@ -190,6 +195,7 @@ If the token expires before rotation, releases fail at the publish step with a 4
 | Wrong bump type committed (e.g. minor declared but should have been major) | Edit the `chore: release packages` PR before merging: bump `version` higher in `package.json`, edit CHANGELOG. The Changesets-generated content is editable. |
 | Reviewer accidentally approved a publish run that shouldn't have published | If npm publish hasn't completed yet, **Cancel workflow** in the Actions UI. If it has completed, fall back to unpublish/deprecate above. |
 | `npm publish` fails with `403 Forbidden` after token rotation | Granular token's package scope may not cover newly added packages. Either select the broader `@piplabs` scope when generating the token, or add the missing package explicitly. |
+| `post-release-integration` went red after a successful publish | Inspect the run summary's "Overall" table at the bottom and drill into the failing gate's section above. If transient (Aeneid RPC flake, npm registry mirror lag), re-run via Actions → "Post-Release Integration" → **Run workflow**. If reproducible, ship a fix-forward patch release that addresses the failing gate; don't advertise the broken version externally. |
 
 ## Verifying provenance
 
