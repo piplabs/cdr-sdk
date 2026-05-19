@@ -230,8 +230,17 @@ try {
       const balance = await subPublic.getBalance({
         address: subAccount.address,
       });
-      if (balance > GAS_RESERVE_WEI) {
-        const sweepAmount = balance - GAS_RESERVE_WEI;
+      // Compute the actual gas cost for the sweep tx; the static 0.001 IP
+      // reserve only covers up to ~47 gwei (1e15 / 21_000). Under Aeneid
+      // congestion above that breakpoint the sweep would fail and the
+      // funder would silently bleed the subwallet. 2x buffer absorbs
+      // base-fee fluctuation between quote and submit.
+      const gasPrice = await subPublic.getGasPrice();
+      const dynamicReserve = gasPrice * 21_000n * 2n;
+      const reserve =
+        dynamicReserve > GAS_RESERVE_WEI ? dynamicReserve : GAS_RESERVE_WEI;
+      if (balance > reserve) {
+        const sweepAmount = balance - reserve;
         const refundTx = await subWallet.sendTransaction({
           to: status.funder.address,
           value: sweepAmount,
@@ -247,7 +256,7 @@ try {
         );
       } else {
         console.log(
-          `refund:         skipped (balance ${formatEther(balance)} IP ≤ reserve ${formatEther(GAS_RESERVE_WEI)} IP)`,
+          `refund:         skipped (balance ${formatEther(balance)} IP ≤ reserve ${formatEther(reserve)} IP)`,
         );
       }
     } catch (err) {

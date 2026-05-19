@@ -462,7 +462,9 @@ jobs:
       # Aeneid endpoint constants — copied from integration.yml.
       CDR_API_URL: http://172.192.41.96:1317
       CDR_RPC_URL: https://aeneid.storyrpc.io
-      CDR_AENEID_TEST_PRIVATE_KEY: ${{ secrets.CDR_AENEID_TEST_PRIVATE_KEY }}
+      # CDR_AENEID_TEST_PRIVATE_KEY is scoped to the `Run e2e` step
+      # below so the raw secret isn't materialized in checkout /
+      # setup-node / install step environments.
     steps:
       # Pin checkout to the release revision so the harness file is
       # always the one that shipped with the tarball under test. 
@@ -474,8 +476,10 @@ jobs:
           node-version: '20'
 
       - name: Verify Aeneid secret populated
+        env:
+          SECRET_PRESENT: ${{ secrets.CDR_AENEID_TEST_PRIVATE_KEY != '' }}
         run: |
-          if [ -z "$CDR_AENEID_TEST_PRIVATE_KEY" ]; then
+          if [ "$SECRET_PRESENT" != "true" ]; then
             echo "::error::CDR_AENEID_TEST_PRIVATE_KEY is empty (missing repo secret)"
             exit 1
           fi
@@ -497,6 +501,8 @@ jobs:
 
       - name: Run e2e — upload + access via subwallet
         id: e2e
+        env:
+          CDR_AENEID_TEST_PRIVATE_KEY: ${{ secrets.CDR_AENEID_TEST_PRIVATE_KEY }}
         run: |
           set -uo pipefail
           cd "$INSTALL_DIR"
