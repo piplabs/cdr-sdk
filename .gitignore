@@ -1,6 +1,8 @@
 node_modules/
 dist/
 .turbo/
+.tshy/
+.tshy-build/
 *.tsbuildinfo
 .env*
 !.env.local.example

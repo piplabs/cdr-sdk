@@ -8,9 +8,11 @@
  *   const raw = wasm.tdh2Encrypt(globalPubKey, plaintext, label);
  */
 
-import createCbMpcModule from "./cb-mpc-tdh2.js";
+import { wasmBinaryUrl, wasmShimSpecifier } from "./wasm-paths.js";
 import { WASM_MANIFEST } from "./manifest.js";
 import { WasmIntegrityError } from "../errors.js";
+
+type CreateCbMpcModule = (moduleArg?: Record<string, unknown>) => Promise<unknown>;
 
 /** Opaque WASM module instance */
 interface EmscriptenModule {
@@ -284,10 +286,14 @@ export class CbMpcWasm {
   }
 }
 
-let wasmInstance: CbMpcWasm | null = null;
+// Hoist the singleton to globalThis so the ESM and CommonJS dist trees share
+// one WASM instance. Without this, a consumer that mixes `import` and `require`
+// would load two copies of the module and only one would have `wasmInstance` set.
+const wasmInstanceKey: unique symbol = Symbol.for("@piplabs/cdr-crypto:wasmInstance") as never;
+type WasmInstanceHolder = { [wasmInstanceKey]?: CbMpcWasm | null };
+const holder = globalThis as unknown as WasmInstanceHolder;
 
 async function verifyWasmHash(): Promise<void> {
-  const wasmUrl = new URL("cb-mpc-tdh2.wasm", import.meta.url);
   let wasmBytes: ArrayBuffer;
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -298,10 +304,10 @@ async function verifyWasmHash(): Promise<void> {
     const nodeUrl = "node:url";
     const fs: any = await import(nodeFs);
     const url: any = await import(nodeUrl);
-    const buf = fs.readFileSync(url.fileURLToPath(wasmUrl));
+    const buf = fs.readFileSync(url.fileURLToPath(wasmBinaryUrl));
     wasmBytes = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
   } else {
-    const response = await fetch(wasmUrl.href);
+    const response = await fetch(wasmBinaryUrl.href);
     wasmBytes = await response.arrayBuffer();
   }
 
@@ -322,7 +328,7 @@ async function verifyWasmHash(): Promise<void> {
  * @param options.skipHashCheck - If true, skip SHA-256 verification of the WASM binary (default: false)
  */
 export async function initWasm(options?: { skipHashCheck?: boolean }): Promise<void> {
-  if (wasmInstance) return;
+  if (holder[wasmInstanceKey]) return;
 
   if (options?.skipHashCheck) {
     console.warn("[cdr-crypto] WASM hash verification skipped. Do NOT use skipHashCheck in production.");
@@ -330,6 +336,11 @@ export async function initWasm(options?: { skipHashCheck?: boolean }): Promise<v
     await verifyWasmHash();
   }
 
+  // Dynamic import: the Emscripten shim is ESM (uses `import.meta.url` + top-level
+  // `await`) so it cannot be `require()`-ed from the CJS build. Dynamic `import()`
+  // is universal — it works inside both ESM and CJS module scopes.
+  const shim = (await import(wasmShimSpecifier)) as { default: CreateCbMpcModule };
+  const createCbMpcModule = shim.default;
   const Module = await createCbMpcModule() as unknown as EmscriptenModule;
 
   const ptrSize = Module._wasm_ptr_size();
@@ -351,26 +362,26 @@ export async function initWasm(options?: { skipHashCheck?: boolean }): Promise<v
     console.warn("WASM module does not export _wasm_seed_random — OpenSSL RNG is unseeded");
   }
 
-  wasmInstance = new CbMpcWasm(Module);
+  holder[wasmInstanceKey] = new CbMpcWasm(Module);
 }
 
 /**
  * Return the initialized WASM instance, or null if initWasm() has not been called.
  */
 export function getWasm(): CbMpcWasm | null {
-  return wasmInstance;
+  return holder[wasmInstanceKey] ?? null;
 }
 
 /**
  * Reset the WASM instance. Primarily for use in tests.
  */
 export function resetWasm(): void {
-  wasmInstance = null;
+  holder[wasmInstanceKey] = null;
 }
 
 /**
  * Inject a pre-built CbMpcWasm instance. For use in tests only.
  */
 export function setWasmForTesting(instance: CbMpcWasm): void {
-  wasmInstance = instance;
+  holder[wasmInstanceKey] = instance;
 }

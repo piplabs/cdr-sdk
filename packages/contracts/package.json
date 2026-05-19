@@ -6,8 +6,6 @@
   "engines": {
     "node": ">=20.19.0"
   },
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
   "publishConfig": {
     "access": "public"
   },
@@ -17,14 +15,21 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc",
-    "clean": "rm -rf dist",
+    "build": "tshy",
+    "clean": "rm -rf dist .tshy-build",
     "lint": "tsc --noEmit"
+  },
+  "tshy": {
+    "exports": {
+      "./package.json": "./package.json",
+      ".": "./src/index.ts"
+    }
   },
   "peerDependencies": {
     "viem": "^2.21"
   },
   "devDependencies": {
+    "tshy": "^4.1.2",
     "typescript": "^5.5",
     "viem": "^2.47.6"
   },
@@ -32,5 +37,21 @@
     "type": "git",
     "url": "https://github.com/piplabs/cdr-sdk.git",
     "directory": "packages/contracts"
-  }
+  },
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/commonjs/index.d.ts",
+        "default": "./dist/commonjs/index.js"
+      }
+    }
+  },
+  "main": "./dist/commonjs/index.js",
+  "types": "./dist/commonjs/index.d.ts",
+  "module": "./dist/esm/index.js"
 }
