@@ -58,7 +58,9 @@ function mockClients() {
   const publicClient = {
     readContract: vi.fn(),
     waitForTransactionReceipt: vi.fn(),
-    simulateContract: vi.fn().mockRejectedValue({ cause: { name: "ContractFunctionRevertedError" } }),
+    // Default: simulateContract succeeds, modelling a valid condition
+    // contract whose checkRead/Write function returned a bool.
+    simulateContract: vi.fn().mockResolvedValue({ result: true, request: {} }),
   } as any;
   const walletClient = {
     writeContract: vi.fn(),
