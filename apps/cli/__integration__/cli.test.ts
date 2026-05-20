@@ -13,7 +13,7 @@
  * Cost model: 1 open-condition deploy in beforeAll + 1 uploadCDR + 1
  * accessCDR end-to-end → ~0.06 IP per run on DevNet.
  *
- * Test harness: `tsc → dist/index.js`, then each case spawns the binary
+ * Test harness: `tshy → dist/esm/index.js`, then each case spawns the binary
  * via `execaNode` with an explicitly controlled env (no inheritance) to
  * isolate flag-vs-env precedence behavior.
  */
@@ -51,7 +51,8 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CLI_PATH = path.resolve(__dirname, "../dist/index.js");
+// Matches `bin.cdr-cli` in package.json — the same entry consumers invoke.
+const CLI_PATH = path.resolve(__dirname, "../dist/esm/index.js");
 
 const API_URL = process.env.CDR_API_URL;
 const RPC_URL = process.env.CDR_RPC_URL;

@@ -286,12 +286,18 @@ export class CbMpcWasm {
   }
 }
 
-// Hoist the singleton to globalThis so the ESM and CommonJS dist trees share
-// one WASM instance. Without this, a consumer that mixes `import` and `require`
-// would load two copies of the module and only one would have `wasmInstance` set.
-const wasmInstanceKey: unique symbol = Symbol.for("@piplabs/cdr-crypto:wasmInstance") as never;
-type WasmInstanceHolder = { [wasmInstanceKey]?: CbMpcWasm | null };
-const holder = globalThis as unknown as WasmInstanceHolder;
+// Hoist BOTH the singleton instance and the in-flight init promise to globalThis.
+// - The instance hoist mitigates the dual-package hazard: a consumer that mixes
+//   `import` and `require` loads the package twice, and Symbol.for keys are
+//   process-global so both module copies converge on one CbMpcWasm.
+// - The promise hoist closes a race: initWasm() has three awaits between its
+//   early-return guard and the final assignment. Concurrent callers (within
+//   one dialect or across both) would all pass the guard before any of them
+//   reached the assignment, duplicating the WASM load. With this slot,
+//   concurrent callers await the same in-flight promise.
+const WASM_INSTANCE_KEY = Symbol.for("@piplabs/cdr-crypto:wasmInstance");
+const WASM_INIT_PROMISE_KEY = Symbol.for("@piplabs/cdr-crypto:wasmInitPromise");
+const holder = globalThis as unknown as Record<symbol, unknown>;
 
 async function verifyWasmHash(): Promise<void> {
   let wasmBytes: ArrayBuffer;
@@ -328,60 +334,75 @@ async function verifyWasmHash(): Promise<void> {
  * @param options.skipHashCheck - If true, skip SHA-256 verification of the WASM binary (default: false)
  */
 export async function initWasm(options?: { skipHashCheck?: boolean }): Promise<void> {
-  if (holder[wasmInstanceKey]) return;
+  if (holder[WASM_INSTANCE_KEY]) return;
+  const inFlight = holder[WASM_INIT_PROMISE_KEY] as Promise<void> | undefined;
+  if (inFlight) return inFlight;
 
-  if (options?.skipHashCheck) {
-    console.warn("[cdr-crypto] WASM hash verification skipped. Do NOT use skipHashCheck in production.");
-  } else {
-    await verifyWasmHash();
-  }
-
-  // Dynamic import: the Emscripten shim is ESM (uses `import.meta.url` + top-level
-  // `await`) so it cannot be `require()`-ed from the CJS build. Dynamic `import()`
-  // is universal — it works inside both ESM and CJS module scopes.
-  const shim = (await import(wasmShimSpecifier)) as { default: CreateCbMpcModule };
-  const createCbMpcModule = shim.default;
-  const Module = await createCbMpcModule() as unknown as EmscriptenModule;
-
-  const ptrSize = Module._wasm_ptr_size();
-  if (ptrSize !== 4) {
-    console.warn(`Unexpected WASM pointer size: ${ptrSize} (expected 4)`);
-  }
-
-  // Seed OpenSSL's RNG — WASM has no OS entropy source
-  if (typeof Module._wasm_seed_random === "function") {
-    const entropy = globalThis.crypto.getRandomValues(new Uint8Array(64));
-    const seedPtr = Module._malloc(entropy.length);
-    try {
-      Module.HEAPU8.set(entropy, seedPtr);
-      Module._wasm_seed_random(seedPtr, entropy.length);
-    } finally {
-      Module._free(seedPtr);
+  const promise = (async () => {
+    if (options?.skipHashCheck) {
+      console.warn("[cdr-crypto] WASM hash verification skipped. Do NOT use skipHashCheck in production.");
+    } else {
+      await verifyWasmHash();
     }
-  } else {
-    console.warn("WASM module does not export _wasm_seed_random — OpenSSL RNG is unseeded");
-  }
 
-  holder[wasmInstanceKey] = new CbMpcWasm(Module);
+    // Dynamic import: the Emscripten shim is ESM (uses `import.meta.url` + top-level
+    // `await`) so it cannot be `require()`-ed from the CJS build. Dynamic `import()`
+    // is universal — it works inside both ESM and CJS module scopes.
+    const shim = (await import(wasmShimSpecifier)) as { default: CreateCbMpcModule };
+    const createCbMpcModule = shim.default;
+    const Module = await createCbMpcModule() as unknown as EmscriptenModule;
+
+    const ptrSize = Module._wasm_ptr_size();
+    if (ptrSize !== 4) {
+      console.warn(`Unexpected WASM pointer size: ${ptrSize} (expected 4)`);
+    }
+
+    // Seed OpenSSL's RNG — WASM has no OS entropy source
+    if (typeof Module._wasm_seed_random === "function") {
+      const entropy = globalThis.crypto.getRandomValues(new Uint8Array(64));
+      const seedPtr = Module._malloc(entropy.length);
+      try {
+        Module.HEAPU8.set(entropy, seedPtr);
+        Module._wasm_seed_random(seedPtr, entropy.length);
+      } finally {
+        Module._free(seedPtr);
+      }
+    } else {
+      console.warn("WASM module does not export _wasm_seed_random — OpenSSL RNG is unseeded");
+    }
+
+    holder[WASM_INSTANCE_KEY] = new CbMpcWasm(Module);
+  })();
+
+  holder[WASM_INIT_PROMISE_KEY] = promise;
+  try {
+    await promise;
+  } finally {
+    // Clear the in-flight slot whether the init succeeded or threw — on success
+    // the instance slot has the result; on failure the next caller should retry.
+    holder[WASM_INIT_PROMISE_KEY] = undefined;
+  }
 }
 
 /**
  * Return the initialized WASM instance, or null if initWasm() has not been called.
  */
 export function getWasm(): CbMpcWasm | null {
-  return holder[wasmInstanceKey] ?? null;
+  return (holder[WASM_INSTANCE_KEY] as CbMpcWasm | null | undefined) ?? null;
 }
 
 /**
- * Reset the WASM instance. Primarily for use in tests.
+ * Reset the WASM instance. Primarily for use in tests. Also clears any
+ * in-flight init promise so a subsequent initWasm() truly starts fresh.
  */
 export function resetWasm(): void {
-  holder[wasmInstanceKey] = null;
+  holder[WASM_INSTANCE_KEY] = null;
+  holder[WASM_INIT_PROMISE_KEY] = undefined;
 }
 
 /**
  * Inject a pre-built CbMpcWasm instance. For use in tests only.
  */
 export function setWasmForTesting(instance: CbMpcWasm): void {
-  holder[wasmInstanceKey] = instance;
+  holder[WASM_INSTANCE_KEY] = instance;
 }
