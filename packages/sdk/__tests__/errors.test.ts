@@ -42,6 +42,13 @@ describe("errors", () => {
       expect(err.message).toContain("5");
       expect(err).toBeInstanceOf(CDRError);
     });
+
+    it("exposes collected, needed, and timeoutMs as public fields", () => {
+      const err = new PartialCollectionTimeoutError(3, 5, 30000);
+      expect(err.collected).toBe(3);
+      expect(err.needed).toBe(5);
+      expect(err.timeoutMs).toBe(30000);
+    });
   });
 
   describe("ContractRevertError", () => {

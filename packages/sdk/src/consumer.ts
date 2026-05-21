@@ -290,8 +290,14 @@ export class Consumer {
     const reported = new Set<string>();
     /** Last-known submission count (within the matching bucket), for the timeout error. */
     let lastSeen = 0;
-    /** Last-known round threshold, for the timeout error. */
-    let lastNeeded = 0;
+    /**
+     * Last-known round threshold, for the timeout error. Seeded from the
+     * active-round threshold so a complete no-show timeout still surfaces a
+     * meaningful `needed` value (e.g. `got 0/3`) rather than `got 0/0`.
+     * Overridden by `getThresholdAt(group.round)` once a matching bucket
+     * appears.
+     */
+    let lastNeeded = await this.observer.getThreshold().catch(() => 0);
 
     while (Date.now() < deadline) {
       let groups: Awaited<ReturnType<typeof queryCDRPartials>> = [];

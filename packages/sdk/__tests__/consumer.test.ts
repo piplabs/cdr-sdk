@@ -500,21 +500,52 @@ describe("Consumer", () => {
     });
 
     it("times out when threshold never reached", async () => {
-      const { consumer } = makeConsumer(makeFakeObserver({ threshold: 5 }));
+      const { consumer } = makeConsumer(
+        makeFakeObserver({ threshold: 5, thresholdAt: 5 }),
+      );
       vi.mocked(queryCDRPartials).mockResolvedValue([
         makeGroup({
           submissions: [makeSubmission({ validator: VALIDATOR_A, pid: 1 })],
           thresholdMet: false,
         }),
       ]);
-      await expect(
-        consumer.collectPartials({
+      try {
+        await consumer.collectPartials({
           uuid: 1,
           requesterPubKey: "0x04" as `0x${string}`,
           timeoutMs: 50,
           pollIntervalMs: 5,
-        }),
-      ).rejects.toThrow(PartialCollectionTimeoutError);
+        });
+        expect.fail("expected PartialCollectionTimeoutError");
+      } catch (err) {
+        expect(err).toBeInstanceOf(PartialCollectionTimeoutError);
+        const e = err as PartialCollectionTimeoutError;
+        expect(e.collected).toBe(1);
+        expect(e.needed).toBe(5);
+        expect(e.timeoutMs).toBe(50);
+        expect(e.code).toBe("PARTIAL_COLLECTION_TIMEOUT");
+      }
+    });
+
+    it("timeout fields reflect active-round threshold when no matching bucket ever appears", async () => {
+      const { consumer } = makeConsumer(makeFakeObserver({ threshold: 3 }));
+      // No groups returned across all polls — bucket-aware getThresholdAt
+      // never runs; `needed` should come from the seeded getThreshold().
+      vi.mocked(queryCDRPartials).mockResolvedValue([]);
+      try {
+        await consumer.collectPartials({
+          uuid: 1,
+          requesterPubKey: "0x04" as `0x${string}`,
+          timeoutMs: 30,
+          pollIntervalMs: 5,
+        });
+        expect.fail("expected PartialCollectionTimeoutError");
+      } catch (err) {
+        const e = err as PartialCollectionTimeoutError;
+        expect(e.collected).toBe(0);
+        expect(e.needed).toBe(3);
+        expect(e.timeoutMs).toBe(30);
+      }
     });
 
     it("treats empty groups as 'wait, may arrive later'", async () => {
@@ -808,9 +839,8 @@ describe("Consumer", () => {
 
     it("uses provided globalPubKey: skips observer.getGlobalPubKey", async () => {
       // observer.getThresholdAt is called once from collectPartials (it
-      // derives the bucket-round threshold). observer.getThreshold (the
-      // active-round variant) must NOT be called from collectPartials —
-      // those are now distinct methods.
+      // derives the bucket-round threshold). observer.getThreshold is
+      // called once at loop start to seed `needed` on the timeout error.
       vi.mocked(generateEphemeralKeyPair).mockReturnValue({
         privateKey: new Uint8Array(32).fill(1),
         publicKey: new Uint8Array(65).fill(2),
@@ -838,7 +868,7 @@ describe("Consumer", () => {
       expect(observer.getGlobalPubKey).not.toHaveBeenCalled();
       expect(observer.getThresholdAt).toHaveBeenCalledTimes(1);
       expect(observer.getThresholdAt).toHaveBeenCalledWith(4);
-      expect(observer.getThreshold).not.toHaveBeenCalled();
+      expect(observer.getThreshold).toHaveBeenCalledTimes(1);
     });
 
     it("throws EmptyVaultError BEFORE submitting any tx — no fee paid for empty vault (#78)", async () => {
@@ -1155,8 +1185,9 @@ describe("Consumer", () => {
 
       expect(result).toHaveLength(2);
       expect(observer.getThresholdAt).toHaveBeenCalledWith(10);
-      // getThreshold (active-round) must not be called from collectPartials.
-      expect(observer.getThreshold).not.toHaveBeenCalled();
+      // getThresholdAt drives the bucket-aware threshold; getThreshold is
+      // only called once to seed `needed` on the timeout error.
+      expect(observer.getThresholdAt).toHaveBeenCalledTimes(1);
     });
 
     it("throws EmptyVaultError when vault has no encryptedData", async () => {

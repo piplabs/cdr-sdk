@@ -14,11 +14,17 @@ export class WalletClientRequiredError extends CDRError {
 }
 
 export class PartialCollectionTimeoutError extends CDRError {
+  collected: number;
+  needed: number;
+  timeoutMs: number;
   constructor(collected: number, needed: number, timeoutMs: number) {
     super(
       `Timed out collecting partials after ${timeoutMs}ms: got ${collected}/${needed}`,
       "PARTIAL_COLLECTION_TIMEOUT",
     );
+    this.collected = collected;
+    this.needed = needed;
+    this.timeoutMs = timeoutMs;
   }
 }
 
