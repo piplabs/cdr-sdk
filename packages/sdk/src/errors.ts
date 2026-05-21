@@ -101,3 +101,18 @@ export class EmptyVaultError extends CDRError {
     this.uuid = uuid;
   }
 }
+
+export class ReadTransactionRevertedError extends CDRError {
+  txHash: `0x${string}`;
+  reason?: string;
+  constructor(txHash: `0x${string}`, reason?: string) {
+    super(
+      reason
+        ? `Read transaction ${txHash} reverted: ${reason}`
+        : `Read transaction ${txHash} reverted`,
+      "READ_TX_REVERTED",
+    );
+    this.txHash = txHash;
+    this.reason = reason;
+  }
+}

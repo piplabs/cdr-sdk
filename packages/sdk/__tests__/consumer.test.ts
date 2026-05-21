@@ -38,6 +38,7 @@ import {
   PartialCollectionTimeoutError,
   InvalidParamsError,
   EmptyVaultError,
+  ReadTransactionRevertedError,
 } from "../src/errors.js";
 import { toHex } from "viem";
 import type { Observer } from "../src/observer.js";
@@ -144,6 +145,8 @@ function mockClients(opts: { vaultEncryptedData?: `0x${string}` } = {}) {
   const publicClient = {
     readContract,
     getBlockNumber: vi.fn().mockResolvedValue(1000n),
+    waitForTransactionReceipt: vi.fn().mockResolvedValue({ status: "success" }),
+    simulateContract: vi.fn().mockResolvedValue({ result: undefined }),
   };
   const walletClient = {
     writeContract: vi.fn().mockResolvedValue("0xtxhash" as `0x${string}`),
@@ -223,6 +226,161 @@ describe("Consumer", () => {
       expect(walletClient.writeContract).toHaveBeenCalledWith(
         expect.objectContaining({ value: 99n }),
       );
+    });
+
+    it("read awaits the tx receipt with the submitted tx hash", async () => {
+      const { consumer, publicClient } = makeConsumer();
+      await consumer.read({
+        uuid: 42,
+        accessAuxData: "0x",
+        requesterPubKey: "0x04" as `0x${string}`,
+        feeOverride: 1n,
+      });
+      expect(publicClient.waitForTransactionReceipt).toHaveBeenCalledWith({
+        hash: "0xtxhash",
+      });
+    });
+
+    it("read returns txHash when receipt status is success", async () => {
+      const { consumer, publicClient } = makeConsumer();
+      publicClient.waitForTransactionReceipt.mockResolvedValueOnce({ status: "success" });
+      const result = await consumer.read({
+        uuid: 42,
+        accessAuxData: "0x",
+        requesterPubKey: "0x04" as `0x${string}`,
+        feeOverride: 1n,
+      });
+      expect(result.txHash).toBe("0xtxhash");
+    });
+
+    it("read throws ReadTransactionRevertedError with txHash when receipt status is reverted", async () => {
+      const { consumer, publicClient } = makeConsumer();
+      publicClient.waitForTransactionReceipt.mockResolvedValueOnce({ status: "reverted" });
+      try {
+        await consumer.read({
+          uuid: 42,
+          accessAuxData: "0x",
+          requesterPubKey: "0x04" as `0x${string}`,
+          feeOverride: 1n,
+        });
+        expect.fail("expected ReadTransactionRevertedError");
+      } catch (err) {
+        expect(err).toBeInstanceOf(ReadTransactionRevertedError);
+        expect((err as ReadTransactionRevertedError).txHash).toBe("0xtxhash");
+        expect((err as ReadTransactionRevertedError).code).toBe("READ_TX_REVERTED");
+      }
+    });
+
+    it("read populates reason from viem revert error when simulate fails", async () => {
+      const { consumer, publicClient } = makeConsumer();
+      publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
+        status: "reverted",
+        blockNumber: 123n,
+      });
+      const simulateErr: any = new Error("execution reverted");
+      simulateErr.shortMessage = "execution reverted";
+      simulateErr.cause = { reason: "Invalid fee amount" };
+      publicClient.simulateContract.mockRejectedValueOnce(simulateErr);
+
+      try {
+        await consumer.read({
+          uuid: 42,
+          accessAuxData: "0x",
+          requesterPubKey: "0x04" as `0x${string}`,
+          feeOverride: 1n,
+        });
+        expect.fail("expected ReadTransactionRevertedError");
+      } catch (err) {
+        expect(err).toBeInstanceOf(ReadTransactionRevertedError);
+        expect((err as ReadTransactionRevertedError).reason).toBe("Invalid fee amount");
+        expect((err as ReadTransactionRevertedError).message).toContain("Invalid fee amount");
+      }
+      expect(publicClient.simulateContract).toHaveBeenCalledWith(
+        expect.objectContaining({
+          functionName: "read",
+          args: [42, "0x", "0x04"],
+          value: 1n,
+          blockNumber: 123n,
+        }),
+      );
+    });
+
+    it("read still throws ReadTransactionRevertedError when reason decoding fails", async () => {
+      const { consumer, publicClient } = makeConsumer();
+      publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
+        status: "reverted",
+        blockNumber: 123n,
+      });
+      // Opaque error from simulate — no recognizable viem fields.
+      publicClient.simulateContract.mockRejectedValueOnce(new Error("network is hard"));
+
+      try {
+        await consumer.read({
+          uuid: 42,
+          accessAuxData: "0x",
+          requesterPubKey: "0x04" as `0x${string}`,
+          feeOverride: 1n,
+        });
+        expect.fail("expected ReadTransactionRevertedError");
+      } catch (err) {
+        expect(err).toBeInstanceOf(ReadTransactionRevertedError);
+        expect((err as ReadTransactionRevertedError).reason).toBeUndefined();
+      }
+    });
+
+    it("read ignores shortMessage from non-contract errors (transport/RPC)", async () => {
+      const { consumer, publicClient } = makeConsumer();
+      publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
+        status: "reverted",
+        blockNumber: 123n,
+      });
+      // Simulate throws a transport-shaped error — has shortMessage/details
+      // but is NOT a ContractFunction(Execution|Reverted)Error. The decoder
+      // must not surface "HTTP request failed" as a contract revert reason.
+      const transportErr: any = new Error("transport");
+      transportErr.name = "HttpRequestError";
+      transportErr.shortMessage = "HTTP request failed";
+      transportErr.details = "fetch failed: ECONNREFUSED";
+      publicClient.simulateContract.mockRejectedValueOnce(transportErr);
+
+      try {
+        await consumer.read({
+          uuid: 42,
+          accessAuxData: "0x",
+          requesterPubKey: "0x04" as `0x${string}`,
+          feeOverride: 1n,
+        });
+        expect.fail("expected ReadTransactionRevertedError");
+      } catch (err) {
+        expect(err).toBeInstanceOf(ReadTransactionRevertedError);
+        expect((err as ReadTransactionRevertedError).reason).toBeUndefined();
+      }
+    });
+
+    it("read uses top-level shortMessage when chain contains a contract error but no decoded fields", async () => {
+      const { consumer, publicClient } = makeConsumer();
+      publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
+        status: "reverted",
+        blockNumber: 123n,
+      });
+      const cfeErr: any = new Error("execution reverted");
+      cfeErr.name = "ContractFunctionExecutionError";
+      cfeErr.shortMessage = "The contract function \"read\" reverted.";
+      publicClient.simulateContract.mockRejectedValueOnce(cfeErr);
+
+      try {
+        await consumer.read({
+          uuid: 42,
+          accessAuxData: "0x",
+          requesterPubKey: "0x04" as `0x${string}`,
+          feeOverride: 1n,
+        });
+        expect.fail("expected ReadTransactionRevertedError");
+      } catch (err) {
+        expect((err as ReadTransactionRevertedError).reason).toBe(
+          "The contract function \"read\" reverted.",
+        );
+      }
     });
   });
 
@@ -775,6 +933,23 @@ describe("Consumer", () => {
       // reads would mean accessCDR + collectPartials each loaded the
       // vault separately, and the filter would pin C2 instead of C1.
       expect(vaultReadCount).toBe(1);
+    });
+
+    it("does not enter collectPartials when read tx reverts", async () => {
+      const { consumer, publicClient } = makeConsumer(
+        makeFakeObserver({ globalPubKey: new Uint8Array(34).fill(0xaa) }),
+      );
+      vi.mocked(generateEphemeralKeyPair).mockReturnValue({
+        privateKey: new Uint8Array(32).fill(1),
+        publicKey: new Uint8Array(65).fill(2),
+      });
+      publicClient.waitForTransactionReceipt.mockResolvedValueOnce({ status: "reverted" });
+
+      await expect(
+        consumer.accessCDR({ uuid: 42, accessAuxData: "0x", timeoutMs: 1000 }),
+      ).rejects.toBeInstanceOf(ReadTransactionRevertedError);
+
+      expect(queryCDRPartials).not.toHaveBeenCalled();
     });
   });
 

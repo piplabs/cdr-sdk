@@ -13,6 +13,7 @@ import {
   InvalidParamsError,
   CidIntegrityError,
   EmptyVaultError,
+  ReadTransactionRevertedError,
 } from "./errors.js";
 import type { PartialDecryptionEvent } from "./types.js";
 import { uuidToLabel } from "./label.js";
@@ -146,7 +147,43 @@ export class Consumer {
       value: fee,
     });
 
+    const receipt = await this.publicClient.waitForTransactionReceipt({ hash: txHash });
+
+    if (receipt.status === "reverted") {
+      const reason = await this.decodeReadRevertReason({
+        uuid: params.uuid,
+        accessAuxData: params.accessAuxData,
+        requesterPubKey: params.requesterPubKey,
+        fee,
+        blockNumber: receipt.blockNumber,
+      });
+      throw new ReadTransactionRevertedError(txHash, reason);
+    }
+
     return { txHash };
+  }
+
+  private async decodeReadRevertReason(params: {
+    uuid: number;
+    accessAuxData: `0x${string}`;
+    requesterPubKey: `0x${string}`;
+    fee: bigint;
+    blockNumber?: bigint;
+  }): Promise<string | undefined> {
+    try {
+      await this.publicClient.simulateContract({
+        account: this.walletClient.account ?? undefined,
+        address: contractAddresses[this.network].cdr,
+        abi: cdrAbi,
+        functionName: "read",
+        args: [params.uuid, params.accessAuxData, params.requesterPubKey],
+        value: params.fee,
+        blockNumber: params.blockNumber,
+      });
+    } catch (err) {
+      return extractViemRevertReason(err);
+    }
+    return undefined;
   }
 
   /**
@@ -622,4 +659,56 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Best-effort revert-reason extractor for viem errors. Walks the `cause`
+ * chain looking for stable fields — `reason` (Solidity `revert("msg")`),
+ * decoded custom error name, or signature. Falls back to top-level
+ * `shortMessage` / `details` ONLY when the chain contains a
+ * `ContractFunctionExecutionError` / `ContractFunctionRevertedError` —
+ * otherwise transport/RPC errors (e.g. `HttpRequestError`) would surface
+ * misleading reasons like "HTTP request failed". Returns undefined for
+ * unrecognized shapes.
+ */
+function extractViemRevertReason(err: unknown): string | undefined {
+  if (!err || typeof err !== "object") return undefined;
+
+  let current: any = err;
+  let sawContractError = false;
+  for (let i = 0; i < 5 && current; i++) {
+    if (
+      current.name === "ContractFunctionExecutionError" ||
+      current.name === "ContractFunctionRevertedError"
+    ) {
+      sawContractError = true;
+    }
+    if (typeof current.reason === "string" && current.reason.length > 0) {
+      return current.reason;
+    }
+    const decoded = current.data;
+    if (
+      decoded &&
+      typeof decoded === "object" &&
+      typeof decoded.errorName === "string" &&
+      decoded.errorName.length > 0
+    ) {
+      return decoded.errorName;
+    }
+    if (typeof current.signature === "string" && current.signature.length > 0) {
+      return current.signature;
+    }
+    current = current.cause;
+  }
+
+  if (!sawContractError) return undefined;
+
+  const top: any = err;
+  if (typeof top.shortMessage === "string" && top.shortMessage.length > 0) {
+    return top.shortMessage;
+  }
+  if (typeof top.details === "string" && top.details.length > 0) {
+    return top.details;
+  }
+  return undefined;
 }
