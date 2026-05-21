@@ -621,20 +621,43 @@ describe("Consumer", () => {
       ]);
 
       const onInvalidPartial = vi.fn();
-      await expect(
-        consumer.collectPartials({
+      let timeoutErr: PartialCollectionTimeoutError | undefined;
+      try {
+        await consumer.collectPartials({
           uuid: 1,
           requesterPubKey: "0x04" as `0x${string}`,
           timeoutMs: 50,
           pollIntervalMs: 5,
           attestationConfig: { minSecurityVersion: 1 },
           onInvalidPartial,
-        }),
-      ).rejects.toThrow(PartialCollectionTimeoutError);
+        });
+        expect.fail("expected PartialCollectionTimeoutError");
+      } catch (err) {
+        expect(err).toBeInstanceOf(PartialCollectionTimeoutError);
+        timeoutErr = err as PartialCollectionTimeoutError;
+      }
+
+      // `collected` reflects the trusted/accepted count (1: only A), NOT
+      // the raw bucket size (3). Critical when the typed field is consumed
+      // for telemetry / UX.
+      expect(timeoutErr!.collected).toBe(1);
+      expect(timeoutErr!.needed).toBe(2);
 
       // Both un-trusted validators reported.
       const reported = onInvalidPartial.mock.calls.map((c) => c[0].validator);
       expect(new Set(reported)).toEqual(new Set([VALIDATOR_B, VALIDATOR_C]));
+
+      // Each call passes a typed `attestation-rejected` reason as the 2nd
+      // argument, with stable fields callers can switch on without parsing
+      // text. The legacy Error is still passed as the 3rd argument.
+      for (const call of onInvalidPartial.mock.calls) {
+        const [event, reason, error] = call;
+        expect(reason.kind).toBe("attestation-rejected");
+        expect(reason.validator).toBe(event.validator);
+        expect(reason.pid).toBe(event.pid);
+        expect(reason.round).toBe(event.round);
+        expect(error).toBeInstanceOf(Error);
+      }
     });
 
     it("attestation cache: verifyAttestation called once per validator per round", async () => {

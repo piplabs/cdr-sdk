@@ -15,7 +15,7 @@ import {
   EmptyVaultError,
   ReadTransactionRevertedError,
 } from "./errors.js";
-import type { PartialDecryptionEvent } from "./types.js";
+import type { PartialDecryptionEvent, InvalidPartialReason } from "./types.js";
 import { uuidToLabel } from "./label.js";
 import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
@@ -243,7 +243,11 @@ export class Consumer {
     requesterPubKey: `0x${string}`;
     timeoutMs?: number;
     pollIntervalMs?: number;
-    onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
+    onInvalidPartial?: (
+      event: PartialDecryptionEvent,
+      reason: InvalidPartialReason,
+      error?: Error,
+    ) => void;
     attestationConfig?: AttestationConfig;
     /**
      * @internal Pre-loaded vault ciphertext from a containing call (e.g.
@@ -344,6 +348,12 @@ export class Consumer {
                 reported.add(dedupeKey);
                 onInvalidPartial?.(
                   event,
+                  {
+                    kind: "attestation-rejected",
+                    validator: sub.validator,
+                    pid: sub.pid,
+                    round: group.round,
+                  },
                   new Error(`attestation rejected for validator ${sub.validator}`),
                 );
               }
@@ -355,6 +365,10 @@ export class Consumer {
           if (accepted.length >= sdkThreshold) {
             return accepted.slice(0, sdkThreshold);
           }
+          // Below threshold after trust filtering: surface the
+          // trusted/accepted count (not the raw bucket size) on a future
+          // timeout, so callers see what was actually usable.
+          lastSeen = accepted.length;
           // Not enough trusted partials this poll — keep waiting; more
           // validators may still submit, and the trust set is fixed for
           // this round so newly-arrived partials reuse the same checks.
@@ -495,7 +509,11 @@ export class Consumer {
     timeoutMs?: number;
     /** See {@link read}'s `feeOverride` — same strict-equality semantics. */
     feeOverride?: bigint;
-    onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
+    onInvalidPartial?: (
+      event: PartialDecryptionEvent,
+      reason: InvalidPartialReason,
+      error?: Error,
+    ) => void;
     attestationConfig?: AttestationConfig;
   }): Promise<{ dataKey: Uint8Array; txHash: `0x${string}` }> {
     if (
@@ -585,7 +603,11 @@ export class Consumer {
     timeoutMs?: number;
     /** See {@link read}'s `feeOverride` — same strict-equality semantics. */
     feeOverride?: bigint;
-    onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
+    onInvalidPartial?: (
+      event: PartialDecryptionEvent,
+      reason: InvalidPartialReason,
+      error?: Error,
+    ) => void;
     attestationConfig?: AttestationConfig;
     /** Skip CID integrity verification of downloaded file (default: false). */
     skipCidVerification?: boolean;
