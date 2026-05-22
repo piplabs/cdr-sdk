@@ -9,7 +9,7 @@ vi.mock("@piplabs/cdr-crypto", () => ({
 
 import { Uploader } from "../src/uploader.js";
 import { tdh2Encrypt } from "@piplabs/cdr-crypto";
-import { ContentSizeExceededError } from "../src/errors.js";
+import { ContentSizeExceededError, InvalidConditionContractError } from "../src/errors.js";
 import type { Observer } from "../src/observer.js";
 
 /**
@@ -290,6 +290,79 @@ describe("Uploader", () => {
     // No tx ever submitted — fail-fast before writeContract.
     expect(walletClient.writeContract).not.toHaveBeenCalled();
     expect(observer.getMaxEncryptedDataSize).toHaveBeenCalledOnce();
+  });
+
+  it("uploadCDR with skipConditionValidation does not call simulateContract and completes", async () => {
+    const { publicClient, walletClient } = mockClients();
+    // allocateFee
+    publicClient.readContract.mockResolvedValueOnce(1000n);
+    walletClient.writeContract.mockResolvedValueOnce("0xalloctx" as `0x${string}`);
+    publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
+      logs: [makeVaultAllocatedLog(99)],
+    });
+    // writeFee
+    publicClient.readContract.mockResolvedValueOnce(200n);
+    walletClient.writeContract.mockResolvedValueOnce("0xwritetx" as `0x${string}`);
+    publicClient.waitForTransactionReceipt.mockResolvedValueOnce({});
+
+    vi.mocked(tdh2Encrypt).mockResolvedValueOnce({
+      raw: new Uint8Array([1, 2, 3]),
+      label: new Uint8Array([4, 5]),
+    });
+
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer: fakeObserver(),
+    });
+
+    // EOA addresses — would fail interface validation if it ran.
+    const result = await uploader.uploadCDR({
+      dataKey: new Uint8Array([0x11]),
+      globalPubKey: new Uint8Array([0xaa]),
+      updatable: false,
+      writeConditionAddr: "0xeeee000000000000000000000000000000000001",
+      readConditionAddr: "0xeeee000000000000000000000000000000000002",
+      writeConditionData: "0x",
+      readConditionData: "0x",
+      accessAuxData: "0x",
+      skipConditionValidation: true,
+    });
+
+    expect(publicClient.simulateContract).not.toHaveBeenCalled();
+    expect(result.uuid).toBe(99);
+    expect(result.txHashes.allocate).toBe("0xalloctx");
+    expect(result.txHashes.write).toBe("0xwritetx");
+  });
+
+  it("uploadCDR without skipConditionValidation rejects EOA condition addresses with InvalidConditionContractError", async () => {
+    const { publicClient, walletClient } = mockClients();
+    // No `cause` → validator treats this as a missing selector / non-contract address.
+    publicClient.simulateContract.mockReset();
+    publicClient.simulateContract.mockRejectedValue(new Error("returned no data"));
+
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer: fakeObserver(),
+    });
+
+    await expect(
+      uploader.uploadCDR({
+        dataKey: new Uint8Array([0x11]),
+        globalPubKey: new Uint8Array([0xaa]),
+        updatable: false,
+        writeConditionAddr: "0xeeee000000000000000000000000000000000001",
+        readConditionAddr: "0xeeee000000000000000000000000000000000002",
+        writeConditionData: "0x",
+        readConditionData: "0x",
+        accessAuxData: "0x",
+      }),
+    ).rejects.toThrow(InvalidConditionContractError);
+
+    expect(walletClient.writeContract).not.toHaveBeenCalled();
   });
 
   it("write passes when encryptedData is within maxEncryptedDataSize", async () => {

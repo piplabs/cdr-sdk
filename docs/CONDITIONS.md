@@ -76,6 +76,23 @@ When someone calls `write()` or `read()` on the CDR contract, the contract:
 
 This happens at the protocol level — the SDK does not enforce conditions locally. Your transaction will revert on-chain if conditions aren't met.
 
+### Bypassing Validation for EOA / Wallet-Address Conditions
+
+The CDR contract supports a short-circuit when `msg.sender == conditionAddr` — in that case, the on-chain `write()` / `read()` skips the condition `staticcall` entirely. This lets you use a plain wallet (EOA) address as the condition address for the simplest "only this wallet" access pattern, with no condition contract to deploy.
+
+Because the SDK validates the condition contract interface at allocation time (it simulates `checkWriteCondition` / `checkReadCondition`), an EOA address would fail that check. Pass `skipConditionValidation: true` to bypass it. `allocate()`, `uploadCDR()`, and `uploadFile()` all accept this flag:
+
+```typescript
+await client.uploader.uploadCDR({
+  // ...
+  writeConditionAddr: walletAddress,
+  readConditionAddr: walletAddress,
+  writeConditionData: "0x",
+  readConditionData: "0x",
+  skipConditionValidation: true,
+});
+```
+
 ## Expected Interface
 
 Condition contracts must implement these functions:
