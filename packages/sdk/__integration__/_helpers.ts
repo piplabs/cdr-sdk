@@ -7,6 +7,8 @@
  */
 
 import { expect, vi } from "vitest";
+import type { PublicClient } from "viem";
+import { cdrAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
 import { bytesToHex } from "../src/story-api/index.js";
 
 /**
@@ -210,5 +212,159 @@ export function writePerfStats(file: PerfStatsFile): void {
   } catch (e) {
     // eslint-disable-next-line no-console
     console.warn(`[perf-stats] failed to write ${path}: ${(e as Error).message}`);
+  }
+}
+
+/**
+ * The four fee getters on the CDR contract, all denominated in wei.
+ * Per-tx payable composition (current contract behavior on aeneid + devnet):
+ *
+ *   uploadCDR.value = baseFee + writeFee + allocateFee
+ *   accessCDR.value = readFee                       (NO baseFee)
+ *
+ * `baseFee` is only charged on the upload path. Read-only suites
+ * (100w-shared, 1000w-perf) pay readFee only.
+ */
+export interface CDRFees {
+  baseFee: bigint;
+  writeFee: bigint;
+  readFee: bigint;
+  allocateFee: bigint;
+}
+
+/**
+ * Query all four fees off the live CDR proxy at
+ * `contractAddresses[network].cdr`. One RPC roundtrip per getter (4 total).
+ * Each ephemeral suite calls this once at setup so the per-wallet fund
+ * tracks whatever fees are live on the target chain — avoids the
+ * hard-coded `parseEther("0.1")` shortfall that broke 100w-fresh-aeneid
+ * once aeneid raised all four fees from 0.01 IP → 0.03 IP.
+ */
+export async function queryCDRFees(
+  publicClient: PublicClient,
+  network: Network,
+): Promise<CDRFees> {
+  const cdrAddress = contractAddresses[network].cdr;
+  const [baseFee, writeFee, readFee, allocateFee] = await Promise.all([
+    publicClient.readContract({
+      address: cdrAddress,
+      abi: cdrAbi,
+      functionName: "baseFee",
+    }) as Promise<bigint>,
+    publicClient.readContract({
+      address: cdrAddress,
+      abi: cdrAbi,
+      functionName: "writeFee",
+    }) as Promise<bigint>,
+    publicClient.readContract({
+      address: cdrAddress,
+      abi: cdrAbi,
+      functionName: "readFee",
+    }) as Promise<bigint>,
+    publicClient.readContract({
+      address: cdrAddress,
+      abi: cdrAbi,
+      functionName: "allocateFee",
+    }) as Promise<bigint>,
+  ]);
+  return { baseFee, writeFee, readFee, allocateFee };
+}
+
+/**
+ * Required `payable` value for one uploadCDR call, EXCLUDING gas.
+ * Mirrors the contract's `require(msg.value == baseFee + writeFee +
+ * allocateFee)` on the write path.
+ */
+export function uploadFeeCost(fees: CDRFees): bigint {
+  return fees.baseFee + fees.writeFee + fees.allocateFee;
+}
+
+/**
+ * Required `payable` value for one accessCDR call, EXCLUDING gas.
+ * Mirrors `require(msg.value == readFee)` on the read path. `baseFee`
+ * is NOT charged on access — read-only suites (100w-shared, 1000w-perf)
+ * pay only this.
+ */
+export function accessFeeCost(fees: CDRFees): bigint {
+  return fees.readFee;
+}
+
+/**
+ * Required `payable` value for one (upload + access) cycle. Suites that
+ * exercise both paths per wallet (100w-fresh*, 60min-stress) use this.
+ */
+export function cycleFeeCost(fees: CDRFees): bigint {
+  return uploadFeeCost(fees) + accessFeeCost(fees);
+}
+
+/**
+ * Compute per-wallet fund for an ephemeral suite. Callers pass the
+ * per-cycle cost they expect (`cycleFeeCost`/`uploadFeeCost`/
+ * `accessFeeCost`) so this helper stays agnostic to which contract
+ * paths the suite exercises.
+ *
+ *   funded = perCycleWei × cyclesPerWallet × safetyMultiplier
+ *          + gasReserveWei × cyclesPerWallet
+ *
+ * `safetyMultiplier` covers fee bumps mid-run + per-tx gas variance;
+ * default 3× tracks the historical funded/needed ratio on devnet
+ * (PER_WALLET_FUND=0.1 IP vs single-cycle fee cost ≈ 0.04 IP).
+ * `gasReserveWei` defaults to 0.005 IP per tx, matching the same
+ * conservative gas reserve used by `_ephemeral-wallets.ts::refundWallets`.
+ *
+ * Returns a bigint suitable for passing straight into `fundWallets`.
+ */
+export function computePerWalletFund(opts: {
+  perCycleWei: bigint;
+  cyclesPerWallet: number;
+  safetyMultiplier?: number;
+  gasReserveWei?: bigint;
+}): bigint {
+  const cycles = BigInt(opts.cyclesPerWallet);
+  const multiplier = BigInt(Math.round((opts.safetyMultiplier ?? 3) * 100));
+  // Multiply by safetyMultiplier × 100 then divide by 100 to keep bigint
+  // math integral when callers pass a fractional multiplier like 2.5.
+  const padded = (opts.perCycleWei * cycles * multiplier) / 100n;
+  const gas = opts.gasReserveWei ?? 5_000_000_000_000_000n; // 0.005 IP
+  return padded + gas * cycles;
+}
+
+/**
+ * Per-suite fee snapshot written to `/tmp/fee-stats-{label}.json` at the
+ * end of each ephemeral suite setup. The integration workflow's summary
+ * step globs these files and renders one table row per file in the Step
+ * Summary, surfacing live fee values + actual per-wallet fund used
+ * alongside the perf table.
+ */
+export interface FeeStatsFile {
+  label: string;
+  network: string;
+  baseFee_wei: string;
+  writeFee_wei: string;
+  readFee_wei: string;
+  allocateFee_wei: string;
+  /**
+   * The per-cycle fee cost the suite used to compute its fund — either
+   * `cycleFeeCost` (full upload+access), `uploadFeeCost`, or `accessFeeCost`
+   * depending on which contract path the suite exercises.
+   */
+  per_cycle_wei: string;
+  cycles_per_wallet: number;
+  safety_multiplier: number;
+  per_wallet_fund_wei: string;
+}
+
+export function writeFeeStats(file: FeeStatsFile): void {
+  // Lazy fs import — see writePerfStats above for the rationale.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const fs = require("node:fs") as typeof import("node:fs");
+  const path = `/tmp/fee-stats-${file.label}.json`;
+  try {
+    fs.writeFileSync(path, JSON.stringify(file, null, 2));
+    // eslint-disable-next-line no-console
+    console.log(`[fee-stats] wrote ${path}`);
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn(`[fee-stats] failed to write ${path}: ${(e as Error).message}`);
   }
 }

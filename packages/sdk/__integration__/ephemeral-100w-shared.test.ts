@@ -43,7 +43,6 @@ import {
   createPublicClient,
   createWalletClient,
   http,
-  parseEther,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { CDRClient, initWasm } from "../src/index.js";
@@ -54,10 +53,23 @@ import {
   generateEphemeralWallets,
   refundWallets,
 } from "./_ephemeral-wallets.js";
-import { formatMs, logCase, mean, p50, p95, statsOf, writePerfStats } from "./_helpers.js";
+import {
+  accessFeeCost,
+  computePerWalletFund,
+  formatMs,
+  logCase,
+  mean,
+  p50,
+  p95,
+  queryCDRFees,
+  statsOf,
+  writeFeeStats,
+  writePerfStats,
+} from "./_helpers.js";
 
 const WALLET_COUNT = 100;
-const PER_WALLET_FUND = parseEther("0.05");
+const CYCLES_PER_WALLET = 1; // 1 accessCDR per wallet, no upload
+const FUND_SAFETY_MULTIPLIER = 3;
 const ACCESS_TIMEOUT_MS = 180_000;
 
 const API_URL = process.env.CDR_API_URL;
@@ -143,6 +155,7 @@ describe.skipIf(skipUnlessSuite("default"))(
     let sharedVaultUuid: number;
     let sharedDataKey: Uint8Array;
     let wallets: EphemeralWallet[];
+    let perWalletFund = 0n;
     let totalFundedWei = 0n;
     // Captured by `it`, written to /tmp/perf-stats-100w-shared.json by
     // `afterAll` (so the workflow can render a perf table). null until
@@ -163,6 +176,37 @@ describe.skipIf(skipUnlessSuite("default"))(
       funderWallet = f.walletClient;
       funderClient = f.client;
       funderAddress = privateKeyToAccount(FUNDER_KEY!).address;
+
+      // Read-only suite: each ephemeral wallet pays accessFee only (no
+      // upload / no baseFee). Size fund from the live readFee instead of
+      // a static 0.05 IP that becomes unsafe whenever the chain raises
+      // readFee.
+      const fees = await queryCDRFees(funderPublic, "testnet");
+      const perCycleWei = accessFeeCost(fees);
+      perWalletFund = computePerWalletFund({
+        perCycleWei,
+        cyclesPerWallet: CYCLES_PER_WALLET,
+        safetyMultiplier: FUND_SAFETY_MULTIPLIER,
+      });
+      writeFeeStats({
+        label: "100w-shared",
+        network: NETWORK,
+        baseFee_wei: fees.baseFee.toString(),
+        writeFee_wei: fees.writeFee.toString(),
+        readFee_wei: fees.readFee.toString(),
+        allocateFee_wei: fees.allocateFee.toString(),
+        per_cycle_wei: perCycleWei.toString(),
+        cycles_per_wallet: CYCLES_PER_WALLET,
+        safety_multiplier: FUND_SAFETY_MULTIPLIER,
+        per_wallet_fund_wei: perWalletFund.toString(),
+      });
+      logCase("fees + fund sizing", {
+        readFee: fees.readFee.toString(),
+        perCycleWei: perCycleWei.toString(),
+        cyclesPerWallet: CYCLES_PER_WALLET,
+        safetyMultiplier: FUND_SAFETY_MULTIPLIER,
+        perWalletFund: perWalletFund.toString(),
+      });
 
       openCondition = await deployOpenCondition(funderPublic, funderWallet);
       logCase("openCondition", openCondition);
@@ -187,13 +231,13 @@ describe.skipIf(skipUnlessSuite("default"))(
         funderPublic,
         funderWallet,
         wallets,
-        PER_WALLET_FUND,
+        perWalletFund,
       );
       totalFundedWei = fund.totalFundedWei;
       logCase("multicall3 batch fund", {
         multicall3: fund.multicall3Address,
         wallets: wallets.length,
-        perWallet: PER_WALLET_FUND.toString(),
+        perWallet: perWalletFund.toString(),
         totalWei: fund.totalFundedWei.toString(),
         txHash: fund.txHash,
       });

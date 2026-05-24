@@ -559,6 +559,51 @@ jobs:
             done
           }
 
+          # ─── Fee table: glob /tmp/fee-stats-*.json ────────────────────────────
+          # Each ephemeral suite queries baseFee / writeFee / readFee /
+          # allocateFee off the live CDR contract at setup time and writes
+          # them to /tmp/fee-stats-{label}.json alongside the per-cycle cost
+          # it actually used + the computed per-wallet fund. We render that
+          # here so any "100 wallets failed with insufficient funds" failure
+          # mode is one table-row away from being diagnosed — you can see
+          # at a glance whether the chain raised a fee since the last run
+          # and whether the suite's fund covers it.
+          render_fee_table() {
+            shopt -s nullglob
+            local files=(/tmp/fee-stats-*.json)
+            shopt -u nullglob
+            [ "${#files[@]}" -gt 0 ] || { echo "_(no fee-stats output produced — no ephemeral suite ran)_"; echo ""; return; }
+            echo "**One row per ephemeral suite.** Fees are queried live off the CDR contract at suite setup."
+            echo "\`Per-cycle\` = the payable value the suite expects per (upload + access) iteration —"
+            echo "read-only suites (100w-shared, 1000w-perf) bill only \`readFee\`; full-cycle suites add \`baseFee + writeFee + allocateFee\`; stress adds an extra \`readFee\` for the second access per cycle."
+            echo "\`Per-wallet fund\` = \`per-cycle × cycles × safety_multiplier + gas_reserve × cycles\`."
+            echo ""
+            echo "| Suite | baseFee | writeFee | readFee | allocateFee | Per-cycle | Cycles/wallet | Safety× | Per-wallet fund |"
+            echo "|---|---|---|---|---|---|---|---|---|"
+            for f in "${files[@]}"; do
+              jq -r '
+                def fmtIp:
+                  ((. | tonumber) / 1e18) as $ip |
+                  ($ip * 10000 | floor) as $n |
+                  ($n / 10000 | floor | tostring) as $whole |
+                  ($n % 10000 | tostring) as $fracraw |
+                  ("0000" + $fracraw)[-4:] as $frac |
+                  $whole + "." + $frac + " IP";
+                "| " + .label
+                + " | " + (.baseFee_wei         | fmtIp)
+                + " | " + (.writeFee_wei        | fmtIp)
+                + " | " + (.readFee_wei         | fmtIp)
+                + " | " + (.allocateFee_wei     | fmtIp)
+                + " | " + (.per_cycle_wei       | fmtIp)
+                + " | " + (.cycles_per_wallet   | tostring)
+                + " | " + (.safety_multiplier   | tostring)
+                + " | " + (.per_wallet_fund_wei | fmtIp)
+                + " |"
+              ' "$f"
+            done
+            echo ""
+          }
+
           # ─── Now write everything to GITHUB_STEP_SUMMARY in the new order ─────
           {
             echo "## ${HEADLINE_EMOJI} Overall — ${TOTAL_PASSED} passed | ${TOTAL_FAILED} failed | ${TOTAL_SKIPPED} skipped — wall ${ELAPSED_S}s"
@@ -598,6 +643,10 @@ jobs:
             echo ""
             echo "_DKG stage codes: 1 = Registration, 2 = Dealing, 3 = Finalization, 4 = Active._"
             echo ""
+
+            echo "### Live CDR fees + ephemeral fund sizing"
+            echo ""
+            render_fee_table
 
             echo "### Performance metrics"
             echo ""

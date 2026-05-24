@@ -32,7 +32,6 @@ import {
   type WalletClient,
   createPublicClient,
   createWalletClient,
-  parseEther,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { CDRClient, initWasm } from "../src/index.js";
@@ -43,11 +42,24 @@ import {
   generateEphemeralWallets,
   refundWallets,
 } from "./_ephemeral-wallets.js";
-import { formatMs, logCase, mean, p50, p95, statsOf, writePerfStats } from "./_helpers.js";
+import {
+  computePerWalletFund,
+  cycleFeeCost,
+  formatMs,
+  logCase,
+  mean,
+  p50,
+  p95,
+  queryCDRFees,
+  statsOf,
+  writeFeeStats,
+  writePerfStats,
+} from "./_helpers.js";
 import { pLimit, resilientHttp } from "./_rpc-resilience.js";
 
 const WALLET_COUNT = 100;
-const PER_WALLET_FUND = parseEther("0.1");
+const CYCLES_PER_WALLET = 1; // upload + access
+const FUND_SAFETY_MULTIPLIER = 3;
 const ACCESS_TIMEOUT_MS = 180_000;
 const MAX_INFLIGHT = 25;
 
@@ -125,6 +137,7 @@ describe.skipIf(skipUnlessSuite("default") || NETWORK !== "aeneid")(
     let funderAddress: `0x${string}`;
     let openCondition: `0x${string}`;
     let wallets: EphemeralWallet[];
+    let perWalletFund = 0n;
     let totalFundedWei = 0n;
     let perfBuffer: {
       fulfilled: number;
@@ -141,6 +154,40 @@ describe.skipIf(skipUnlessSuite("default") || NETWORK !== "aeneid")(
       funderWallet = f.walletClient;
       funderAddress = privateKeyToAccount(FUNDER_KEY!).address;
 
+      // Query live CDR fees and size each wallet's fund to actual on-chain
+      // cost. The previous hard-coded 0.1 IP broke on aeneid once all four
+      // fees moved 0.01 → 0.03 IP — 0.1 IP minus a single upload (~0.078 IP)
+      // left only ~0.022 IP, below the 0.03 IP value the read tx requires.
+      const fees = await queryCDRFees(funderPublic, "testnet");
+      const perCycleWei = cycleFeeCost(fees);
+      perWalletFund = computePerWalletFund({
+        perCycleWei,
+        cyclesPerWallet: CYCLES_PER_WALLET,
+        safetyMultiplier: FUND_SAFETY_MULTIPLIER,
+      });
+      writeFeeStats({
+        label: "100w-fresh-aeneid",
+        network: NETWORK,
+        baseFee_wei: fees.baseFee.toString(),
+        writeFee_wei: fees.writeFee.toString(),
+        readFee_wei: fees.readFee.toString(),
+        allocateFee_wei: fees.allocateFee.toString(),
+        per_cycle_wei: perCycleWei.toString(),
+        cycles_per_wallet: CYCLES_PER_WALLET,
+        safety_multiplier: FUND_SAFETY_MULTIPLIER,
+        per_wallet_fund_wei: perWalletFund.toString(),
+      });
+      logCase("fees + fund sizing", {
+        baseFee: fees.baseFee.toString(),
+        writeFee: fees.writeFee.toString(),
+        readFee: fees.readFee.toString(),
+        allocateFee: fees.allocateFee.toString(),
+        perCycleWei: perCycleWei.toString(),
+        cyclesPerWallet: CYCLES_PER_WALLET,
+        safetyMultiplier: FUND_SAFETY_MULTIPLIER,
+        perWalletFund: perWalletFund.toString(),
+      });
+
       openCondition = await deployOpenCondition(funderPublic, funderWallet);
       logCase("openCondition", openCondition);
 
@@ -149,13 +196,13 @@ describe.skipIf(skipUnlessSuite("default") || NETWORK !== "aeneid")(
         funderPublic,
         funderWallet,
         wallets,
-        PER_WALLET_FUND,
+        perWalletFund,
       );
       totalFundedWei = fund.totalFundedWei;
       logCase("multicall3 batch fund", {
         multicall3: fund.multicall3Address,
         wallets: wallets.length,
-        perWallet: PER_WALLET_FUND.toString(),
+        perWallet: perWalletFund.toString(),
         totalWei: fund.totalFundedWei.toString(),
         txHash: fund.txHash,
       });
