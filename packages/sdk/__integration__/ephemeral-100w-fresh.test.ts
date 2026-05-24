@@ -46,16 +46,14 @@ import {
   refundWallets,
 } from "./_ephemeral-wallets.js";
 import {
-  computePerWalletFund,
   cycleFeeCost,
   formatMs,
   logCase,
   mean,
   p50,
   p95,
-  queryCDRFees,
+  sizeFundAndReport,
   statsOf,
-  writeFeeStats,
   writePerfStats,
 } from "./_helpers.js";
 
@@ -157,34 +155,13 @@ describe.skipIf(skipUnlessSuite("default") || NETWORK !== "devnet")(
 
       // Size each wallet's fund from live CDR fees. See the aeneid
       // sibling suite for the failure-mode rationale.
-      const fees = await queryCDRFees(funderPublic, "testnet");
-      const perCycleWei = cycleFeeCost(fees);
-      perWalletFund = computePerWalletFund({
-        perCycleWei,
-        cyclesPerWallet: CYCLES_PER_WALLET,
-        safetyMultiplier: FUND_SAFETY_MULTIPLIER,
-      });
-      writeFeeStats({
+      perWalletFund = await sizeFundAndReport({
         label: "100w-fresh",
         network: NETWORK,
-        baseFee_wei: fees.baseFee.toString(),
-        writeFee_wei: fees.writeFee.toString(),
-        readFee_wei: fees.readFee.toString(),
-        allocateFee_wei: fees.allocateFee.toString(),
-        per_cycle_wei: perCycleWei.toString(),
-        cycles_per_wallet: CYCLES_PER_WALLET,
-        safety_multiplier: FUND_SAFETY_MULTIPLIER,
-        per_wallet_fund_wei: perWalletFund.toString(),
-      });
-      logCase("fees + fund sizing", {
-        baseFee: fees.baseFee.toString(),
-        writeFee: fees.writeFee.toString(),
-        readFee: fees.readFee.toString(),
-        allocateFee: fees.allocateFee.toString(),
-        perCycleWei: perCycleWei.toString(),
+        publicClient: funderPublic,
+        perCycleCost: cycleFeeCost,
         cyclesPerWallet: CYCLES_PER_WALLET,
         safetyMultiplier: FUND_SAFETY_MULTIPLIER,
-        perWalletFund: perWalletFund.toString(),
       });
 
       openCondition = await deployOpenCondition(funderPublic, funderWallet);

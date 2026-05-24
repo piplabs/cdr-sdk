@@ -46,7 +46,6 @@ import {
 } from "./_ephemeral-wallets.js";
 import {
   accessFeeCost,
-  computePerWalletFund,
   formatMs,
   logCase,
   max as arrMax,
@@ -54,9 +53,8 @@ import {
   p50,
   p95,
   p99,
-  queryCDRFees,
+  sizeFundAndReport,
   statsOf,
-  writeFeeStats,
   writePerfStats,
 } from "./_helpers.js";
 
@@ -190,31 +188,13 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only") || NETWOR
       // Read-only suite: each wallet pays readFee only. Size fund from
       // live readFee so we don't have to rotate this hard-coded number
       // every time chain fees move.
-      const fees = await queryCDRFees(funderPublic, "testnet");
-      const perCycleWei = accessFeeCost(fees);
-      perWalletFund = computePerWalletFund({
-        perCycleWei,
-        cyclesPerWallet: CYCLES_PER_WALLET,
-        safetyMultiplier: FUND_SAFETY_MULTIPLIER,
-      });
-      writeFeeStats({
+      perWalletFund = await sizeFundAndReport({
         label: "1000w-perf",
         network: NETWORK,
-        baseFee_wei: fees.baseFee.toString(),
-        writeFee_wei: fees.writeFee.toString(),
-        readFee_wei: fees.readFee.toString(),
-        allocateFee_wei: fees.allocateFee.toString(),
-        per_cycle_wei: perCycleWei.toString(),
-        cycles_per_wallet: CYCLES_PER_WALLET,
-        safety_multiplier: FUND_SAFETY_MULTIPLIER,
-        per_wallet_fund_wei: perWalletFund.toString(),
-      });
-      logCase("fees + fund sizing", {
-        readFee: fees.readFee.toString(),
-        perCycleWei: perCycleWei.toString(),
+        publicClient: funderPublic,
+        perCycleCost: accessFeeCost,
         cyclesPerWallet: CYCLES_PER_WALLET,
         safetyMultiplier: FUND_SAFETY_MULTIPLIER,
-        perWalletFund: perWalletFund.toString(),
       });
 
       openCondition = await deployOpenCondition(funderPublic, funderWallet);

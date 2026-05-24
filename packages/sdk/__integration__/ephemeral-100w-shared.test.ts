@@ -55,15 +55,13 @@ import {
 } from "./_ephemeral-wallets.js";
 import {
   accessFeeCost,
-  computePerWalletFund,
   formatMs,
   logCase,
   mean,
   p50,
   p95,
-  queryCDRFees,
+  sizeFundAndReport,
   statsOf,
-  writeFeeStats,
   writePerfStats,
 } from "./_helpers.js";
 
@@ -177,35 +175,15 @@ describe.skipIf(skipUnlessSuite("default"))(
       funderClient = f.client;
       funderAddress = privateKeyToAccount(FUNDER_KEY!).address;
 
-      // Read-only suite: each ephemeral wallet pays accessFee only (no
-      // upload / no baseFee). Size fund from the live readFee instead of
-      // a static 0.05 IP that becomes unsafe whenever the chain raises
-      // readFee.
-      const fees = await queryCDRFees(funderPublic, "testnet");
-      const perCycleWei = accessFeeCost(fees);
-      perWalletFund = computePerWalletFund({
-        perCycleWei,
-        cyclesPerWallet: CYCLES_PER_WALLET,
-        safetyMultiplier: FUND_SAFETY_MULTIPLIER,
-      });
-      writeFeeStats({
+      // Read-only suite: each wallet pays accessFee only (no upload, no
+      // baseFee). Size fund from live readFee.
+      perWalletFund = await sizeFundAndReport({
         label: "100w-shared",
         network: NETWORK,
-        baseFee_wei: fees.baseFee.toString(),
-        writeFee_wei: fees.writeFee.toString(),
-        readFee_wei: fees.readFee.toString(),
-        allocateFee_wei: fees.allocateFee.toString(),
-        per_cycle_wei: perCycleWei.toString(),
-        cycles_per_wallet: CYCLES_PER_WALLET,
-        safety_multiplier: FUND_SAFETY_MULTIPLIER,
-        per_wallet_fund_wei: perWalletFund.toString(),
-      });
-      logCase("fees + fund sizing", {
-        readFee: fees.readFee.toString(),
-        perCycleWei: perCycleWei.toString(),
+        publicClient: funderPublic,
+        perCycleCost: accessFeeCost,
         cyclesPerWallet: CYCLES_PER_WALLET,
         safetyMultiplier: FUND_SAFETY_MULTIPLIER,
-        perWalletFund: perWalletFund.toString(),
       });
 
       openCondition = await deployOpenCondition(funderPublic, funderWallet);

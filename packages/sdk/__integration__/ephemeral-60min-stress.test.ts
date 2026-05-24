@@ -86,20 +86,20 @@ import {
 } from "./_ephemeral-wallets.js";
 import {
   accessFeeCost,
-  computePerWalletFund,
-  queryCDRFees,
+  sizeFundAndReport,
   statsOf,
   uploadFeeCost,
-  writeFeeStats,
   writePerfStats,
 } from "./_helpers.js";
 
 const DURATION_MS = 60 * 60 * 1000; // 1 hour
 const CONCURRENCY = 10;
 // Generous over-estimate of cycles per wallet. Real run on devnet does
-// ~120-200 cycles in 1 hour; 500 here absorbs any speedup while leaving
-// the fund well above what a 60-min loop can plausibly consume.
-const ESTIMATED_CYCLES_PER_WALLET = 500;
+// ~120-200 cycles in 1 hour; 1000 here absorbs any future cycle speedup
+// while staying close to the spirit of the previous static 1000 IP fund
+// (it works out to ~155 IP/wallet on devnet vs the previous 1000 IP —
+// still a 15× buffer over realistic need, but tracks live fees).
+const ESTIMATED_CYCLES_PER_WALLET = 1000;
 const FUND_SAFETY_MULTIPLIER = 3;
 // Generous reserve absorbs any pending-tx mempool cost when refund runs
 // right after the last cycle. Loses ~10 IP across 10 wallets — DevNet
@@ -245,34 +245,17 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
       funderClient = f.client;
       funderAddress = privateKeyToAccount(FUNDER_KEY!).address;
 
-      // Each cycle = 1 uploadCDR + 2 accessCDR (shared + own-fresh).
-      // Size fund from live fees with a 500-cycle generous estimate so the
-      // suite cannot starve even if cycles run faster than expected.
-      const fees = await queryCDRFees(funderPublic, "testnet");
-      const perCycleWei = uploadFeeCost(fees) + accessFeeCost(fees) * 2n;
-      perWalletFund = computePerWalletFund({
-        perCycleWei,
+      // Each cycle = 1 uploadCDR + 2 accessCDR (shared + own-fresh). The
+      // fee snapshot + fund sizing also lands in /tmp/fee-stats-60min-stress.json
+      // for the workflow summary table.
+      perWalletFund = await sizeFundAndReport({
+        label: "60min-stress",
+        network: NETWORK,
+        publicClient: funderPublic,
+        perCycleCost: (fees) => uploadFeeCost(fees) + accessFeeCost(fees) * 2n,
         cyclesPerWallet: ESTIMATED_CYCLES_PER_WALLET,
         safetyMultiplier: FUND_SAFETY_MULTIPLIER,
       });
-      writeFeeStats({
-        label: "60min-stress",
-        network: NETWORK,
-        baseFee_wei: fees.baseFee.toString(),
-        writeFee_wei: fees.writeFee.toString(),
-        readFee_wei: fees.readFee.toString(),
-        allocateFee_wei: fees.allocateFee.toString(),
-        per_cycle_wei: perCycleWei.toString(),
-        cycles_per_wallet: ESTIMATED_CYCLES_PER_WALLET,
-        safety_multiplier: FUND_SAFETY_MULTIPLIER,
-        per_wallet_fund_wei: perWalletFund.toString(),
-      });
-      logLine(
-        `[suite-setup] fee sizing: baseFee=${fees.baseFee} writeFee=${fees.writeFee} ` +
-          `readFee=${fees.readFee} allocateFee=${fees.allocateFee} perCycle=${perCycleWei} ` +
-          `cycles=${ESTIMATED_CYCLES_PER_WALLET} multiplier=${FUND_SAFETY_MULTIPLIER} ` +
-          `perWalletFund=${perWalletFund}`,
-      );
 
       openCondition = await deployOpenCondition(funderPublic, funderWallet);
       logLine(`[suite-setup] openCondition deployed at ${openCondition}`);

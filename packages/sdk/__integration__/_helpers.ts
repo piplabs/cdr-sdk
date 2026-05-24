@@ -304,13 +304,14 @@ export function cycleFeeCost(fees: CDRFees): bigint {
  * paths the suite exercises.
  *
  *   funded = perCycleWei × cyclesPerWallet × safetyMultiplier
- *          + gasReserveWei × cyclesPerWallet
+ *          + gasReservePerCycleWei × cyclesPerWallet
  *
  * `safetyMultiplier` covers fee bumps mid-run + per-tx gas variance;
  * default 3× tracks the historical funded/needed ratio on devnet
  * (PER_WALLET_FUND=0.1 IP vs single-cycle fee cost ≈ 0.04 IP).
- * `gasReserveWei` defaults to 0.005 IP per tx, matching the same
- * conservative gas reserve used by `_ephemeral-wallets.ts::refundWallets`.
+ * `gasReservePerCycleWei` defaults to 0.005 IP per cycle, which covers
+ * 1-3 txs of typical gas (~0.001-0.002 IP per tx). Same order of
+ * magnitude as the `refundWallets` end-of-suite reserve.
  *
  * Returns a bigint suitable for passing straight into `fundWallets`.
  */
@@ -318,14 +319,14 @@ export function computePerWalletFund(opts: {
   perCycleWei: bigint;
   cyclesPerWallet: number;
   safetyMultiplier?: number;
-  gasReserveWei?: bigint;
+  gasReservePerCycleWei?: bigint;
 }): bigint {
   const cycles = BigInt(opts.cyclesPerWallet);
   const multiplier = BigInt(Math.round((opts.safetyMultiplier ?? 3) * 100));
   // Multiply by safetyMultiplier × 100 then divide by 100 to keep bigint
   // math integral when callers pass a fractional multiplier like 2.5.
   const padded = (opts.perCycleWei * cycles * multiplier) / 100n;
-  const gas = opts.gasReserveWei ?? 5_000_000_000_000_000n; // 0.005 IP
+  const gas = opts.gasReservePerCycleWei ?? 5_000_000_000_000_000n; // 0.005 IP
   return padded + gas * cycles;
 }
 
@@ -367,4 +368,69 @@ export function writeFeeStats(file: FeeStatsFile): void {
     // eslint-disable-next-line no-console
     console.warn(`[fee-stats] failed to write ${path}: ${(e as Error).message}`);
   }
+}
+
+/**
+ * Suite-side convenience wrapper: query live fees, compute per-wallet
+ * fund, persist the fee-stats snapshot for the workflow summary, and
+ * return the fund. Folds the boilerplate that all five ephemeral suites
+ * share into a single call. The `perCycleCost` selector lets each suite
+ * pick the cost shape it actually exercises without the helper having
+ * to know which contract paths it touches.
+ *
+ *   const perWalletFund = await sizeFundAndReport({
+ *     label: "100w-fresh-aeneid",
+ *     network: NETWORK,
+ *     publicClient: funderPublic,
+ *     perCycleCost: cycleFeeCost,            // or accessFeeCost / uploadFeeCost
+ *     cyclesPerWallet: 1,
+ *     safetyMultiplier: 3,
+ *   });
+ *
+ * Logs the fee snapshot via `console.log` so the suite's CI output
+ * preserves the same one-line trace that the previous bespoke logCase
+ * calls produced.
+ */
+export async function sizeFundAndReport(opts: {
+  label: string;
+  network: string;
+  publicClient: PublicClient;
+  contractNetwork?: Network;
+  perCycleCost: (fees: CDRFees) => bigint;
+  cyclesPerWallet: number;
+  safetyMultiplier?: number;
+  gasReservePerCycleWei?: bigint;
+}): Promise<bigint> {
+  const fees = await queryCDRFees(
+    opts.publicClient,
+    opts.contractNetwork ?? "testnet",
+  );
+  const perCycleWei = opts.perCycleCost(fees);
+  const safetyMultiplier = opts.safetyMultiplier ?? 3;
+  const perWalletFund = computePerWalletFund({
+    perCycleWei,
+    cyclesPerWallet: opts.cyclesPerWallet,
+    safetyMultiplier,
+    gasReservePerCycleWei: opts.gasReservePerCycleWei,
+  });
+  writeFeeStats({
+    label: opts.label,
+    network: opts.network,
+    baseFee_wei: fees.baseFee.toString(),
+    writeFee_wei: fees.writeFee.toString(),
+    readFee_wei: fees.readFee.toString(),
+    allocateFee_wei: fees.allocateFee.toString(),
+    per_cycle_wei: perCycleWei.toString(),
+    cycles_per_wallet: opts.cyclesPerWallet,
+    safety_multiplier: safetyMultiplier,
+    per_wallet_fund_wei: perWalletFund.toString(),
+  });
+  // eslint-disable-next-line no-console
+  console.log(
+    `[fee-sizing][${opts.label}] base=${fees.baseFee} write=${fees.writeFee} ` +
+      `read=${fees.readFee} allocate=${fees.allocateFee} perCycle=${perCycleWei} ` +
+      `cycles=${opts.cyclesPerWallet} safety=${safetyMultiplier} ` +
+      `perWalletFund=${perWalletFund}`,
+  );
+  return perWalletFund;
 }
