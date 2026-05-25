@@ -40,6 +40,7 @@ import {
   MULTICALL3_ABI,
   buildMulticall3CreationBytecode,
 } from "./_multicall3-artifact.js";
+import { waitForReceiptResilient } from "./_rpc-resilience.js";
 
 export interface EphemeralWallet {
   privateKey: Hex;
@@ -95,7 +96,7 @@ export async function ensureMulticall3(
     to: null,
     data: buildMulticall3CreationBytecode(),
   });
-  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  const receipt = await waitForReceiptResilient(publicClient, hash);
   if (!receipt.contractAddress) {
     throw new Error(
       `ensureMulticall3: deployment receipt missing contractAddress (tx ${hash})`,
@@ -151,7 +152,7 @@ export async function fundWallets(
     args: [calls],
     value: totalFundedWei,
   });
-  await publicClient.waitForTransactionReceipt({ hash: txHash });
+  await waitForReceiptResilient(publicClient, txHash);
 
   return { multicall3Address, totalFundedWei, txHash };
 }
@@ -209,7 +210,7 @@ export async function refundWallets(
           value: sweepAmount,
           gas: 21_000n,
         });
-        await publicClient.waitForTransactionReceipt({ hash });
+        await waitForReceiptResilient(publicClient, hash);
         return sweepAmount;
       } catch {
         return -1n; // sentinel for failed sweep

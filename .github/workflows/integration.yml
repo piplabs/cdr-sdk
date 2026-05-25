@@ -443,17 +443,72 @@ jobs:
           }
 
           # ─── Aggregate failures across ALL JSON files (top-of-summary block) ──
+          # Cross-references vitest's assertion failures with the matching
+          # /tmp/perf-stats-{label}.json so an ephemeral-suite failure prints
+          # the per-wallet failure reasons inline (e.g. "99/100 succeeded,
+          # 1 failed: receipt-not-found on tx 0x914c... mined in block
+          # 0x11d2547" from run 26379164817; or the 2-row dual-cause
+          # break-down rendered for run 26380050980 wallets idx=31/36)
+          # rather than only the cryptic `AssertionError: 1 wallets
+          # failed: expected 1 to be +0` + vitest stack a reviewer has
+          # to click into the run log to decipher. Mapping: strip the
+          # `ephemeral-` prefix and `.test.ts` suffix from the test file
+          # basename to derive the perf-stats label. Falls back gracefully
+          # to vitest-stack-only when the perf-stats file is missing or
+          # unreadable (also see the `|| echo "{}"` JSON guard).
           aggregate_failures() {
+            # Build a {label -> perf-stats} map once so the inner jq can
+            # look up the matching per-wallet failure rows for each
+            # assertion failure. Defensive: `jq -s` over multiple files
+            # exits non-zero on the FIRST malformed input, which would
+            # silently drop the entire enriched-failure block — even the
+            # downstream `--argjson perf "$perf_json"` call would fail
+            # to parse, falling back to vitest-stack-only for ALL suites
+            # (not just the one with bad output). Iterate per file so
+            # one truncated / unparseable JSON only loses ITS own
+            # enrichment; the other suites still render the per-wallet
+            # failure tables.
+            shopt -s nullglob
+            local perf_files=(/tmp/perf-stats-*.json)
+            shopt -u nullglob
+            local perf_json="{}"
+            for f in "${perf_files[@]}"; do
+              # `-e` exits non-zero on `select(...)` filtering everything
+              # out (no `.label`), and on outright parse failures.
+              local entry
+              entry=$(jq -ec 'select(type == "object" and (.label | type) == "string")' "$f" 2>/dev/null) || continue
+              perf_json=$(jq -n --argjson acc "$perf_json" --argjson item "$entry" '$acc + {($item.label): $item}')
+            done
+
             for json in /tmp/results-sdk.json /tmp/results-cli.json /tmp/results-examples.json /tmp/results-stress.json; do
               [ -f "$json" ] || continue
-              jq -r --arg scope "$(basename "$json" .json | sed 's/^results-//')" '
+              jq -r \
+                --arg scope "$(basename "$json" .json | sed 's/^results-//')" \
+                --argjson perf "$perf_json" '
+                def truncReason:
+                  gsub("\n"; " ")
+                  | gsub("\\|"; "\\|")
+                  | (if (. | length) > 200 then .[:200] + " …" else . end);
                 .testResults[] as $f
                 | ($f.name | split("/") | last) as $file
+                | ($file | sub("\\.test\\.ts$"; "") | sub("^ephemeral-"; "")) as $label
                 | $f.assertionResults[]
                 | select(.status == "failed")
-                | "**❌ [" + $scope + "] `" + $file + "` → " + .title + "**\n\n```\n"
+                | (($perf[$label]) // null) as $p
+                | "### ❌ [" + $scope + "] `" + $file + "` → " + .title + "\n"
+                  + (if $p != null and $p.failedReasons != null and ($p.failedReasons | length) > 0
+                     then "\n**" + ($p.fulfilled | tostring) + "/"
+                            + (($p.fulfilled + $p.failed) | tostring)
+                            + " wallets succeeded, " + ($p.failed | tostring) + " failed.**\n\n"
+                          + "| idx | failure reason (truncated to 200 chars) |\n"
+                          + "|---|---|\n"
+                          + ($p.failedReasons | map("| " + (.idx | tostring) + " | " + (.reason | truncReason) + " |") | join("\n"))
+                          + "\n"
+                     else "" end)
+                  + "\n<details><summary>Raw assertion / vitest stack</summary>\n\n"
+                  + "```\n"
                   + ((.failureMessages // [])[0] // "(no failureMessage)")
-                  + "\n```\n"
+                  + "\n```\n\n</details>\n"
               ' "$json"
             done
           }

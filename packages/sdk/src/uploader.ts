@@ -1,10 +1,39 @@
-import { parseEventLogs, toHex, toBytes, type PublicClient, type WalletClient } from "viem";
+import { parseEventLogs, toHex, toBytes, type Hash, type PublicClient, type WalletClient } from "viem";
 import { cdrAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
 import { tdh2Encrypt, encryptFile, getWasm, type TDH2Ciphertext } from "@piplabs/cdr-crypto";
 import { uuidToLabel } from "./label.js";
 import { ContentSizeExceededError, LabelMismatchError, InvalidConditionContractError } from "./errors.js";
 import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
+
+/**
+ * Wraps `publicClient.waitForTransactionReceipt` with parameters tuned for
+ * public RPC endpoints (e.g. `https://aeneid.storyrpc.io`) where receipt
+ * propagation can lag block production by tens of seconds for a small tail
+ * of txs. Viem's defaults (`timeout: 180_000`, `retryCount: 6`) are tuned
+ * for a directly-connected node; on a public RPC the 180s overall window
+ * occasionally fires on a tx that DID land on chain — the receipt just
+ * hadn't surfaced yet on the pool node serving `eth_getTransactionReceipt`
+ * (e.g. cdr-sdk run 26379164817, wallet idx=29: allocate tx 0x914c3c...
+ * mined in block 0x11d2547 status=1 but viem gave up first, failing 1/100
+ * wallets in 100w-fresh-aeneid; run 26380050980 hit the same pattern on
+ * wallet idx=31 with tx 0x13cdcd... in block 0x11d2980).
+ *
+ * Bumping `timeout` to 5 min covers any realistic propagation tail and
+ * `retryCount: 30` widens the transient-HTTP-error tolerance; the SDK
+ * still surfaces a real receipt error if the tx genuinely failed. Test
+ * code has a mirror in `packages/sdk/__integration__/_rpc-resilience.ts`;
+ * the duplication is intentional — the SDK shouldn't take a dependency
+ * on test-only files.
+ */
+async function waitForReceiptResilient(publicClient: PublicClient, hash: Hash) {
+  return publicClient.waitForTransactionReceipt({
+    hash,
+    timeout: 5 * 60 * 1000,
+    pollingInterval: 2000,
+    retryCount: 30,
+  });
+}
 
 export class Uploader {
   private publicClient: PublicClient;
@@ -122,7 +151,7 @@ export class Uploader {
       value: fee,
     });
 
-    const receipt = await this.publicClient.waitForTransactionReceipt({ hash: txHash });
+    const receipt = await waitForReceiptResilient(this.publicClient, txHash);
     const uuid = this.parseVaultAllocatedUuid(receipt.logs);
 
     return { txHash, uuid };
@@ -198,7 +227,7 @@ export class Uploader {
       value: fee,
     });
 
-    await this.publicClient.waitForTransactionReceipt({ hash: txHash });
+    await waitForReceiptResilient(this.publicClient, txHash);
 
     return { txHash };
   }
