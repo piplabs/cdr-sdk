@@ -443,15 +443,13 @@ jobs:
           }
 
           # ─── Aggregate failures across ALL JSON files (top-of-summary block) ──
-          # Cross-references vitest's assertion failures with the matching
+          # Joins vitest assertion failures with the matching
           # /tmp/perf-stats-{label}.json so an ephemeral-suite failure prints
-          # the per-wallet failure reasons inline (e.g. "99/100 succeeded,
-          # 1 failed: receipt-not-found on tx 0x914c...") rather than only
-          # the cryptic `AssertionError: 1 wallets failed: expected 1 to be
-          # +0` plus vitest stack the reader has to click into the run log
-          # to decipher. Mapping: results-*.json's testResults[].name basename
-          # like `ephemeral-100w-fresh-aeneid.test.ts` strips to label
-          # `100w-fresh-aeneid` which matches the test's writePerfStats label.
+          # the per-wallet failure reasons inline ("99/100 succeeded, 1
+          # failed: <reason>") instead of only the vitest stack a reviewer
+          # has to click into the run log to decipher. Mapping: strip the
+          # `ephemeral-` prefix and `.test.ts` suffix from the test file
+          # basename to derive the perf-stats label.
           aggregate_failures() {
             # Build a {label -> perf-stats} map once so the inner jq can
             # look up the matching per-wallet failure rows for each

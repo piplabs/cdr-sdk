@@ -7,19 +7,12 @@ import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
 
 /**
- * Wraps `publicClient.waitForTransactionReceipt` with parameters tuned for
- * public RPC endpoints (e.g. `https://aeneid.storyrpc.io`) where receipt
- * propagation can lag block production by tens of seconds for a small tail
- * of txs. Viem's defaults (`timeout: 180_000`, `retryCount: 6`) are tuned
- * for a directly-connected node; on a public RPC the 180s overall window
- * occasionally fires on a tx that DID land on chain — the receipt just
- * hadn't surfaced yet (e.g. cdr-sdk run 26379164817, wallet idx=29: tx
- * 0x914c3c... succeeded in block 0x11d2547 but `waitForTransactionReceipt`
- * gave up first, failing 1/100 wallets in 100w-fresh-aeneid).
- *
- * Bumping `timeout` to 5 min covers any realistic propagation tail and
- * `retryCount: 30` widens the transient-HTTP-error tolerance; the SDK
- * still surfaces a real receipt error if the tx genuinely failed.
+ * `publicClient.waitForTransactionReceipt` with `timeout` widened to 5 min
+ * for public-RPC endpoints whose `eth_getTransactionReceipt` can lag block
+ * production by tens of seconds (viem default `timeout: 180_000` is too
+ * tight for the tail). Test code has a mirror in
+ * `packages/sdk/__integration__/_rpc-resilience.ts`; the duplication is
+ * intentional — the SDK shouldn't take a dependency on test-only files.
  */
 async function waitForReceiptResilient(publicClient: PublicClient, hash: Hash) {
   return publicClient.waitForTransactionReceipt({

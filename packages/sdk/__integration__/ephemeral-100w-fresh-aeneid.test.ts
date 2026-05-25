@@ -53,7 +53,7 @@ import {
   statsOf,
   writePerfStats,
 } from "./_helpers.js";
-import { pLimit, resilientHttp } from "./_rpc-resilience.js";
+import { pLimit, resilientHttp, withAeneidFlakeRetry } from "./_rpc-resilience.js";
 
 const WALLET_COUNT = 100;
 const CYCLES_PER_WALLET = 1; // upload + access
@@ -234,43 +234,47 @@ describe.skipIf(skipUnlessSuite("default") || NETWORK !== "aeneid")(
         const start = Date.now();
         const results = await Promise.allSettled(
           wallets.map((w) =>
-            limit(async () => {
-              const client = makeWalletClient(w);
+            limit(() =>
+              // Tolerate the two known aeneid public-pool consistency
+              // bugs (see withAeneidFlakeRetry doc); each retry re-runs
+              // the full upload→access cycle, which costs at most ~0.24
+              // IP — well under the `safetyMultiplier: 3` fund headroom.
+              withAeneidFlakeRetry(async () => {
+                const client = makeWalletClient(w);
+                const dataKey = crypto.getRandomValues(new Uint8Array(32));
+                const globalPubKey = await client.observer.getGlobalPubKey();
 
-              // ----- per-wallet sequential: upload, then read -----
-              const dataKey = crypto.getRandomValues(new Uint8Array(32));
-              const globalPubKey = await client.observer.getGlobalPubKey();
+                const tUploadStart = Date.now();
+                const upload = await client.uploader.uploadCDR({
+                  dataKey,
+                  globalPubKey,
+                  updatable: false,
+                  writeConditionAddr: openCondition,
+                  readConditionAddr: openCondition,
+                  writeConditionData: "0x",
+                  readConditionData: "0x",
+                  accessAuxData: "0x",
+                });
+                const uploadMs = Date.now() - tUploadStart;
 
-              const tUploadStart = Date.now();
-              const upload = await client.uploader.uploadCDR({
-                dataKey,
-                globalPubKey,
-                updatable: false,
-                writeConditionAddr: openCondition,
-                readConditionAddr: openCondition,
-                writeConditionData: "0x",
-                readConditionData: "0x",
-                accessAuxData: "0x",
-              });
-              const uploadMs = Date.now() - tUploadStart;
+                const tAccessStart = Date.now();
+                const access = await client.consumer.accessCDR({
+                  uuid: upload.uuid,
+                  accessAuxData: "0x",
+                  timeoutMs: ACCESS_TIMEOUT_MS,
+                });
+                const accessMs = Date.now() - tAccessStart;
 
-              const tAccessStart = Date.now();
-              const access = await client.consumer.accessCDR({
-                uuid: upload.uuid,
-                accessAuxData: "0x",
-                timeoutMs: ACCESS_TIMEOUT_MS,
-              });
-              const accessMs = Date.now() - tAccessStart;
-
-              return {
-                address: w.address,
-                uuid: upload.uuid,
-                uploadMs,
-                accessMs,
-                expected: dataKey,
-                recovered: access.dataKey,
-              };
-            }),
+                return {
+                  address: w.address,
+                  uuid: upload.uuid,
+                  uploadMs,
+                  accessMs,
+                  expected: dataKey,
+                  recovered: access.dataKey,
+                };
+              }),
+            ),
           ),
         );
 
