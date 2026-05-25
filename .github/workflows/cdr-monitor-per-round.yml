@@ -15,22 +15,27 @@ run-name: cdr-monitor-aeneid${{ inputs.force == true && ' (force)' || '' }}
 #                            │               integration.yml on aeneid/default
 #                            │
 #                            └─ Compares Story-API /dkg/latest_active.round
-#                               against repo variables (LAST_SEEN_AENEID_*).
-#                               Bumps the variables only when fire-decision
-#                               is positive, so a transient API outage
-#                               doesn't lose round-edge detection.
+#                               against the cached state.json from the last
+#                               watcher run. Re-saves the cache only when
+#                               fire-decision is positive, so a transient
+#                               API outage doesn't lose round-edge detection.
 #
-# State (repo variables, mutable):
-#   LAST_SEEN_AENEID_ROUND        — last round we fired a test against
-#   LAST_SEEN_AENEID_GPK_PREFIX   — 20-char GPK prefix; changes signal a
-#                                   chain reset (round id will drop back
-#                                   to 1 but the GPK won't match the old)
+# State (actions/cache, JSON blob):
+#   ./state.json = {round, gpk} — round we last fired a test against and
+#                                 the 20-char GPK prefix at the time.
+#                                 A GPK change paired with a round drop
+#                                 signals a chain reset (the round id
+#                                 won't match the old chain either).
 #
-# Why GitHub Variables (over commits / artifacts / external KV):
-#   - mutable, no commit-log pollution
-#   - readable cross-run via `gh variable get` with default GITHUB_TOKEN
-#     when `permissions: actions: write` is granted
-#   - no extra infra needed
+# Why actions/cache (over repo variables / commits / external KV):
+#   - works with the default GITHUB_TOKEN; no repo-settings change, no
+#     PAT (repo variables route 403'd on cdr-sdk because the workflow
+#     permissions setting defaults to read-only — see PR #111 run
+#     26388392700)
+#   - state file is tiny (~50 B), GitHub's 10 GB cache budget is
+#     effectively unlimited for this use case
+#   - cache save is gated on should_test=true so we only write a new
+#     entry when state changes, keeping LRU eviction healthy
 #
 # Slack secret required: CDR_SLACK_WEBHOOK_URL (incoming webhook URL for
 # the CDR channel). Without it the notify job will fail visibly so the
@@ -51,9 +56,6 @@ on:
 
 permissions:
   contents: read
-  # `actions: write` is required for `gh variable set/get` against repo
-  # variables via the default GITHUB_TOKEN.
-  actions: write
 
 concurrency:
   # Serialize monitor runs so two cron firings can't both decide to test
@@ -74,6 +76,28 @@ jobs:
       chain_reset: ${{ steps.compare.outputs.chain_reset }}
       forced: ${{ steps.compare.outputs.forced }}
     steps:
+      # State storage: a tiny `./state.json` file ({round, gpk}) shared
+      # across watcher runs via actions/cache. Picked over repo variables
+      # (the obvious choice) because `gh variable set` against the default
+      # GITHUB_TOKEN requires the repo-wide "Workflow permissions" to be
+      # toggled to "Read and write" — see PR #111 run 26388392700 which
+      # 403'd. Cache works with no repo-settings change, no PAT, no
+      # cross-workflow API access. Cache keys:
+      #   - `key` is unique per run so save always lands (no exact-key hit)
+      #   - `restore-keys` is the shared prefix; restore picks the most
+      #     recently saved entry under that prefix on each fresh run
+      # `actions/cache/save@v4` is gated on `should_test == 'true'` so we
+      # only commit a new cache entry when state actually changed, keeping
+      # the repo's 10 GB cache budget from filling with redundant copies.
+      - name: Restore last-seen state from cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ./state.json
+          key: cdr-monitor-aeneid-state-${{ github.run_id }}
+          restore-keys: |
+            cdr-monitor-aeneid-state-
+
       - name: Query aeneid /dkg/latest_active
         id: query
         # Story-API is HTTP-only (same host integration.yml's CDR_API_URL
@@ -103,25 +127,29 @@ jobs:
           echo "round=$round" >> "$GITHUB_OUTPUT"
           echo "gpk=$gpk" >> "$GITHUB_OUTPUT"
 
-      - name: Read last seen round + GPK from repo variables
+      - name: Read last seen round + GPK from cache
         id: last
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # `gh variable get` exits non-zero when the variable doesn't
-          # exist yet (first run after deployment) — fall back to zero
-          # so the first watcher tick treats the current round as new.
-          last_round=$(gh variable get LAST_SEEN_AENEID_ROUND --repo "$GITHUB_REPOSITORY" 2>/dev/null || echo "0")
-          last_gpk=$(gh variable get LAST_SEEN_AENEID_GPK_PREFIX --repo "$GITHUB_REPOSITORY" 2>/dev/null || echo "")
-          # Same validation as the live-query step: if the variable was
-          # tampered with through the Actions Variables UI, refuse to
-          # use it. Empty `last_gpk` is allowed (first-run sentinel).
+          # `./state.json` is absent on the very first run (no prior
+          # cache to restore) — fall back to zero/empty so the first
+          # watcher tick treats the current round as new.
+          if [ -f ./state.json ]; then
+            last_round=$(jq -r '.round // "0"' ./state.json)
+            last_gpk=$(jq -r '.gpk // ""' ./state.json)
+          else
+            last_round="0"
+            last_gpk=""
+          fi
+          # Same validation as the live-query step: if the cache entry
+          # was malformed (e.g. truncated write from a previous run),
+          # refuse to use it. Empty `last_gpk` is allowed (first-run
+          # sentinel).
           if ! [[ "$last_round" =~ ^[0-9]+$ ]]; then
-            echo "::error::LAST_SEEN_AENEID_ROUND=$last_round is not an integer"; exit 1
+            echo "::error::cached last_round=$last_round is not an integer"; exit 1
           fi
           if [ -n "$last_gpk" ] && ! [[ "$last_gpk" =~ ^[A-Za-z0-9+/=]{20}$ ]]; then
-            echo "::error::LAST_SEEN_AENEID_GPK_PREFIX has unexpected shape"; exit 1
+            echo "::error::cached last_gpk has unexpected shape"; exit 1
           fi
           echo "last_round=$last_round" >> "$GITHUB_OUTPUT"
           echo "last_gpk=$last_gpk" >> "$GITHUB_OUTPUT"
@@ -172,19 +200,30 @@ jobs:
             echo "forced=$forced"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Bump repo variables when firing
+      - name: Write new state.json when firing
         if: steps.compare.outputs.should_test == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CUR_ROUND: ${{ steps.query.outputs.round }}
           CUR_GPK: ${{ steps.query.outputs.gpk }}
         run: |
           set -euo pipefail
-          # Update BEFORE the test fires so concurrent cron firings see
-          # the new state and don't re-fire on the same round. `gh
-          # variable set` is idempotent (creates or updates).
-          gh variable set LAST_SEEN_AENEID_ROUND --body "$CUR_ROUND" --repo "$GITHUB_REPOSITORY"
-          gh variable set LAST_SEEN_AENEID_GPK_PREFIX --body "$CUR_GPK" --repo "$GITHUB_REPOSITORY"
+          # File is committed to cache by the next step. Concurrent
+          # cron firings are still serialized by the concurrency group
+          # above, so there's no "two writers, last one wins" race —
+          # the next tick reads the post-write state via cache restore.
+          jq -nc --arg round "$CUR_ROUND" --arg gpk "$CUR_GPK" \
+            '{round: $round, gpk: $gpk}' > ./state.json
+          echo "Wrote ./state.json:"; cat ./state.json
+
+      - name: Save new state to cache
+        if: steps.compare.outputs.should_test == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ./state.json
+          # Save under the run-unique key the restore step looked for;
+          # the next watcher's restore-keys prefix match will find this
+          # as the most recent entry.
+          key: cdr-monitor-aeneid-state-${{ github.run_id }}
 
   test:
     needs: watch
