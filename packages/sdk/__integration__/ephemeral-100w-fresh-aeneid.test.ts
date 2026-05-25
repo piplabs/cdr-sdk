@@ -143,6 +143,7 @@ describe.skipIf(skipUnlessSuite("default") || NETWORK !== "aeneid")(
       wallClockMs: number;
       uploadLats: number[];
       accessLats: number[];
+      failedReasons: Array<{ idx: number; reason: string }>;
     } | null = null;
 
     beforeAll(async () => {
@@ -211,6 +212,8 @@ describe.skipIf(skipUnlessSuite("default") || NETWORK !== "aeneid")(
           wall_clock_ms: perfBuffer.wallClockMs,
           accessMs: statsOf(perfBuffer.accessLats),
           uploadMs: statsOf(perfBuffer.uploadLats),
+          accessSharedMs: null,
+          accessFreshMs: null,
           tickMs: null,
           refund: {
             funded_wei: totalFundedWei.toString(),
@@ -219,6 +222,7 @@ describe.skipIf(skipUnlessSuite("default") || NETWORK !== "aeneid")(
             failed_sweeps: refund.failedRefunds,
           },
           extra: { maxInflight: MAX_INFLIGHT },
+          failedReasons: perfBuffer.failedReasons,
         });
       }
     }, 5 * 60 * 1000);
@@ -312,6 +316,7 @@ describe.skipIf(skipUnlessSuite("default") || NETWORK !== "aeneid")(
           wallClockMs: totalMs,
           uploadLats,
           accessLats,
+          failedReasons: failed.slice(0, 10),
         };
 
         expect(failed.length, `${failed.length} wallets failed`).toBe(0);

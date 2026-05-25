@@ -7,7 +7,27 @@
  * adding retry / throttling there would mask real validator-side issues.
  */
 
-import { http } from "viem";
+import { http, type Hash, type PublicClient } from "viem";
+
+/**
+ * `publicClient.waitForTransactionReceipt` with parameters tuned for
+ * public RPC endpoints (default viem `timeout: 180_000` is too tight when
+ * receipt propagation lags block production — see cdr-sdk run
+ * 26379164817, wallet idx=29: tx 0x914c3c... landed in block 0x11d2547
+ * but viem gave up first, failing 1/100 in 100w-fresh-aeneid). Bumping
+ * `timeout` to 5 min covers any realistic public-RPC tail.
+ */
+export async function waitForReceiptResilient(
+  publicClient: PublicClient,
+  hash: Hash,
+) {
+  return publicClient.waitForTransactionReceipt({
+    hash,
+    timeout: 5 * 60 * 1000,
+    pollingInterval: 2000,
+    retryCount: 30,
+  });
+}
 
 /**
  * `http()` with retry budget tuned for public-RPC throttling.

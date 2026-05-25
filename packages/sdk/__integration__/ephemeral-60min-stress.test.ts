@@ -365,6 +365,9 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
               100
             ).toFixed(2),
           },
+          // Stress reports failures per-cycle in `extra.failed_cycles`,
+          // not per-wallet; there's no per-failure reason to surface.
+          failedReasons: null,
         });
       }
     }, 10 * 60 * 1000);

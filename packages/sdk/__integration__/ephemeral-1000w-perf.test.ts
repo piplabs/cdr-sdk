@@ -175,6 +175,7 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only") || NETWOR
       failed: number;
       wallClockMs: number;
       accessLats: number[];
+      failedReasons: Array<{ idx: number; reason: string }>;
     } | null = null;
 
     beforeAll(async () => {
@@ -260,6 +261,8 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only") || NETWOR
           wall_clock_ms: perfBuffer.wallClockMs,
           accessMs: statsOf(perfBuffer.accessLats),
           uploadMs: null,
+          accessSharedMs: null,
+          accessFreshMs: null,
           tickMs: null,
           refund: {
             funded_wei: totalFundedWei.toString(),
@@ -268,6 +271,7 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only") || NETWOR
             failed_sweeps: refund.failedRefunds,
           },
           extra: null,
+          failedReasons: perfBuffer.failedReasons,
         });
       }
     }, 15 * 60 * 1000);
@@ -338,6 +342,7 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only") || NETWOR
           failed: failed.length,
           wallClockMs: totalMs,
           accessLats: lats,
+          failedReasons: failed.slice(0, 10),
         };
 
         expect(failed.length, `${failed.length} wallets failed accessCDR`).toBe(0);

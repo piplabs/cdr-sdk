@@ -188,6 +188,14 @@ export interface PerfStatsFile {
   } | null;
   /** Optional: stress-style derived counters that don't fit the per-wallet model. */
   extra: Record<string, number | string> | null;
+  /**
+   * Per-wallet failure reasons, capped at 10 entries to keep the JSON
+   * small. The workflow summary renders these as a table so a reviewer
+   * can see why N of M wallets failed without clicking into the raw
+   * vitest stack — the assertion `expect(failed.length).toBe(0)` alone
+   * tells you the count but not the cause.
+   */
+  failedReasons: Array<{ idx: number; reason: string }> | null;
 }
 
 /**
