@@ -28,6 +28,20 @@ on:
           - 1000-wallet-performance-devnet-only
           - 1H-stress-devnet-only
         default: default
+  # Reusable-workflow entrypoint for cdr-monitor-per-round.yml. Strings (not
+  # `choice`) because `workflow_call` doesn't support choice — callers MUST
+  # pass values from the same set as workflow_dispatch's options or the
+  # downstream `case "$SUITE"` in `prepare` will exit 1. The caller reads
+  # this workflow's outcome via `needs.<job>.result` (automatic), so no
+  # explicit `outputs:` block is needed here.
+  workflow_call:
+    inputs:
+      network:
+        type: string
+        required: true
+      test_suite:
+        type: string
+        required: true
   pull_request:
     branches: [main]
     paths:
@@ -61,7 +75,11 @@ jobs:
       - id: resolve
         name: Resolve effective inputs
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          # workflow_call (from cdr-monitor-per-round.yml) carries the same
+          # input shape as workflow_dispatch, so the two paths are treated
+          # identically. Only pull_request falls back to the safe defaults.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
+             || [ "${{ github.event_name }}" = "workflow_call" ]; then
             NETWORK="${{ inputs.network }}"
             SUITE="${{ inputs.test_suite }}"
           else
