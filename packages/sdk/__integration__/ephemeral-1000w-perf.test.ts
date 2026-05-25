@@ -34,7 +34,6 @@ import {
   createWalletClient,
   formatEther,
   http,
-  parseEther,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { CDRClient, initWasm } from "../src/index.js";
@@ -46,6 +45,7 @@ import {
   refundWallets,
 } from "./_ephemeral-wallets.js";
 import {
+  accessFeeCost,
   formatMs,
   logCase,
   max as arrMax,
@@ -53,6 +53,7 @@ import {
   p50,
   p95,
   p99,
+  sizeFundAndReport,
   statsOf,
   writePerfStats,
 } from "./_helpers.js";
@@ -61,7 +62,8 @@ const WALLET_COUNT = 1000;
 // 200-wallet batch keeps Multicall3.aggregate3Value tx-gas ≲ 12M, well
 // under Story's ~30M block gas limit on both DevNet + Aeneid.
 const FUND_BATCH_SIZE = 200;
-const PER_WALLET_FUND = parseEther("0.05");
+const CYCLES_PER_WALLET = 1; // 1 accessCDR per wallet, no upload
+const FUND_SAFETY_MULTIPLIER = 3;
 const ACCESS_TIMEOUT_MS = 300_000;
 
 const API_URL = process.env.CDR_API_URL;
@@ -166,6 +168,7 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only") || NETWOR
     let sharedVaultUuid: number;
     let sharedDataKey: Uint8Array;
     let wallets: EphemeralWallet[];
+    let perWalletFund = 0n;
     let totalFundedWei = 0n;
     let perfBuffer: {
       fulfilled: number;
@@ -181,6 +184,18 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only") || NETWOR
       funderWallet = f.walletClient;
       funderClient = f.client;
       funderAddress = privateKeyToAccount(FUNDER_KEY!).address;
+
+      // Read-only suite: each wallet pays readFee only. Size fund from
+      // live readFee so we don't have to rotate this hard-coded number
+      // every time chain fees move.
+      perWalletFund = await sizeFundAndReport({
+        label: "1000w-perf",
+        network: NETWORK,
+        publicClient: funderPublic,
+        perCycleCost: accessFeeCost,
+        cyclesPerWallet: CYCLES_PER_WALLET,
+        safetyMultiplier: FUND_SAFETY_MULTIPLIER,
+      });
 
       openCondition = await deployOpenCondition(funderPublic, funderWallet);
       logCase("openCondition", openCondition);
@@ -206,14 +221,14 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only") || NETWOR
         funderPublic,
         funderWallet,
         wallets,
-        PER_WALLET_FUND,
+        perWalletFund,
         FUND_BATCH_SIZE,
       );
       logCase("multicall3 batched fund", {
         wallets: wallets.length,
         batchSize: FUND_BATCH_SIZE,
         batches: Math.ceil(wallets.length / FUND_BATCH_SIZE),
-        perWallet: formatEther(PER_WALLET_FUND),
+        perWallet: formatEther(perWalletFund),
         totalIP: formatEther(totalFundedWei),
         elapsedMs: formatMs(Date.now() - fundStart),
       });
