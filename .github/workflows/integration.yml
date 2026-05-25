@@ -28,7 +28,7 @@ on:
           - 1000-wallet-performance-devnet-only
           - 1H-stress-devnet-only
         default: default
-  # Reusable-workflow entrypoint for cdr-sanity-per-round.yml. Strings (not
+  # Reusable-workflow entrypoint for cdr-monitor-per-round.yml. Strings (not
   # `choice`) because `workflow_call` doesn't support choice — callers MUST
   # pass values from the same set as workflow_dispatch's options or the
   # downstream `case "$SUITE"` in `prepare` will exit 1. The caller reads
@@ -75,7 +75,7 @@ jobs:
       - id: resolve
         name: Resolve effective inputs
         run: |
-          # workflow_call (from cdr-sanity-per-round.yml) carries the same
+          # workflow_call (from cdr-monitor-per-round.yml) carries the same
           # input shape as workflow_dispatch, so the two paths are treated
           # identically. Only pull_request falls back to the safe defaults.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] \

@@ -1,6 +1,6 @@
-name: CDR sanity per active round (aeneid)
+name: CDR monitor per active round (aeneid)
 
-run-name: cdr-sanity-aeneid${{ inputs.force == true && ' (force)' || '' }}
+run-name: cdr-monitor-aeneid${{ inputs.force == true && ' (force)' || '' }}
 
 # Cron-fired watcher that detects new DKG active rounds on aeneid and
 # fires the existing integration-aeneid-default suite against each one,
@@ -56,10 +56,10 @@ permissions:
   actions: write
 
 concurrency:
-  # Serialize sanity runs so two cron firings can't both decide to test
+  # Serialize monitor runs so two cron firings can't both decide to test
   # against the same round. cancel-in-progress=false: don't kill an
   # in-flight test; queue the next watcher behind it.
-  group: cdr-sanity-aeneid
+  group: cdr-monitor-aeneid
   cancel-in-progress: false
 
 jobs:
@@ -213,7 +213,7 @@ jobs:
             *)         emoji="❓"; status="$CONCLUSION" ;;
           esac
 
-          headline="$emoji CDR sanity (aeneid) — round $CUR_ROUND $status"
+          headline="$emoji CDR monitor (aeneid) — round $CUR_ROUND $status"
           subline="trigger: $trigger"
 
           payload=$(jq -nc \
