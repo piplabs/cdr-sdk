@@ -1,0 +1,249 @@
+name: CDR sanity per active round (aeneid)
+
+run-name: cdr-sanity-aeneid${{ inputs.force == true && ' (force)' || '' }}
+
+# Cron-fired watcher that detects new DKG active rounds on aeneid and
+# fires the existing integration-aeneid-default suite against each one,
+# then posts the result to the CDR Slack channel.
+#
+# Architecture:
+#
+#   schedule (*/5 min) ─┐
+#   workflow_dispatch ──┴─→ [watch] ──→ [test] ──→ [notify]
+#                            │            │           │
+#                            │            └─ reusable workflow_call to
+#                            │               integration.yml on aeneid/default
+#                            │
+#                            └─ Compares Story-API /dkg/latest_active.round
+#                               against repo variables (LAST_SEEN_AENEID_*).
+#                               Bumps the variables only when fire-decision
+#                               is positive, so a transient API outage
+#                               doesn't lose round-edge detection.
+#
+# State (repo variables, mutable):
+#   LAST_SEEN_AENEID_ROUND        — last round we fired a test against
+#   LAST_SEEN_AENEID_GPK_PREFIX   — 20-char GPK prefix; changes signal a
+#                                   chain reset (round id will drop back
+#                                   to 1 but the GPK won't match the old)
+#
+# Why GitHub Variables (over commits / artifacts / external KV):
+#   - mutable, no commit-log pollution
+#   - readable cross-run via `gh variable get` with default GITHUB_TOKEN
+#     when `permissions: actions: write` is granted
+#   - no extra infra needed
+#
+# Slack secret required: CDR_SLACK_WEBHOOK_URL (incoming webhook URL for
+# the CDR channel). Without it the notify job will fail visibly so the
+# operator knows to configure it.
+
+on:
+  schedule:
+    # Every 5 min (the finest cron granularity GH Actions offers). Aeneid
+    # DKG rounds turn over far slower (typically tens of minutes per
+    # round), so most cron firings will detect no change and exit cheap.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force test even if no new round detected"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  # `actions: write` is required for `gh variable set/get` against repo
+  # variables via the default GITHUB_TOKEN.
+  actions: write
+
+concurrency:
+  # Serialize sanity runs so two cron firings can't both decide to test
+  # against the same round. cancel-in-progress=false: don't kill an
+  # in-flight test; queue the next watcher behind it.
+  group: cdr-sanity-aeneid
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_test: ${{ steps.compare.outputs.should_test }}
+      cur_round: ${{ steps.query.outputs.round }}
+      cur_gpk: ${{ steps.query.outputs.gpk }}
+      last_round: ${{ steps.last.outputs.last_round }}
+      chain_reset: ${{ steps.compare.outputs.chain_reset }}
+      forced: ${{ steps.compare.outputs.forced }}
+    steps:
+      - name: Query aeneid /dkg/latest_active
+        id: query
+        run: |
+          set -euo pipefail
+          # Aeneid Story-API REST gateway. Same host as integration.yml's
+          # `CDR_API_URL` on aeneid (confirmed routable from GH Actions
+          # egress; see integration.yml's "Configure network env" step).
+          API=http://172.192.41.96:1317
+          resp=$(curl -fsS --max-time 10 "$API/dkg/latest_active")
+          echo "$resp" | jq '.msg.network | {round, total, threshold, stage, start_block_height, gpk: (.global_public_key[:20])}'
+          round=$(echo "$resp" | jq -r '.msg.network.round')
+          gpk=$(echo "$resp" | jq -r '.msg.network.global_public_key[:20]')
+          if [ -z "$round" ] || [ "$round" = "null" ]; then
+            echo "::error::could not parse active round from $API/dkg/latest_active"
+            exit 1
+          fi
+          echo "round=$round" >> "$GITHUB_OUTPUT"
+          echo "gpk=$gpk" >> "$GITHUB_OUTPUT"
+
+      - name: Read last seen round + GPK from repo variables
+        id: last
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # `gh variable get` exits non-zero when the variable doesn't
+          # exist yet (first run after deployment) — fall back to zero
+          # so the first watcher tick treats the current round as new.
+          last_round=$(gh variable get LAST_SEEN_AENEID_ROUND --repo "$GITHUB_REPOSITORY" 2>/dev/null || echo "0")
+          last_gpk=$(gh variable get LAST_SEEN_AENEID_GPK_PREFIX --repo "$GITHUB_REPOSITORY" 2>/dev/null || echo "")
+          echo "last_round=$last_round" >> "$GITHUB_OUTPUT"
+          echo "last_gpk=$last_gpk" >> "$GITHUB_OUTPUT"
+          echo "Last seen: round=$last_round gpk=$last_gpk"
+
+      - name: Compare + decide whether to fire test
+        id: compare
+        run: |
+          set -euo pipefail
+          should_test="false"
+          chain_reset="false"
+          forced="false"
+          cur="${{ steps.query.outputs.round }}"
+          last="${{ steps.last.outputs.last_round }}"
+          cur_gpk="${{ steps.query.outputs.gpk }}"
+          last_gpk="${{ steps.last.outputs.last_gpk }}"
+
+          if [ "${{ inputs.force }}" = "true" ]; then
+            should_test="true"
+            forced="true"
+            echo "→ force=true; firing regardless of round delta"
+          elif [ -n "$last_gpk" ] && [ "$cur_gpk" != "$last_gpk" ]; then
+            should_test="true"
+            chain_reset="true"
+            echo "→ chain reset detected (gpk $last_gpk → $cur_gpk)"
+          elif [ "$cur" -gt "$last" ]; then
+            should_test="true"
+            echo "→ new round detected (round $last → $cur)"
+          else
+            echo "→ no change (round=$cur unchanged); skip test"
+          fi
+
+          echo "should_test=$should_test" >> "$GITHUB_OUTPUT"
+          echo "chain_reset=$chain_reset" >> "$GITHUB_OUTPUT"
+          echo "forced=$forced" >> "$GITHUB_OUTPUT"
+
+      - name: Bump repo variables when firing
+        if: steps.compare.outputs.should_test == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Update BEFORE the test fires so concurrent cron firings see
+          # the new state and don't re-fire on the same round.
+          # `gh variable set` is idempotent (creates or updates).
+          gh variable set LAST_SEEN_AENEID_ROUND \
+            --body "${{ steps.query.outputs.round }}" \
+            --repo "$GITHUB_REPOSITORY"
+          gh variable set LAST_SEEN_AENEID_GPK_PREFIX \
+            --body "${{ steps.query.outputs.gpk }}" \
+            --repo "$GITHUB_REPOSITORY"
+
+  test:
+    needs: watch
+    if: needs.watch.outputs.should_test == 'true'
+    # Reusable-workflow call into integration.yml (NOT `gh workflow run` —
+    # the latter, when invoked with the default GITHUB_TOKEN, silently
+    # fails to trigger downstream workflow runs as a recursion guard).
+    # workflow_call sidesteps that by running integration.yml as part of
+    # this run's job graph; the same Actions UI shows both stages.
+    uses: ./.github/workflows/integration.yml
+    with:
+      network: aeneid
+      test_suite: default
+    secrets: inherit
+
+  notify:
+    needs: [watch, test]
+    # `always()` + the should_test gate together: post regardless of test
+    # success/failure, but only when a test actually ran. A pure-skip
+    # watch tick is silent.
+    if: always() && needs.watch.outputs.should_test == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Build Slack payload + post
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.CDR_SLACK_WEBHOOK_URL }}
+          CONCLUSION: ${{ needs.test.result }}
+          CUR_ROUND: ${{ needs.watch.outputs.cur_round }}
+          LAST_ROUND: ${{ needs.watch.outputs.last_round }}
+          CUR_GPK: ${{ needs.watch.outputs.cur_gpk }}
+          CHAIN_RESET: ${{ needs.watch.outputs.chain_reset }}
+          FORCED: ${{ needs.watch.outputs.forced }}
+          RUN_URL: ${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "::error::CDR_SLACK_WEBHOOK_URL secret is not set; cannot post"
+            echo "::notice::Add the incoming-webhook URL via `gh secret set CDR_SLACK_WEBHOOK_URL`"
+            exit 1
+          fi
+
+          # Headline emoji + line built from the resolved trigger reason
+          # and the test outcome.
+          if [ "$CHAIN_RESET" = "true" ]; then
+            trigger="chain reset (gpk → ${CUR_GPK})"
+          elif [ "$FORCED" = "true" ]; then
+            trigger="manual force"
+          else
+            trigger="round $LAST_ROUND → $CUR_ROUND"
+          fi
+
+          case "$CONCLUSION" in
+            success)   emoji="✅"; status="passed" ;;
+            failure)   emoji="❌"; status="FAILED" ;;
+            cancelled) emoji="⚠️"; status="cancelled" ;;
+            *)         emoji="❓"; status="$CONCLUSION" ;;
+          esac
+
+          headline="$emoji CDR sanity (aeneid) — round $CUR_ROUND $status"
+          subline="trigger: $trigger"
+
+          payload=$(jq -nc \
+            --arg headline "$headline" \
+            --arg subline "$subline" \
+            --arg url "$RUN_URL" \
+            --arg round "$CUR_ROUND" \
+            --arg gpk "$CUR_GPK" \
+            --arg status "$CONCLUSION" \
+            '{
+              text: $headline,
+              blocks: [
+                {type: "section", text: {type: "mrkdwn", text: ("*" + $headline + "*\n_" + $subline + "_")}},
+                {type: "section", fields: [
+                  {type: "mrkdwn", text: ("*Active round*\n" + $round)},
+                  {type: "mrkdwn", text: ("*GPK prefix*\n`" + $gpk + "`")},
+                  {type: "mrkdwn", text: ("*Test outcome*\n" + $status)},
+                  {type: "mrkdwn", text: ("*Suite*\naeneid / default (~13 min)")}
+                ]},
+                {type: "actions", elements: [
+                  {type: "button", text: {type: "plain_text", text: "View workflow run"}, url: $url}
+                ]}
+              ]
+            }')
+
+          # Print payload for debugging (Slack webhook responses are
+          # opaque on failure; visible jq output helps).
+          echo "$payload" | jq .
+
+          curl -fsS -X POST \
+            -H 'Content-Type: application/json' \
+            -d "$payload" \
+            "$SLACK_WEBHOOK_URL"
