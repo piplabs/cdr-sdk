@@ -76,19 +76,29 @@ jobs:
     steps:
       - name: Query aeneid /dkg/latest_active
         id: query
+        # Story-API is HTTP-only (same host integration.yml's CDR_API_URL
+        # uses on aeneid). The strict regex validation below limits the
+        # blast radius of a hostile / corrupted response: any value that
+        # doesn't match the expected shape exits the step instead of
+        # flowing into downstream shells. Combined with the env-var
+        # pass-through in later steps this closes the
+        # `${{ steps.x.outputs.y }}` → bash injection vector flagged on
+        # PR #111.
         run: |
           set -euo pipefail
-          # Aeneid Story-API REST gateway. Same host as integration.yml's
-          # `CDR_API_URL` on aeneid (confirmed routable from GH Actions
-          # egress; see integration.yml's "Configure network env" step).
           API=http://172.192.41.96:1317
           resp=$(curl -fsS --max-time 10 "$API/dkg/latest_active")
           echo "$resp" | jq '.msg.network | {round, total, threshold, stage, start_block_height, gpk: (.global_public_key[:20])}'
           round=$(echo "$resp" | jq -r '.msg.network.round')
           gpk=$(echo "$resp" | jq -r '.msg.network.global_public_key[:20]')
-          if [ -z "$round" ] || [ "$round" = "null" ]; then
-            echo "::error::could not parse active round from $API/dkg/latest_active"
-            exit 1
+          # round must be a positive integer; gpk must be exactly 20 chars
+          # of the standard base64 alphabet (the 20-char prefix of the
+          # network's globalPublicKey field, base64-encoded server-side).
+          if ! [[ "$round" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::round=$round is not a positive integer"; exit 1
+          fi
+          if ! [[ "$gpk" =~ ^[A-Za-z0-9+/=]{20}$ ]]; then
+            echo "::error::gpk prefix has unexpected shape: $gpk"; exit 1
           fi
           echo "round=$round" >> "$GITHUB_OUTPUT"
           echo "gpk=$gpk" >> "$GITHUB_OUTPUT"
@@ -104,56 +114,66 @@ jobs:
           # so the first watcher tick treats the current round as new.
           last_round=$(gh variable get LAST_SEEN_AENEID_ROUND --repo "$GITHUB_REPOSITORY" 2>/dev/null || echo "0")
           last_gpk=$(gh variable get LAST_SEEN_AENEID_GPK_PREFIX --repo "$GITHUB_REPOSITORY" 2>/dev/null || echo "")
+          # Same validation as the live-query step: if the variable was
+          # tampered with through the Actions Variables UI, refuse to
+          # use it. Empty `last_gpk` is allowed (first-run sentinel).
+          if ! [[ "$last_round" =~ ^[0-9]+$ ]]; then
+            echo "::error::LAST_SEEN_AENEID_ROUND=$last_round is not an integer"; exit 1
+          fi
+          if [ -n "$last_gpk" ] && ! [[ "$last_gpk" =~ ^[A-Za-z0-9+/=]{20}$ ]]; then
+            echo "::error::LAST_SEEN_AENEID_GPK_PREFIX has unexpected shape"; exit 1
+          fi
           echo "last_round=$last_round" >> "$GITHUB_OUTPUT"
           echo "last_gpk=$last_gpk" >> "$GITHUB_OUTPUT"
           echo "Last seen: round=$last_round gpk=$last_gpk"
 
       - name: Compare + decide whether to fire test
         id: compare
+        env:
+          # Pass values through env: rather than `${{ ... }}` template
+          # interpolation so a hostile API response can't break out of
+          # the string context into bash. Even though the values are
+          # regex-validated upstream this defense-in-depth keeps any
+          # future loosening of those regexes safe by default.
+          FORCE: ${{ inputs.force }}
+          CUR_ROUND: ${{ steps.query.outputs.round }}
+          CUR_GPK: ${{ steps.query.outputs.gpk }}
+          LAST_ROUND: ${{ steps.last.outputs.last_round }}
+          LAST_GPK: ${{ steps.last.outputs.last_gpk }}
         run: |
           set -euo pipefail
-          should_test="false"
-          chain_reset="false"
-          forced="false"
-          cur="${{ steps.query.outputs.round }}"
-          last="${{ steps.last.outputs.last_round }}"
-          cur_gpk="${{ steps.query.outputs.gpk }}"
-          last_gpk="${{ steps.last.outputs.last_gpk }}"
-
-          if [ "${{ inputs.force }}" = "true" ]; then
-            should_test="true"
-            forced="true"
+          should_test="false" chain_reset="false" forced="false"
+          if [ "$FORCE" = "true" ]; then
+            should_test="true"; forced="true"
             echo "→ force=true; firing regardless of round delta"
-          elif [ -n "$last_gpk" ] && [ "$cur_gpk" != "$last_gpk" ]; then
+          elif [ -n "$LAST_GPK" ] && [ "$CUR_GPK" != "$LAST_GPK" ]; then
+            should_test="true"; chain_reset="true"
+            echo "→ chain reset detected (gpk $LAST_GPK → $CUR_GPK)"
+          elif [ "$CUR_ROUND" -gt "$LAST_ROUND" ]; then
             should_test="true"
-            chain_reset="true"
-            echo "→ chain reset detected (gpk $last_gpk → $cur_gpk)"
-          elif [ "$cur" -gt "$last" ]; then
-            should_test="true"
-            echo "→ new round detected (round $last → $cur)"
+            echo "→ new round detected (round $LAST_ROUND → $CUR_ROUND)"
           else
-            echo "→ no change (round=$cur unchanged); skip test"
+            echo "→ no change (round=$CUR_ROUND unchanged); skip test"
           fi
-
-          echo "should_test=$should_test" >> "$GITHUB_OUTPUT"
-          echo "chain_reset=$chain_reset" >> "$GITHUB_OUTPUT"
-          echo "forced=$forced" >> "$GITHUB_OUTPUT"
+          {
+            echo "should_test=$should_test"
+            echo "chain_reset=$chain_reset"
+            echo "forced=$forced"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Bump repo variables when firing
         if: steps.compare.outputs.should_test == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CUR_ROUND: ${{ steps.query.outputs.round }}
+          CUR_GPK: ${{ steps.query.outputs.gpk }}
         run: |
           set -euo pipefail
           # Update BEFORE the test fires so concurrent cron firings see
-          # the new state and don't re-fire on the same round.
-          # `gh variable set` is idempotent (creates or updates).
-          gh variable set LAST_SEEN_AENEID_ROUND \
-            --body "${{ steps.query.outputs.round }}" \
-            --repo "$GITHUB_REPOSITORY"
-          gh variable set LAST_SEEN_AENEID_GPK_PREFIX \
-            --body "${{ steps.query.outputs.gpk }}" \
-            --repo "$GITHUB_REPOSITORY"
+          # the new state and don't re-fire on the same round. `gh
+          # variable set` is idempotent (creates or updates).
+          gh variable set LAST_SEEN_AENEID_ROUND --body "$CUR_ROUND" --repo "$GITHUB_REPOSITORY"
+          gh variable set LAST_SEEN_AENEID_GPK_PREFIX --body "$CUR_GPK" --repo "$GITHUB_REPOSITORY"
 
   test:
     needs: watch
@@ -171,17 +191,24 @@ jobs:
 
   notify:
     needs: [watch, test]
-    # `always()` + the should_test gate together: post regardless of test
-    # success/failure, but only when a test actually ran. A pure-skip
-    # watch tick is silent.
-    if: always() && needs.watch.outputs.should_test == 'true'
+    # Three Slack-post conditions:
+    #   1. watch succeeded AND fired a test       — post the test outcome
+    #   2. watch itself failed (API down, etc.)   — post a watcher-health alert
+    # Skip silently when watch succeeded but decided no test was needed
+    # (`should_test=false`) — that's the normal idle path.
+    if: |
+      always() && (
+        needs.watch.outputs.should_test == 'true'
+        || needs.watch.result == 'failure'
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Build Slack payload + post
+      - name: Post Slack message
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.CDR_SLACK_WEBHOOK_URL }}
-          CONCLUSION: ${{ needs.test.result }}
+          WATCH_RESULT: ${{ needs.watch.result }}
+          TEST_RESULT: ${{ needs.test.result }}
           CUR_ROUND: ${{ needs.watch.outputs.cur_round }}
           LAST_ROUND: ${{ needs.watch.outputs.last_round }}
           CUR_GPK: ${{ needs.watch.outputs.cur_gpk }}
@@ -192,47 +219,59 @@ jobs:
           set -euo pipefail
           if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
             echo "::error::CDR_SLACK_WEBHOOK_URL secret is not set; cannot post"
-            echo "::notice::Add the incoming-webhook URL via `gh secret set CDR_SLACK_WEBHOOK_URL`"
+            echo "::notice::Add the incoming-webhook URL via 'gh secret set CDR_SLACK_WEBHOOK_URL'"
             exit 1
           fi
 
-          # Headline emoji + line built from the resolved trigger reason
-          # and the test outcome.
-          if [ "$CHAIN_RESET" = "true" ]; then
-            trigger="chain reset (gpk → ${CUR_GPK})"
-          elif [ "$FORCED" = "true" ]; then
-            trigger="manual force"
+          # Resolve {emoji, headline, subline, body} for the message
+          # shape we want to post. Three branches share the trailing
+          # jq + curl, so the payload shape stays uniform regardless of
+          # what triggered the post.
+          if [ "$WATCH_RESULT" != "success" ]; then
+            # Watcher itself broke — round detection is offline. Don't
+            # claim a CDR state we can't observe; surface the failure
+            # so the operator can investigate the workflow run.
+            emoji="🚨"
+            headline="$emoji CDR monitor (aeneid) — WATCHER FAILED"
+            subline="trigger: watcher step error (round detection offline)"
+            body=$(printf '• *Watch job result*: *%s*\n• *Last known round*: %s\n• *Suite fired*: no (watcher fault — no test attempted)' \
+              "$WATCH_RESULT" "${LAST_ROUND:-?}")
           else
-            trigger="round $LAST_ROUND → $CUR_ROUND"
+            # Normal test-outcome path. CHAIN_RESET / FORCED / new-round
+            # control the headline trigger line; CONCLUSION drives the
+            # emoji + status word.
+            case "$TEST_RESULT" in
+              success)   emoji="✅"; status="passed"    ;;
+              failure)   emoji="❌"; status="FAILED"    ;;
+              cancelled) emoji="⚠️"; status="cancelled" ;;
+              *)         emoji="❓"; status="$TEST_RESULT" ;;
+            esac
+            if [ "$CHAIN_RESET" = "true" ]; then
+              emoji="🔄"; trigger="chain reset (gpk → ${CUR_GPK})"
+            elif [ "$FORCED" = "true" ]; then
+              trigger="manual force"
+            else
+              trigger="round $LAST_ROUND → $CUR_ROUND"
+            fi
+            headline="$emoji CDR monitor (aeneid) — round $CUR_ROUND $status"
+            subline="trigger: $trigger"
+            # Slack mrkdwn bold is single `*…*` not standard `**`.
+            # Bold the outcome value (not just the label) for at-a-glance
+            # success/failure scan.
+            body=$(printf '• *Active round*: %s\n• *GPK prefix*: `%s`\n• *Test outcome*: *%s*\n• *Suite*: aeneid / default (~13 min)' \
+              "$CUR_ROUND" "$CUR_GPK" "$TEST_RESULT")
           fi
-
-          case "$CONCLUSION" in
-            success)   emoji="✅"; status="passed" ;;
-            failure)   emoji="❌"; status="FAILED" ;;
-            cancelled) emoji="⚠️"; status="cancelled" ;;
-            *)         emoji="❓"; status="$CONCLUSION" ;;
-          esac
-
-          headline="$emoji CDR monitor (aeneid) — round $CUR_ROUND $status"
-          subline="trigger: $trigger"
 
           payload=$(jq -nc \
             --arg headline "$headline" \
             --arg subline "$subline" \
+            --arg body "$body" \
             --arg url "$RUN_URL" \
-            --arg round "$CUR_ROUND" \
-            --arg gpk "$CUR_GPK" \
-            --arg status "$CONCLUSION" \
             '{
               text: $headline,
               blocks: [
                 {type: "section", text: {type: "mrkdwn", text: ("*" + $headline + "*\n_" + $subline + "_")}},
-                {type: "section", fields: [
-                  {type: "mrkdwn", text: ("*Active round*\n" + $round)},
-                  {type: "mrkdwn", text: ("*GPK prefix*\n`" + $gpk + "`")},
-                  {type: "mrkdwn", text: ("*Test outcome*\n" + $status)},
-                  {type: "mrkdwn", text: ("*Suite*\naeneid / default (~13 min)")}
-                ]},
+                {type: "section", text: {type: "mrkdwn", text: $body}},
                 {type: "actions", elements: [
                   {type: "button", text: {type: "plain_text", text: "View workflow run"}, url: $url}
                 ]}
