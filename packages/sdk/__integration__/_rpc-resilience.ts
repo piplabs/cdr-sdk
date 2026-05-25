@@ -88,9 +88,15 @@ export function pLimit(maxConcurrency: number) {
  * `publicClient.waitForTransactionReceipt` with `timeout` widened to 5 min
  * for public-RPC endpoints whose `eth_getTransactionReceipt` can lag block
  * production by tens of seconds (viem default `timeout: 180_000` is too
- * tight for the tail). Mirrors the SDK-internal helper in
- * `packages/sdk/src/uploader.ts`; the duplication is intentional — the
- * SDK shouldn't take a dependency on test-only files.
+ * tight for the tail — e.g. cdr-sdk run 26379164817 wallet idx=29 allocate
+ * tx 0x914c3c... mined in block 0x11d2547 status=1 but viem gave up
+ * first; run 26380050980 wallet idx=31 same pattern with tx 0x13cdcd...
+ * in block 0x11d2980 — both failures rendered as "Transaction receipt
+ * with hash X could not be found" in the workflow summary).
+ *
+ * Mirrors the SDK-internal helper in `packages/sdk/src/uploader.ts`; the
+ * duplication is intentional — the SDK shouldn't take a dependency on
+ * test-only files.
  */
 export async function waitForReceiptResilient(
   publicClient: PublicClient,
@@ -105,19 +111,27 @@ export async function waitForReceiptResilient(
 }
 
 /**
- * Retries `fn` on the two known aeneid public-RPC pool consistency bugs:
+ * Retries `fn` on the two known aeneid public-RPC pool consistency bugs
+ * (both observed in cdr-sdk run 26380050980 on the same `default` suite
+ * within the same minute — neither is an SDK or contract bug):
  *
  *   1. **receipt-not-found** — `eth_getTransactionReceipt` is served by a
  *      pool node that lags the one which served `eth_sendRawTransaction`.
  *      Viem throws `TransactionReceiptNotFoundError` /
  *      `WaitForTransactionReceiptTimeoutError` even though the tx is
- *      mined. Sleep then re-poll — the lagging node usually catches up.
+ *      mined. Empirical case: wallet idx=31, tx 0x13cdcd... actually
+ *      committed in block 0x11d2980 status=1 but the receipt-pool node
+ *      still returned null after viem's 5 min timeout window. Sleep then
+ *      re-poll — the lagging node usually catches up.
  *   2. **write-state-race** — an SDK `uploadCDR` allocate→write sequence
  *      gets its `write()` simulation served by a node that hasn't yet
  *      applied the allocate's state, so the contract's
  *      `require(writeConditionAddr != address(0))` reverts with `CDR:
- *      Write condition address not set` even though the chain state
- *      *does* have the address set. Retrying the whole cycle re-runs
+ *      Write condition address not set` even though chain state *does*
+ *      have the address set. Empirical case: wallet idx=36 allocated
+ *      uuid=2655 with writeConditionAddr=0xa3a45... (confirmed by
+ *      post-run eth_call) but its write() simulate hit a stale node
+ *      seeing vaults[2655]=zero. Retrying the whole cycle re-runs
  *      allocate against a (different / caught-up) pool node and the
  *      write simulation passes.
  *

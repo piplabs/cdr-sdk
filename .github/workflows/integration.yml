@@ -443,24 +443,42 @@ jobs:
           }
 
           # ─── Aggregate failures across ALL JSON files (top-of-summary block) ──
-          # Joins vitest assertion failures with the matching
+          # Cross-references vitest's assertion failures with the matching
           # /tmp/perf-stats-{label}.json so an ephemeral-suite failure prints
-          # the per-wallet failure reasons inline ("99/100 succeeded, 1
-          # failed: <reason>") instead of only the vitest stack a reviewer
-          # has to click into the run log to decipher. Mapping: strip the
+          # the per-wallet failure reasons inline (e.g. "99/100 succeeded,
+          # 1 failed: receipt-not-found on tx 0x914c... mined in block
+          # 0x11d2547" from run 26379164817; or the 2-row dual-cause
+          # break-down rendered for run 26380050980 wallets idx=31/36)
+          # rather than only the cryptic `AssertionError: 1 wallets
+          # failed: expected 1 to be +0` + vitest stack a reviewer has
+          # to click into the run log to decipher. Mapping: strip the
           # `ephemeral-` prefix and `.test.ts` suffix from the test file
-          # basename to derive the perf-stats label.
+          # basename to derive the perf-stats label. Falls back gracefully
+          # to vitest-stack-only when the perf-stats file is missing or
+          # unreadable (also see the `|| echo "{}"` JSON guard).
           aggregate_failures() {
             # Build a {label -> perf-stats} map once so the inner jq can
             # look up the matching per-wallet failure rows for each
-            # assertion failure.
+            # assertion failure. Defensive: `jq -s` over multiple files
+            # exits non-zero on the FIRST malformed input, which would
+            # silently drop the entire enriched-failure block — even the
+            # downstream `--argjson perf "$perf_json"` call would fail
+            # to parse, falling back to vitest-stack-only for ALL suites
+            # (not just the one with bad output). Iterate per file so
+            # one truncated / unparseable JSON only loses ITS own
+            # enrichment; the other suites still render the per-wallet
+            # failure tables.
             shopt -s nullglob
             local perf_files=(/tmp/perf-stats-*.json)
             shopt -u nullglob
             local perf_json="{}"
-            if [ "${#perf_files[@]}" -gt 0 ]; then
-              perf_json=$(jq -s 'map({key: .label, value: .}) | from_entries' "${perf_files[@]}")
-            fi
+            for f in "${perf_files[@]}"; do
+              # `-e` exits non-zero on `select(...)` filtering everything
+              # out (no `.label`), and on outright parse failures.
+              local entry
+              entry=$(jq -ec 'select(type == "object" and (.label | type) == "string")' "$f" 2>/dev/null) || continue
+              perf_json=$(jq -n --argjson acc "$perf_json" --argjson item "$entry" '$acc + {($item.label): $item}')
+            done
 
             for json in /tmp/results-sdk.json /tmp/results-cli.json /tmp/results-examples.json /tmp/results-stress.json; do
               [ -f "$json" ] || continue
