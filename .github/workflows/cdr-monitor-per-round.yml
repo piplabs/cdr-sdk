@@ -146,9 +146,20 @@ jobs:
           if [ "$FORCE" = "true" ]; then
             should_test="true"; forced="true"
             echo "→ force=true; firing regardless of round delta"
-          elif [ -n "$LAST_GPK" ] && [ "$CUR_GPK" != "$LAST_GPK" ]; then
+          elif [ -n "$LAST_GPK" ] \
+               && [ "$CUR_ROUND" -le "$LAST_ROUND" ] \
+               && [ "$CUR_GPK" != "$LAST_GPK" ]; then
+            # Both conditions required: chain reset = round id drops back
+            # AND the GPK no longer matches the old chain. GPK alone is
+            # too broad — if Story ever runs a non-resharing round
+            # (is_resharing=false on advance) the GPK can change while
+            # the round id still moves forward, and that's a normal
+            # round advance, not a reset. Aeneid is steady-state
+            # is_resharing=true so this is currently belt-and-suspenders,
+            # but the tightening keeps the label honest if that ever
+            # changes.
             should_test="true"; chain_reset="true"
-            echo "→ chain reset detected (gpk $LAST_GPK → $CUR_GPK)"
+            echo "→ chain reset detected (round $LAST_ROUND → $CUR_ROUND, gpk $LAST_GPK → $CUR_GPK)"
           elif [ "$CUR_ROUND" -gt "$LAST_ROUND" ]; then
             should_test="true"
             echo "→ new round detected (round $LAST_ROUND → $CUR_ROUND)"
