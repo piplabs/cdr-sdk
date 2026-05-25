@@ -15,10 +15,10 @@ run-name: cdr-monitor-aeneid${{ inputs.force == true && ' (force)' || '' }}
 #                            │               integration.yml on aeneid/default
 #                            │
 #                            └─ Compares Story-API /dkg/latest_active.round
-#                               against repo variables (LAST_SEEN_AENEID_*).
-#                               Bumps the variables only when fire-decision
-#                               is positive, so a transient API outage
-#                               doesn't lose round-edge detection.
+#                               against the cached state.json from the last
+#                               watcher run. Re-saves the cache only when
+#                               fire-decision is positive, so a transient
+#                               API outage doesn't lose round-edge detection.
 #
 # State (actions/cache, JSON blob):
 #   ./state.json = {round, gpk} — round we last fired a test against and
