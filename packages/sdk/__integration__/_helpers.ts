@@ -296,15 +296,15 @@ export async function queryCDRFees(
 //
 // 1 IP base covers per-tx gas for any reasonable workload; ×3 of the
 // user-side per-cycle fees absorbs fee bumps mid-run.
-export const BASE_GAS_BUDGET_WEI = 1_000_000_000_000_000_000n; // 1 IP
-export const FUND_SAFETY_MULTIPLIER = 3n;
+const BASE_GAS_BUDGET_WEI = 1_000_000_000_000_000_000n; // 1 IP
+const FUND_SAFETY_MULTIPLIER = 3n;
 
 /**
  * Required `payable` value for one user-side (allocate + write + read)
  * cycle, EXCLUDING gas and EXCLUDING the validator-paid `baseFee`.
  * Mirrors `require(msg.value == ...)` on each user-facing CDR path.
  */
-export function userPerCycleFee(fees: CDRFees): bigint {
+function userPerCycleFee(fees: CDRFees): bigint {
   return fees.writeFee + fees.allocateFee + fees.readFee;
 }
 
@@ -316,7 +316,7 @@ export function userPerCycleFee(fees: CDRFees): bigint {
  * contract paths it exercises — uniform funding keeps the test surface
  * predictable and tolerates fee bumps mid-run.
  */
-export function computePerWalletFund(fees: CDRFees): bigint {
+function computePerWalletFund(fees: CDRFees): bigint {
   return BASE_GAS_BUDGET_WEI + userPerCycleFee(fees) * FUND_SAFETY_MULTIPLIER;
 }
 
@@ -332,7 +332,7 @@ export function computePerWalletFund(fees: CDRFees): bigint {
  * baseFee is 0 the chain's evmengine handler silently drops every
  * partial submission — see piplabs/story client/x/evmengine/keeper/cdr.go).
  */
-export interface FeeStatsFile {
+interface FeeStatsFile {
   label: string;
   network: string;
   base_fee_wei: string;
@@ -355,7 +355,7 @@ export interface FeeStatsFile {
   per_wallet_fund_wei: string;
 }
 
-export function writeFeeStats(file: FeeStatsFile): void {
+function writeFeeStats(file: FeeStatsFile): void {
   // Lazy fs import — see writePerfStats above for the rationale.
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const fs = require("node:fs") as typeof import("node:fs");
@@ -423,8 +423,16 @@ export async function sizeFundAndReport(opts: {
     opts.publicClient.getGasPrice(),
   ]);
   const userCycleFeeWei = userPerCycleFee(fees);
+  const formulaFundWei = computePerWalletFund(fees);
   const isOverride = opts.overrideFundWei !== undefined;
-  const perWalletFund = opts.overrideFundWei ?? computePerWalletFund(fees);
+  const perWalletFund = opts.overrideFundWei ?? formulaFundWei;
+  const fundShape = isOverride
+    ? { fund_source: "override" as const, safety_multiplier: 0, base_gas_budget_wei: "0" }
+    : {
+        fund_source: "formula" as const,
+        safety_multiplier: Number(FUND_SAFETY_MULTIPLIER),
+        base_gas_budget_wei: BASE_GAS_BUDGET_WEI.toString(),
+      };
   writeFeeStats({
     label: opts.label,
     network: opts.network,
@@ -434,9 +442,7 @@ export async function sizeFundAndReport(opts: {
     allocate_fee_wei: fees.allocateFee.toString(),
     gas_price_wei: gasPriceWei.toString(),
     user_per_cycle_fee_wei: userCycleFeeWei.toString(),
-    fund_source: isOverride ? "override" : "formula",
-    safety_multiplier: isOverride ? 0 : Number(FUND_SAFETY_MULTIPLIER),
-    base_gas_budget_wei: isOverride ? "0" : BASE_GAS_BUDGET_WEI.toString(),
+    ...fundShape,
     per_wallet_fund_wei: perWalletFund.toString(),
   });
   // eslint-disable-next-line no-console
@@ -444,9 +450,8 @@ export async function sizeFundAndReport(opts: {
     `[fee-sizing][${opts.label}] base=${fees.baseFee} write=${fees.writeFee} ` +
       `read=${fees.readFee} allocate=${fees.allocateFee} gasPrice=${gasPriceWei} ` +
       `userPerCycle=${userCycleFeeWei} perWalletFund=${perWalletFund} ` +
-      (isOverride
-        ? `(override — formula would give ${computePerWalletFund(fees)})`
-        : `(= ${BASE_GAS_BUDGET_WEI} base + ${userCycleFeeWei} × ${FUND_SAFETY_MULTIPLIER})`),
+      `source=${fundShape.fund_source}` +
+      (isOverride ? ` (formula would give ${formulaFundWei})` : ""),
   );
   return perWalletFund;
 }
