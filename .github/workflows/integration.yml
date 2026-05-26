@@ -634,25 +634,31 @@ jobs:
 
           # ─── Fee table: glob /tmp/fee-stats-*.json ────────────────────────────
           # Each ephemeral suite queries baseFee / writeFee / readFee /
-          # allocateFee off the live CDR contract at setup time and writes
-          # them to /tmp/fee-stats-{label}.json alongside the per-cycle cost
-          # it actually used + the computed per-wallet fund. We render that
-          # here so any "100 wallets failed with insufficient funds" failure
-          # mode is one table-row away from being diagnosed — you can see
-          # at a glance whether the chain raised a fee since the last run
-          # and whether the suite's fund covers it.
+          # allocateFee off the live CDR contract + live gas price at setup
+          # time and writes them to /tmp/fee-stats-{label}.json alongside
+          # the computed per-wallet fund. We render that here so any
+          # "100 wallets failed with insufficient funds" failure mode is one
+          # table-row away from being diagnosed — you can see at a glance
+          # whether the chain raised a fee or a gas spike pushed gas budget
+          # past the funded buffer.
+          #
+          # Per-wallet fund formula (all suites): 1 IP base + 3 × (writeFee +
+          # allocateFee + readFee). baseFee is validator-paid (not in the
+          # funding sum) but is shown for ops visibility — baseFee=0 silently
+          # disables CDR partials in the chain's evmengine handler.
           render_fee_table() {
             shopt -s nullglob
             local files=(/tmp/fee-stats-*.json)
             shopt -u nullglob
             [ "${#files[@]}" -gt 0 ] || { echo "_(no fee-stats output produced — no ephemeral suite ran)_"; echo ""; return; }
-            echo "**One row per ephemeral suite.** Fees are queried live off the CDR contract at suite setup."
-            echo "\`Per-cycle\` = the payable value the suite expects per (upload + access) iteration —"
-            echo "read-only suites (100w-shared, 1000w-perf) bill only \`readFee\`; full-cycle suites add \`baseFee + writeFee + allocateFee\`; stress adds an extra \`readFee\` for the second access per cycle."
-            echo "\`Per-wallet fund\` = \`per-cycle × cycles × safety_multiplier + gas_reserve × cycles\`."
+            echo "**One row per ephemeral suite.** Fees + gas price queried live off the chain at suite setup."
             echo ""
-            echo "| Suite | baseFee | writeFee | readFee | allocateFee | Per-cycle | Cycles/wallet | Safety× | Per-wallet fund |"
-            echo "|---|---|---|---|---|---|---|---|---|"
+            echo "Formula-funded suites: \`per-wallet fund = base_gas_budget + safety_multiplier × (writeFee + allocateFee + readFee)\`."
+            echo "Override-funded suites (e.g. 60-min stress): per-wallet fund is a caller-set flat value; \`Safety×\` + \`Base gas budget\` show \`—\`."
+            echo "\`baseFee\` is validator-paid (not in funding) — shown for visibility."
+            echo ""
+            echo "| Suite | Source | baseFee (validator) | writeFee | allocateFee | readFee | Gas price | User per-cycle fee | Safety× | + Base gas budget | Per-wallet fund |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|"
             for f in "${files[@]}"; do
               jq -r '
                 def fmtIp:
@@ -662,15 +668,25 @@ jobs:
                   ($n % 10000 | tostring) as $fracraw |
                   ("0000" + $fracraw)[-4:] as $frac |
                   $whole + "." + $frac + " IP";
+                def fmtGwei:
+                  ((. | tonumber) / 1e9) as $g |
+                  ($g * 100 | floor) as $n |
+                  ($n / 100 | floor | tostring) as $whole |
+                  ($n % 100 | tostring) as $fracraw |
+                  ("00" + $fracraw)[-2:] as $frac |
+                  $whole + "." + $frac + " gwei";
+                (.fund_source // "formula") as $src |
                 "| " + .label
-                + " | " + (.baseFee_wei         | fmtIp)
-                + " | " + (.writeFee_wei        | fmtIp)
-                + " | " + (.readFee_wei         | fmtIp)
-                + " | " + (.allocateFee_wei     | fmtIp)
-                + " | " + (.per_cycle_wei       | fmtIp)
-                + " | " + (.cycles_per_wallet   | tostring)
-                + " | " + (.safety_multiplier   | tostring)
-                + " | " + (.per_wallet_fund_wei | fmtIp)
+                + " | " + $src
+                + " | " + (.base_fee_wei            | fmtIp)
+                + " | " + (.write_fee_wei           | fmtIp)
+                + " | " + (.allocate_fee_wei        | fmtIp)
+                + " | " + (.read_fee_wei            | fmtIp)
+                + " | " + (.gas_price_wei           | fmtGwei)
+                + " | " + (.user_per_cycle_fee_wei  | fmtIp)
+                + " | " + (if $src == "override" then "—" else "× " + (.safety_multiplier | tostring) end)
+                + " | " + (if $src == "override" then "—" else (.base_gas_budget_wei | fmtIp) end)
+                + " | " + (.per_wallet_fund_wei    | fmtIp)
                 + " |"
               ' "$f"
             done

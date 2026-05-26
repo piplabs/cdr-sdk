@@ -45,7 +45,6 @@ import {
   refundWallets,
 } from "./_ephemeral-wallets.js";
 import {
-  accessFeeCost,
   formatMs,
   logCase,
   max as arrMax,
@@ -63,7 +62,6 @@ const WALLET_COUNT = 1000;
 // under Story's ~30M block gas limit on both DevNet + Aeneid.
 const FUND_BATCH_SIZE = 200;
 const CYCLES_PER_WALLET = 1; // 1 accessCDR per wallet, no upload
-const FUND_SAFETY_MULTIPLIER = 3;
 const ACCESS_TIMEOUT_MS = 300_000;
 
 const API_URL = process.env.CDR_API_URL;
@@ -186,16 +184,13 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only") || NETWOR
       funderClient = f.client;
       funderAddress = privateKeyToAccount(FUNDER_KEY!).address;
 
-      // Read-only suite: each wallet pays readFee only. Size fund from
-      // live readFee so we don't have to rotate this hard-coded number
-      // every time chain fees move.
+      // Flat per-wallet fund = 1 IP + 3 × (writeFee + allocateFee + readFee).
+      // Read-only suite over-funds by writeFee+allocateFee × 3 at current
+      // chain fees, which is fine — 1 IP base dominates anyway.
       perWalletFund = await sizeFundAndReport({
         label: "1000w-perf",
         network: NETWORK,
         publicClient: funderPublic,
-        perCycleCost: accessFeeCost,
-        cyclesPerWallet: CYCLES_PER_WALLET,
-        safetyMultiplier: FUND_SAFETY_MULTIPLIER,
       });
 
       openCondition = await deployOpenCondition(funderPublic, funderWallet);
