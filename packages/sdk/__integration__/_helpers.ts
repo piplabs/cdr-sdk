@@ -341,6 +341,15 @@ export interface FeeStatsFile {
   allocate_fee_wei: string;
   gas_price_wei: string;
   user_per_cycle_fee_wei: string;
+  /**
+   * "formula" → per_wallet_fund_wei = base_gas_budget_wei + safety_multiplier × user_per_cycle_fee_wei.
+   * "override" → per_wallet_fund_wei is a caller-provided flat value; safety_multiplier /
+   *               base_gas_budget_wei are recorded as 0 and the workflow summary renders "—"
+   *               in those cells. Used by suites whose per-wallet cost is dominated by
+   *               cycle count rather than per-cycle fee (e.g. the 60-min stress suite which
+   *               runs ~150 cycles/wallet on devnet — vastly exceeding any flat-formula budget).
+   */
+  fund_source: "formula" | "override";
   safety_multiplier: number;
   base_gas_budget_wei: string;
   per_wallet_fund_wei: string;
@@ -363,22 +372,37 @@ export function writeFeeStats(file: FeeStatsFile): void {
 
 /**
  * Suite-side convenience wrapper: query live fees + live gas price,
- * compute per-wallet fund via the flat formula, persist the fee-stats
- * snapshot for the workflow summary, and return the fund.
+ * compute per-wallet fund via the flat formula (or accept a caller-provided
+ * override), persist the fee-stats snapshot for the workflow summary, and
+ * return the fund.
  *
+ *   // formula path (default — short suites doing ≤ a few cycles per wallet)
  *   const perWalletFund = await sizeFundAndReport({
  *     label: "100w-fresh-aeneid",
  *     network: NETWORK,
  *     publicClient: funderPublic,
  *   });
  *
- * The formula is uniform across suites:
- *   perWalletFund = 1 IP + 3 × (writeFee + allocateFee + readFee)
+ *   // override path — suites whose per-wallet cost is dominated by
+ *   // cycle count rather than per-cycle fee (e.g. 60-min stress runs
+ *   // ~150 cycles/wallet, which the flat 1 IP base cannot cover).
+ *   const perWalletFund = await sizeFundAndReport({
+ *     label: "60min-stress",
+ *     network: NETWORK,
+ *     publicClient: funderPublic,
+ *     overrideFundWei: parseEther("100"),
+ *   });
+ *
+ * Even on the override path we still query live fees + gas price so the
+ * workflow summary table has a row for every suite that runs, with the
+ * same set of contextual columns. Unused balance is swept back via
+ * `refundWallets` at the end of each suite — over-funding the override
+ * value is cheap, exhausting it mid-run isn't.
  *
  * `baseFee` is not part of funding (validator-paid) but is recorded in
  * the fee-stats JSON for ops visibility. `gas_price_wei` is queried live
  * off the funder's public client so the workflow summary can surface it
- * next to fee values (gas price spikes are the most common cause of
+ * next to fee values (gas-price spikes are the most common cause of
  * insufficient-funds at the read step on aeneid).
  */
 export async function sizeFundAndReport(opts: {
@@ -386,13 +410,21 @@ export async function sizeFundAndReport(opts: {
   network: string;
   publicClient: PublicClient;
   contractNetwork?: Network;
+  /**
+   * When set, bypass the flat formula and use this exact value as the
+   * per-wallet fund. Caller is responsible for picking a value that
+   * comfortably covers their suite's per-wallet cost; `refundWallets`
+   * sweeps any unused balance back to the funder at teardown.
+   */
+  overrideFundWei?: bigint;
 }): Promise<bigint> {
   const [fees, gasPriceWei] = await Promise.all([
     queryCDRFees(opts.publicClient, opts.contractNetwork ?? "testnet"),
     opts.publicClient.getGasPrice(),
   ]);
   const userCycleFeeWei = userPerCycleFee(fees);
-  const perWalletFund = computePerWalletFund(fees);
+  const isOverride = opts.overrideFundWei !== undefined;
+  const perWalletFund = opts.overrideFundWei ?? computePerWalletFund(fees);
   writeFeeStats({
     label: opts.label,
     network: opts.network,
@@ -402,8 +434,9 @@ export async function sizeFundAndReport(opts: {
     allocate_fee_wei: fees.allocateFee.toString(),
     gas_price_wei: gasPriceWei.toString(),
     user_per_cycle_fee_wei: userCycleFeeWei.toString(),
-    safety_multiplier: Number(FUND_SAFETY_MULTIPLIER),
-    base_gas_budget_wei: BASE_GAS_BUDGET_WEI.toString(),
+    fund_source: isOverride ? "override" : "formula",
+    safety_multiplier: isOverride ? 0 : Number(FUND_SAFETY_MULTIPLIER),
+    base_gas_budget_wei: isOverride ? "0" : BASE_GAS_BUDGET_WEI.toString(),
     per_wallet_fund_wei: perWalletFund.toString(),
   });
   // eslint-disable-next-line no-console
@@ -411,7 +444,9 @@ export async function sizeFundAndReport(opts: {
     `[fee-sizing][${opts.label}] base=${fees.baseFee} write=${fees.writeFee} ` +
       `read=${fees.readFee} allocate=${fees.allocateFee} gasPrice=${gasPriceWei} ` +
       `userPerCycle=${userCycleFeeWei} perWalletFund=${perWalletFund} ` +
-      `(= ${BASE_GAS_BUDGET_WEI} base + ${userCycleFeeWei} × ${FUND_SAFETY_MULTIPLIER})`,
+      (isOverride
+        ? `(override — formula would give ${computePerWalletFund(fees)})`
+        : `(= ${BASE_GAS_BUDGET_WEI} base + ${userCycleFeeWei} × ${FUND_SAFETY_MULTIPLIER})`),
   );
   return perWalletFund;
 }

@@ -93,9 +93,23 @@ import {
 const DURATION_MS = 60 * 60 * 1000; // 1 hour
 const CONCURRENCY = 10;
 // Documentary constant — real run on devnet does ~120-200 cycles in 1 hour.
-// No longer feeds into per-wallet fund sizing (now flat 1 IP base + 3 ×
-// (writeFee + allocateFee + readFee), independent of cycle count).
 const ESTIMATED_CYCLES_PER_WALLET = 1000;
+// Fixed per-wallet fund for the 1-hour stress run on devnet. Each cycle
+// pays `writeFee + allocateFee + 2 × readFee` (upload + 2 × accessCDR),
+// so at ~150 cycles × 0.04 IP/cycle (devnet) + gas overhead we need
+// ~7-10 IP per wallet. 100 IP gives ~10× safety on devnet (anvil-0
+// funder has effectively unlimited IP, and `refundWallets` sweeps any
+// unused balance back at teardown — over-funding is cheap, exhausting
+// mid-run is not). Stress is `skipUnlessDevnet`-gated, so aeneid /
+// mainnet never hit this code path.
+//
+// History: PR #109 inlined this into the dynamic-fee formula with
+// `cyclesPerWallet=1000` + `safetyMultiplier=3`, producing ~155 IP/wallet
+// on devnet. PR #113 flattened that formula but accidentally dropped the
+// cycle-count factor — the resulting ~1.09 IP/wallet exhausted after
+// ~25 cycles. Reverted to a fixed value here, queried-fee path lives in
+// `sizeFundAndReport`'s formula branch and is reserved for short suites.
+const STRESS_PER_WALLET_FUND = parseEther("100");
 // Generous reserve absorbs any pending-tx mempool cost when refund runs
 // right after the last cycle. Loses ~10 IP across 10 wallets — DevNet
 // anvil-0 has unlimited dev IP, so trading a little waste for refund
@@ -240,15 +254,17 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
       funderClient = f.client;
       funderAddress = privateKeyToAccount(FUNDER_KEY!).address;
 
-      // Flat per-wallet fund = 1 IP + 3 × (writeFee + allocateFee + readFee).
-      // Stress runs 1h × 10 wallets × ~150 cycles, but funding is independent
-      // of cycle count — 1 IP base on devnet (where fees are typically 0.01 IP)
-      // covers ~50k cycles' worth of gas. The fee snapshot + fund sizing
-      // lands in /tmp/fee-stats-60min-stress.json for the workflow summary.
+      // Stress uses a fixed override (100 IP/wallet) — the flat formula
+      // branch is for short suites and can't cover ~150 cycles' worth
+      // of fees over 1h. We still call `sizeFundAndReport` (not a bespoke
+      // path) so the workflow summary table has a row with live fees +
+      // gas price for this suite, same shape as every other suite. See
+      // STRESS_PER_WALLET_FUND comment above for the sizing rationale.
       perWalletFund = await sizeFundAndReport({
         label: "60min-stress",
         network: NETWORK,
         publicClient: funderPublic,
+        overrideFundWei: STRESS_PER_WALLET_FUND,
       });
 
       openCondition = await deployOpenCondition(funderPublic, funderWallet);
