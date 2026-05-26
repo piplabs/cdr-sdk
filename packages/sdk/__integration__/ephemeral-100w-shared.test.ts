@@ -54,7 +54,6 @@ import {
   refundWallets,
 } from "./_ephemeral-wallets.js";
 import {
-  accessFeeCost,
   formatMs,
   logCase,
   mean,
@@ -67,7 +66,6 @@ import {
 
 const WALLET_COUNT = 100;
 const CYCLES_PER_WALLET = 1; // 1 accessCDR per wallet, no upload
-const FUND_SAFETY_MULTIPLIER = 3;
 const ACCESS_TIMEOUT_MS = 180_000;
 
 const API_URL = process.env.CDR_API_URL;
@@ -176,15 +174,14 @@ describe.skipIf(skipUnlessSuite("default"))(
       funderClient = f.client;
       funderAddress = privateKeyToAccount(FUNDER_KEY!).address;
 
-      // Read-only suite: each wallet pays accessFee only (no upload, no
-      // baseFee). Size fund from live readFee.
+      // Flat per-wallet fund = 1 IP + 3 × (writeFee + allocateFee + readFee).
+      // Read-only suite over-funds by writeFee+allocateFee × 3 at current
+      // chain fees, which is fine — 1 IP base dominates anyway, and the
+      // uniform formula keeps the test surface predictable.
       perWalletFund = await sizeFundAndReport({
         label: "100w-shared",
         network: NETWORK,
         publicClient: funderPublic,
-        perCycleCost: accessFeeCost,
-        cyclesPerWallet: CYCLES_PER_WALLET,
-        safetyMultiplier: FUND_SAFETY_MULTIPLIER,
       });
 
       openCondition = await deployOpenCondition(funderPublic, funderWallet);

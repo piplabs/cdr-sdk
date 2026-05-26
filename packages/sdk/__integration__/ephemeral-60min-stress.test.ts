@@ -85,22 +85,17 @@ import {
   refundWallets,
 } from "./_ephemeral-wallets.js";
 import {
-  accessFeeCost,
   sizeFundAndReport,
   statsOf,
-  uploadFeeCost,
   writePerfStats,
 } from "./_helpers.js";
 
 const DURATION_MS = 60 * 60 * 1000; // 1 hour
 const CONCURRENCY = 10;
-// Generous over-estimate of cycles per wallet. Real run on devnet does
-// ~120-200 cycles in 1 hour; 1000 here absorbs any future cycle speedup
-// while staying close to the spirit of the previous static 1000 IP fund
-// (it works out to ~155 IP/wallet on devnet vs the previous 1000 IP —
-// still a 15× buffer over realistic need, but tracks live fees).
+// Documentary constant — real run on devnet does ~120-200 cycles in 1 hour.
+// No longer feeds into per-wallet fund sizing (now flat 1 IP base + 3 ×
+// (writeFee + allocateFee + readFee), independent of cycle count).
 const ESTIMATED_CYCLES_PER_WALLET = 1000;
-const FUND_SAFETY_MULTIPLIER = 3;
 // Generous reserve absorbs any pending-tx mempool cost when refund runs
 // right after the last cycle. Loses ~10 IP across 10 wallets — DevNet
 // anvil-0 has unlimited dev IP, so trading a little waste for refund
@@ -245,16 +240,15 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
       funderClient = f.client;
       funderAddress = privateKeyToAccount(FUNDER_KEY!).address;
 
-      // Each cycle = 1 uploadCDR + 2 accessCDR (shared + own-fresh). The
-      // fee snapshot + fund sizing also lands in /tmp/fee-stats-60min-stress.json
-      // for the workflow summary table.
+      // Flat per-wallet fund = 1 IP + 3 × (writeFee + allocateFee + readFee).
+      // Stress runs 1h × 10 wallets × ~150 cycles, but funding is independent
+      // of cycle count — 1 IP base on devnet (where fees are typically 0.01 IP)
+      // covers ~50k cycles' worth of gas. The fee snapshot + fund sizing
+      // lands in /tmp/fee-stats-60min-stress.json for the workflow summary.
       perWalletFund = await sizeFundAndReport({
         label: "60min-stress",
         network: NETWORK,
         publicClient: funderPublic,
-        perCycleCost: (fees) => uploadFeeCost(fees) + accessFeeCost(fees) * 2n,
-        cyclesPerWallet: ESTIMATED_CYCLES_PER_WALLET,
-        safetyMultiplier: FUND_SAFETY_MULTIPLIER,
       });
 
       openCondition = await deployOpenCondition(funderPublic, funderWallet);

@@ -46,7 +46,6 @@ import {
   refundWallets,
 } from "./_ephemeral-wallets.js";
 import {
-  cycleFeeCost,
   formatMs,
   logCase,
   mean,
@@ -59,7 +58,6 @@ import {
 
 const WALLET_COUNT = 100;
 const CYCLES_PER_WALLET = 1; // upload + access
-const FUND_SAFETY_MULTIPLIER = 3;
 const ACCESS_TIMEOUT_MS = 180_000;
 
 const API_URL = process.env.CDR_API_URL;
@@ -154,15 +152,12 @@ describe.skipIf(skipUnlessSuite("default") || NETWORK !== "devnet")(
       funderWallet = f.walletClient;
       funderAddress = privateKeyToAccount(FUNDER_KEY!).address;
 
-      // Size each wallet's fund from live CDR fees. See the aeneid
-      // sibling suite for the failure-mode rationale.
+      // Flat per-wallet fund = 1 IP + 3 × (writeFee + allocateFee + readFee).
+      // See _helpers.ts::computePerWalletFund for the rationale.
       perWalletFund = await sizeFundAndReport({
         label: "100w-fresh",
         network: NETWORK,
         publicClient: funderPublic,
-        perCycleCost: cycleFeeCost,
-        cyclesPerWallet: CYCLES_PER_WALLET,
-        safetyMultiplier: FUND_SAFETY_MULTIPLIER,
       });
 
       openCondition = await deployOpenCondition(funderPublic, funderWallet);

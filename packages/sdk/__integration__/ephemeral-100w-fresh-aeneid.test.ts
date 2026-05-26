@@ -43,7 +43,6 @@ import {
   refundWallets,
 } from "./_ephemeral-wallets.js";
 import {
-  cycleFeeCost,
   formatMs,
   logCase,
   mean,
@@ -57,7 +56,6 @@ import { pLimit, resilientHttp, withAeneidFlakeRetry } from "./_rpc-resilience.j
 
 const WALLET_COUNT = 100;
 const CYCLES_PER_WALLET = 1; // upload + access
-const FUND_SAFETY_MULTIPLIER = 3;
 const ACCESS_TIMEOUT_MS = 180_000;
 const MAX_INFLIGHT = 25;
 
@@ -153,17 +151,15 @@ describe.skipIf(skipUnlessSuite("default") || NETWORK !== "aeneid")(
       funderWallet = f.walletClient;
       funderAddress = privateKeyToAccount(FUNDER_KEY!).address;
 
-      // Size each wallet's fund from live CDR fees. The previous hard-coded
-      // 0.1 IP broke on aeneid once all four fees moved 0.01 → 0.03 IP —
-      // 0.1 IP minus a single upload (~0.078 IP) left only ~0.022 IP, below
-      // the 0.03 IP value the read tx requires.
+      // Flat per-wallet fund = 1 IP + 3 × (writeFee + allocateFee + readFee).
+      // 1 IP base covers gas; 3× safety on user-side fees absorbs mid-run
+      // fee bumps. See _helpers.ts::computePerWalletFund for the rationale
+      // — replaces the previous hard-coded 0.1 IP that broke once aeneid
+      // fees moved 0.01 → 0.03 IP.
       perWalletFund = await sizeFundAndReport({
         label: "100w-fresh-aeneid",
         network: NETWORK,
         publicClient: funderPublic,
-        perCycleCost: cycleFeeCost,
-        cyclesPerWallet: CYCLES_PER_WALLET,
-        safetyMultiplier: FUND_SAFETY_MULTIPLIER,
       });
 
       openCondition = await deployOpenCondition(funderPublic, funderWallet);

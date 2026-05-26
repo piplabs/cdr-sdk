@@ -278,88 +278,71 @@ export async function queryCDRFees(
   return { baseFee, writeFee, readFee, allocateFee };
 }
 
+// Flat per-wallet fund constants.
+//
+// The previous formula scaled with cyclesPerWallet + per-suite cost shape
+// (upload-vs-access-vs-cycle). Two problems with that:
+//   1. `uploadFeeCost` included `baseFee` — but baseFee is paid by
+//      validators when they submit partial decryptions, not by the user.
+//      User-side `uploadCDR` only requires `allocateFee + writeFee`. The
+//      old formula over-funded by `baseFee × cycles × 3` on every suite.
+//   2. Sizing was so tight that a single fee bump on aeneid (0.01 → 0.03 IP)
+//      tipped 100/100 wallets into insufficient-funds failures.
+//
+// New formula: every ephemeral suite gets the same fund regardless of
+// cycles-per-wallet or which contract paths it exercises:
+//
+//   perWalletFund = BASE_GAS_BUDGET + (writeFee + allocateFee + readFee) × FUND_SAFETY_MULTIPLIER
+//
+// 1 IP base covers per-tx gas for any reasonable workload; ×3 of the
+// user-side per-cycle fees absorbs fee bumps mid-run.
+export const BASE_GAS_BUDGET_WEI = 1_000_000_000_000_000_000n; // 1 IP
+export const FUND_SAFETY_MULTIPLIER = 3n;
+
 /**
- * Required `payable` value for one uploadCDR call, EXCLUDING gas.
- * Mirrors the contract's `require(msg.value == baseFee + writeFee +
- * allocateFee)` on the write path.
+ * Required `payable` value for one user-side (allocate + write + read)
+ * cycle, EXCLUDING gas and EXCLUDING the validator-paid `baseFee`.
+ * Mirrors `require(msg.value == ...)` on each user-facing CDR path.
  */
-export function uploadFeeCost(fees: CDRFees): bigint {
-  return fees.baseFee + fees.writeFee + fees.allocateFee;
+export function userPerCycleFee(fees: CDRFees): bigint {
+  return fees.writeFee + fees.allocateFee + fees.readFee;
 }
 
 /**
- * Required `payable` value for one accessCDR call, EXCLUDING gas.
- * Mirrors `require(msg.value == readFee)` on the read path. `baseFee`
- * is NOT charged on access — read-only suites (100w-shared, 1000w-perf)
- * pay only this.
- */
-export function accessFeeCost(fees: CDRFees): bigint {
-  return fees.readFee;
-}
-
-/**
- * Required `payable` value for one (upload + access) cycle. Suites that
- * exercise both paths per wallet (100w-fresh*, 60min-stress) use this.
- */
-export function cycleFeeCost(fees: CDRFees): bigint {
-  return uploadFeeCost(fees) + accessFeeCost(fees);
-}
-
-/**
- * Compute per-wallet fund for an ephemeral suite. Callers pass the
- * per-cycle cost they expect (`cycleFeeCost`/`uploadFeeCost`/
- * `accessFeeCost`) so this helper stays agnostic to which contract
- * paths the suite exercises.
+ * Per-wallet fund used by every ephemeral suite. Flat formula:
+ *   1 IP base + 3 × (writeFee + allocateFee + readFee)
  *
- *   funded = perCycleWei × cyclesPerWallet × safetyMultiplier
- *          + gasReservePerCycleWei × cyclesPerWallet
- *
- * `safetyMultiplier` covers fee bumps mid-run + per-tx gas variance;
- * default 3× tracks the historical funded/needed ratio on devnet
- * (PER_WALLET_FUND=0.1 IP vs single-cycle fee cost ≈ 0.04 IP).
- * `gasReservePerCycleWei` defaults to 0.005 IP per cycle, which covers
- * 1-3 txs of typical gas (~0.001-0.002 IP per tx). Same order of
- * magnitude as the `refundWallets` end-of-suite reserve.
- *
- * Returns a bigint suitable for passing straight into `fundWallets`.
+ * Independent of the suite's cycles-per-wallet count and which
+ * contract paths it exercises — uniform funding keeps the test surface
+ * predictable and tolerates fee bumps mid-run.
  */
-export function computePerWalletFund(opts: {
-  perCycleWei: bigint;
-  cyclesPerWallet: number;
-  safetyMultiplier?: number;
-  gasReservePerCycleWei?: bigint;
-}): bigint {
-  const cycles = BigInt(opts.cyclesPerWallet);
-  const multiplier = BigInt(Math.round((opts.safetyMultiplier ?? 3) * 100));
-  // Multiply by safetyMultiplier × 100 then divide by 100 to keep bigint
-  // math integral when callers pass a fractional multiplier like 2.5.
-  const padded = (opts.perCycleWei * cycles * multiplier) / 100n;
-  const gas = opts.gasReservePerCycleWei ?? 5_000_000_000_000_000n; // 0.005 IP
-  return padded + gas * cycles;
+export function computePerWalletFund(fees: CDRFees): bigint {
+  return BASE_GAS_BUDGET_WEI + userPerCycleFee(fees) * FUND_SAFETY_MULTIPLIER;
 }
 
 /**
  * Per-suite fee snapshot written to `/tmp/fee-stats-{label}.json` at the
  * end of each ephemeral suite setup. The integration workflow's summary
  * step globs these files and renders one table row per file in the Step
- * Summary, surfacing live fee values + actual per-wallet fund used
- * alongside the perf table.
+ * Summary, surfacing live fee values + gas price + actual per-wallet
+ * fund used alongside the perf table.
+ *
+ * `base_fee_wei` is the validator-paid `baseFee` — it does NOT feed into
+ * `per_wallet_fund_wei`. It is recorded here for ops visibility (if
+ * baseFee is 0 the chain's evmengine handler silently drops every
+ * partial submission — see piplabs/story client/x/evmengine/keeper/cdr.go).
  */
 export interface FeeStatsFile {
   label: string;
   network: string;
-  baseFee_wei: string;
-  writeFee_wei: string;
-  readFee_wei: string;
-  allocateFee_wei: string;
-  /**
-   * The per-cycle fee cost the suite used to compute its fund — either
-   * `cycleFeeCost` (full upload+access), `uploadFeeCost`, or `accessFeeCost`
-   * depending on which contract path the suite exercises.
-   */
-  per_cycle_wei: string;
-  cycles_per_wallet: number;
+  base_fee_wei: string;
+  write_fee_wei: string;
+  read_fee_wei: string;
+  allocate_fee_wei: string;
+  gas_price_wei: string;
+  user_per_cycle_fee_wei: string;
   safety_multiplier: number;
+  base_gas_budget_wei: string;
   per_wallet_fund_wei: string;
 }
 
@@ -379,66 +362,56 @@ export function writeFeeStats(file: FeeStatsFile): void {
 }
 
 /**
- * Suite-side convenience wrapper: query live fees, compute per-wallet
- * fund, persist the fee-stats snapshot for the workflow summary, and
- * return the fund. Folds the boilerplate that all five ephemeral suites
- * share into a single call. The `perCycleCost` selector lets each suite
- * pick the cost shape it actually exercises without the helper having
- * to know which contract paths it touches.
+ * Suite-side convenience wrapper: query live fees + live gas price,
+ * compute per-wallet fund via the flat formula, persist the fee-stats
+ * snapshot for the workflow summary, and return the fund.
  *
  *   const perWalletFund = await sizeFundAndReport({
  *     label: "100w-fresh-aeneid",
  *     network: NETWORK,
  *     publicClient: funderPublic,
- *     perCycleCost: cycleFeeCost,            // or accessFeeCost / uploadFeeCost
- *     cyclesPerWallet: 1,
- *     safetyMultiplier: 3,
  *   });
  *
- * Logs the fee snapshot via `console.log` so the suite's CI output
- * preserves the same one-line trace that the previous bespoke logCase
- * calls produced.
+ * The formula is uniform across suites:
+ *   perWalletFund = 1 IP + 3 × (writeFee + allocateFee + readFee)
+ *
+ * `baseFee` is not part of funding (validator-paid) but is recorded in
+ * the fee-stats JSON for ops visibility. `gas_price_wei` is queried live
+ * off the funder's public client so the workflow summary can surface it
+ * next to fee values (gas price spikes are the most common cause of
+ * insufficient-funds at the read step on aeneid).
  */
 export async function sizeFundAndReport(opts: {
   label: string;
   network: string;
   publicClient: PublicClient;
   contractNetwork?: Network;
-  perCycleCost: (fees: CDRFees) => bigint;
-  cyclesPerWallet: number;
-  safetyMultiplier?: number;
-  gasReservePerCycleWei?: bigint;
 }): Promise<bigint> {
-  const fees = await queryCDRFees(
-    opts.publicClient,
-    opts.contractNetwork ?? "testnet",
-  );
-  const perCycleWei = opts.perCycleCost(fees);
-  const safetyMultiplier = opts.safetyMultiplier ?? 3;
-  const perWalletFund = computePerWalletFund({
-    perCycleWei,
-    cyclesPerWallet: opts.cyclesPerWallet,
-    safetyMultiplier,
-    gasReservePerCycleWei: opts.gasReservePerCycleWei,
-  });
+  const [fees, gasPriceWei] = await Promise.all([
+    queryCDRFees(opts.publicClient, opts.contractNetwork ?? "testnet"),
+    opts.publicClient.getGasPrice(),
+  ]);
+  const userCycleFeeWei = userPerCycleFee(fees);
+  const perWalletFund = computePerWalletFund(fees);
   writeFeeStats({
     label: opts.label,
     network: opts.network,
-    baseFee_wei: fees.baseFee.toString(),
-    writeFee_wei: fees.writeFee.toString(),
-    readFee_wei: fees.readFee.toString(),
-    allocateFee_wei: fees.allocateFee.toString(),
-    per_cycle_wei: perCycleWei.toString(),
-    cycles_per_wallet: opts.cyclesPerWallet,
-    safety_multiplier: safetyMultiplier,
+    base_fee_wei: fees.baseFee.toString(),
+    write_fee_wei: fees.writeFee.toString(),
+    read_fee_wei: fees.readFee.toString(),
+    allocate_fee_wei: fees.allocateFee.toString(),
+    gas_price_wei: gasPriceWei.toString(),
+    user_per_cycle_fee_wei: userCycleFeeWei.toString(),
+    safety_multiplier: Number(FUND_SAFETY_MULTIPLIER),
+    base_gas_budget_wei: BASE_GAS_BUDGET_WEI.toString(),
     per_wallet_fund_wei: perWalletFund.toString(),
   });
   // eslint-disable-next-line no-console
   console.log(
     `[fee-sizing][${opts.label}] base=${fees.baseFee} write=${fees.writeFee} ` +
-      `read=${fees.readFee} allocate=${fees.allocateFee} perCycle=${perCycleWei} ` +
-      `cycles=${opts.cyclesPerWallet} safety=${safetyMultiplier} ` +
-      `perWalletFund=${perWalletFund}`,
+      `read=${fees.readFee} allocate=${fees.allocateFee} gasPrice=${gasPriceWei} ` +
+      `userPerCycle=${userCycleFeeWei} perWalletFund=${perWalletFund} ` +
+      `(= ${BASE_GAS_BUDGET_WEI} base + ${userCycleFeeWei} × ${FUND_SAFETY_MULTIPLIER})`,
   );
   return perWalletFund;
 }
