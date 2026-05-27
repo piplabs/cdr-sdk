@@ -6,6 +6,8 @@ import { ContentSizeExceededError, LabelMismatchError, InvalidConditionContractE
 import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
 
+const SENTINEL_CONDITION_FUNCTION = "__cdrSentinelProbeNoImpl__";
+
 export class Uploader {
   private publicClient: PublicClient;
   private walletClient: WalletClient;
@@ -378,11 +380,7 @@ export class Uploader {
       stateMutability: "view" as const,
     }];
 
-    // Zero-padded dummy bytes (256 bytes each) so well-formed conditions can
-    // run their body to completion under abi.decode of common shapes and
-    // return a value, rather than reverting on truncated input. That keeps
-    // the empty-revert-data signal specific to "selector not found on this
-    // contract" (dispatcher fallback path).
+    // Keep dummy bytes ABI-decodable so empty reverts remain a selector-miss signal.
     const dummyBytes = `0x${"00".repeat(256)}` as `0x${string}`;
     const zeroAddr = "0x0000000000000000000000000000000000000000" as `0x${string}`;
 
@@ -393,31 +391,28 @@ export class Uploader {
         functionName,
         args: [0, dummyBytes, dummyBytes, zeroAddr],
       });
-      return;
     } catch (e: any) {
-      // Function exists iff the call reverted with a non-empty revert payload
-      // (Error string, custom error, Panic, etc.). An empty `0x` revert is
-      // the EVM dispatcher fallback path — the selector isn't routed.
-      // ContractFunctionZeroDataError (EOA / no code at all) and any other
-      // error surface as invalid too.
       const cause = e?.cause;
       const realRevertedWithPayload =
         cause?.name === "ContractFunctionRevertedError" &&
         typeof cause.raw === "string" &&
         cause.raw !== "0x";
+      // Payload reverts are still ambiguous until the sentinel proves unknown
+      // selectors miss cleanly.
       if (!realRevertedWithPayload) {
-        throw new InvalidConditionContractError(address, type);
+        if (
+          cause?.name === "ContractFunctionRevertedError" ||
+          cause?.name === "ContractFunctionZeroDataError"
+        ) {
+          throw new InvalidConditionContractError(address, type);
+        }
+        throw e;
       }
     }
 
-    // Real selector reverted with payload — could be the function body OR a
-    // payload-reverting fallback (e.g. EIP-2535 Diamond's
-    // `Diamond_FunctionDoesNotExist()`). Probe a sentinel selector that no
-    // real condition contract implements; if it ALSO reverts non-empty, we
-    // cannot tell the payload came from our function rather than the
-    // fallback, and conservatively reject. Users with this code shape can
-    // opt out via `skipConditionValidation: true`.
-    const sentinelClean = await this.sentinelProbeIsEmpty(address);
+    // Success and payload reverts can both come from catch-all fallbacks.
+    // Trust the real selector only after an unknown selector cleanly misses.
+    const sentinelClean = await this.sentinelProbeCleanlyMisses(address);
     if (!sentinelClean) {
       throw new InvalidConditionContractError(
         address,
@@ -427,17 +422,14 @@ export class Uploader {
     }
   }
 
-  private async sentinelProbeIsEmpty(
+  private async sentinelProbeCleanlyMisses(
     address: `0x${string}`,
   ): Promise<boolean> {
-    // A fake function name no condition contract would implement; its
-    // selector (keccak256("__cdrSentinelProbeNoImpl__()")[:4]) is
-    // effectively random over the 4-byte space, so collision with a real
-    // selector is astronomically unlikely.
+    // True means the unknown selector missed cleanly; false means a fallback answered it.
     const sentinelAbi = [
       {
         type: "function" as const,
-        name: "__cdrSentinelProbeNoImpl__",
+        name: SENTINEL_CONDITION_FUNCTION,
         inputs: [],
         outputs: [{ name: "", type: "bool" }],
         stateMutability: "view" as const,
@@ -447,10 +439,8 @@ export class Uploader {
       await this.publicClient.simulateContract({
         address,
         abi: sentinelAbi,
-        functionName: "__cdrSentinelProbeNoImpl__",
+        functionName: SENTINEL_CONDITION_FUNCTION,
       });
-      // Returned OK on a fabricated selector → swallow-all fallback. Treat
-      // as not-empty so the caller rejects conservatively.
       return false;
     } catch (sErr: any) {
       const sCause = sErr?.cause;
@@ -462,7 +452,14 @@ export class Uploader {
       ) {
         return true;
       }
-      return false;
+      if (
+        sCause?.name === "ContractFunctionRevertedError" &&
+        typeof sCause.raw === "string" &&
+        sCause.raw !== "0x"
+      ) {
+        return false;
+      }
+      throw sErr;
     }
   }
 

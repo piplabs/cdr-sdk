@@ -13,6 +13,8 @@ import { ContentSizeExceededError } from "../src/errors.js";
 import type { StorageProvider } from "../src/storage/types.js";
 import type { Observer } from "../src/observer.js";
 
+const SENTINEL_CONDITION_FUNCTION = "__cdrSentinelProbeNoImpl__";
+
 function fakeObserver(opts: { maxSize?: bigint } = {}): Observer {
   return {
     getMaxEncryptedDataSize: vi.fn().mockResolvedValue(opts.maxSize ?? 10_000n),
@@ -58,9 +60,16 @@ function mockClients() {
   const publicClient = {
     readContract: vi.fn(),
     waitForTransactionReceipt: vi.fn(),
-    // Default: simulateContract succeeds, modelling a valid condition
-    // contract whose checkRead/Write function returned a bool.
-    simulateContract: vi.fn().mockResolvedValue({ result: true, request: {} }),
+    // Default validation path: real selector returns, sentinel selector misses.
+    simulateContract: vi
+      .fn()
+      .mockImplementation(({ functionName }: { functionName: string }) =>
+        functionName === SENTINEL_CONDITION_FUNCTION
+          ? Promise.reject({
+              cause: { name: "ContractFunctionRevertedError", raw: "0x" },
+            })
+          : Promise.resolve({ result: true, request: {} }),
+      ),
   } as any;
   const walletClient = {
     writeContract: vi.fn(),

@@ -12,6 +12,13 @@ import { tdh2Encrypt } from "@piplabs/cdr-crypto";
 import { ContentSizeExceededError, InvalidConditionContractError } from "../src/errors.js";
 import type { Observer } from "../src/observer.js";
 
+const SENTINEL_CONDITION_FUNCTION = "__cdrSentinelProbeNoImpl__";
+const ERROR_STRING_DEMO_REVERT_RAW =
+  "0x08c379a0" +
+  "0000000000000000000000000000000000000000000000000000000000000020" +
+  "0000000000000000000000000000000000000000000000000000000000000004" +
+  "64656d6f00000000000000000000000000000000000000000000000000000000";
+
 /**
  * Minimal Observer stub for Uploader unit tests. Uploader consults Observer
  * for `maxEncryptedDataSize` (the size-validation gate in `write`) and for
@@ -69,11 +76,16 @@ function mockClients() {
     readContract: vi.fn(),
     waitForTransactionReceipt: vi.fn(),
     getTransactionReceipt: vi.fn(),
-    // Default: simulateContract succeeds, modelling a valid condition
-    // contract whose checkRead/Write function returned a bool. Tests
-    // exercising the rejection paths override this with explicit
-    // mockRejectedValue / mockImplementation.
-    simulateContract: vi.fn().mockResolvedValue({ result: true, request: {} }),
+    // Default validation path: real selector returns, sentinel selector misses.
+    simulateContract: vi
+      .fn()
+      .mockImplementation(({ functionName }: { functionName: string }) =>
+        functionName === SENTINEL_CONDITION_FUNCTION
+          ? Promise.reject({
+              cause: { name: "ContractFunctionRevertedError", raw: "0x" },
+            })
+          : Promise.resolve({ result: true, request: {} }),
+      ),
   } as any;
   const walletClient = {
     writeContract: vi.fn(),
@@ -147,9 +159,6 @@ describe("Uploader", () => {
   });
 
   it("allocate rejects when condition contract does not implement the check function", async () => {
-    // Empty revert payload from a `ContractFunctionRevertedError` is the EVM
-    // dispatcher's fallback signal — the function selector was not routed.
-    // This is the case the previous (buggy) preflight silently accepted.
     const { publicClient, walletClient } = mockClients();
     publicClient.simulateContract.mockRejectedValue({
       cause: { name: "ContractFunctionRevertedError", raw: "0x" },
@@ -172,14 +181,10 @@ describe("Uploader", () => {
       }),
     ).rejects.toThrow(InvalidConditionContractError);
 
-    // Short-circuits before allocate would have been broadcast.
     expect(walletClient.writeContract).not.toHaveBeenCalled();
   });
 
   it("allocate rejects condition revert whose cause has no raw field (#95)", async () => {
-    // Regression for #95: the original guard `cause.raw !== "0x"` was
-    // silently true when `raw` was undefined, passing the contract as
-    // valid. The typeof tightening now routes this to selector-miss.
     const { publicClient, walletClient } = mockClients();
     publicClient.simulateContract.mockRejectedValue({
       cause: { name: "ContractFunctionRevertedError" }, // no `raw`
@@ -208,10 +213,6 @@ describe("Uploader", () => {
   });
 
   it("allocate rejects when condition call surfaces ContractFunctionZeroDataError (EOA / no code)", async () => {
-    // viem returns this when the call returns `0x` with no revert —
-    // what an EOA, or a contract whose dispatcher returns nothing,
-    // looks like. Distinct shape from ContractFunctionRevertedError;
-    // also maps to selector-miss.
     const { publicClient, walletClient } = mockClients();
     publicClient.simulateContract.mockRejectedValue({
       cause: { name: "ContractFunctionZeroDataError" },
@@ -240,20 +241,11 @@ describe("Uploader", () => {
   });
 
   it("allocate accepts when condition function body reverts with non-empty data", async () => {
-    // Function exists and reverted with an Error(string) payload —
-    // selector 0x08c379a0 + abi-encoded "demo". The preflight treats a
-    // non-empty revert payload as "selector found, body ran" only when
-    // the sentinel probe confirms the contract doesn't have a catch-all
-    // fallback that would produce the same shape.
     const { publicClient, walletClient } = mockClients();
     const realRevert = {
       cause: {
         name: "ContractFunctionRevertedError",
-        raw:
-          "0x08c379a0" +
-          "0000000000000000000000000000000000000000000000000000000000000020" +
-          "0000000000000000000000000000000000000000000000000000000000000004" +
-          "64656d6f00000000000000000000000000000000000000000000000000000000",
+        raw: ERROR_STRING_DEMO_REVERT_RAW,
       },
     };
     const sentinelRevert = {
@@ -262,7 +254,7 @@ describe("Uploader", () => {
     publicClient.simulateContract.mockImplementation(
       ({ functionName }: { functionName: string }) =>
         Promise.reject(
-          functionName === "__cdrSentinelProbeNoImpl__"
+          functionName === SENTINEL_CONDITION_FUNCTION
             ? sentinelRevert
             : realRevert,
         ),
@@ -292,20 +284,11 @@ describe("Uploader", () => {
   });
 
   it("allocate rejects when contract has a payload-reverting fallback (ambiguous)", async () => {
-    // Both the real-selector and sentinel-selector calls revert with the
-    // same Error(string) payload — modelling a contract whose fallback
-    // reverts with a non-empty payload. We cannot tell whether the real
-    // call's payload came from the function body or the fallback, so the
-    // preflight rejects conservatively with reason="ambiguous-fallback".
     const { publicClient, walletClient } = mockClients();
     const payloadRevert = {
       cause: {
         name: "ContractFunctionRevertedError",
-        raw:
-          "0x08c379a0" +
-          "0000000000000000000000000000000000000000000000000000000000000020" +
-          "0000000000000000000000000000000000000000000000000000000000000004" +
-          "64656d6f00000000000000000000000000000000000000000000000000000000",
+        raw: ERROR_STRING_DEMO_REVERT_RAW,
       },
     };
     publicClient.simulateContract.mockRejectedValue(payloadRevert);
@@ -334,11 +317,6 @@ describe("Uploader", () => {
   });
 
   it("allocate rejects when sentinel probe returns OK (swallow-all fallback)", async () => {
-    // Real-selector call reverts with a payload (looks like a body
-    // revert), but the sentinel call returns successfully — the
-    // contract has a fallback that accepts any selector, so we cannot
-    // trust the original payload-revert came from the real function.
-    // Conservative reject.
     const { publicClient, walletClient } = mockClients();
     const realRevert = {
       cause: {
@@ -348,7 +326,7 @@ describe("Uploader", () => {
     };
     publicClient.simulateContract.mockImplementation(
       ({ functionName }: { functionName: string }) =>
-        functionName === "__cdrSentinelProbeNoImpl__"
+        functionName === SENTINEL_CONDITION_FUNCTION
           ? Promise.resolve({ result: true, request: {} })
           : Promise.reject(realRevert),
     );
@@ -375,6 +353,83 @@ describe("Uploader", () => {
     expect(walletClient.writeContract).not.toHaveBeenCalled();
   });
 
+  it("allocate rejects when the real selector itself returns OK via a swallow-all fallback", async () => {
+    const { publicClient, walletClient } = mockClients();
+    publicClient.simulateContract.mockResolvedValue({ result: true, request: {} });
+
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer: fakeObserver(),
+    });
+
+    await expect(
+      uploader.allocate({
+        updatable: false,
+        writeConditionAddr: "0x1111111111111111111111111111111111111111",
+        readConditionAddr: "0x2222222222222222222222222222222222222222",
+        writeConditionData: "0x",
+        readConditionData: "0x",
+      }),
+    ).rejects.toMatchObject({
+      code: "INVALID_CONDITION_CONTRACT",
+      reason: "ambiguous-fallback",
+    });
+    expect(walletClient.writeContract).not.toHaveBeenCalled();
+  });
+
+  it("allocate surfaces a transport error from the sentinel probe instead of masking it as ambiguous", async () => {
+    const { publicClient, walletClient } = mockClients();
+    publicClient.simulateContract.mockImplementation(
+      ({ functionName }: { functionName: string }) =>
+        functionName === SENTINEL_CONDITION_FUNCTION
+          ? Promise.reject(new Error("HTTP request failed"))
+          : Promise.resolve({ result: true, request: {} }),
+    );
+
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer: fakeObserver(),
+    });
+
+    await expect(
+      uploader.allocate({
+        updatable: false,
+        writeConditionAddr: "0x1111111111111111111111111111111111111111",
+        readConditionAddr: "0x2222222222222222222222222222222222222222",
+        writeConditionData: "0x",
+        readConditionData: "0x",
+      }),
+    ).rejects.toThrow("HTTP request failed");
+    expect(walletClient.writeContract).not.toHaveBeenCalled();
+  });
+
+  it("allocate surfaces a transport error from the real probe instead of masking it as invalid", async () => {
+    const { publicClient, walletClient } = mockClients();
+    publicClient.simulateContract.mockRejectedValue(new Error("RPC timeout"));
+
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer: fakeObserver(),
+    });
+
+    await expect(
+      uploader.allocate({
+        updatable: false,
+        writeConditionAddr: "0x1111111111111111111111111111111111111111",
+        readConditionAddr: "0x2222222222222222222222222222222222222222",
+        writeConditionData: "0x",
+        readConditionData: "0x",
+      }),
+    ).rejects.toThrow("RPC timeout");
+    expect(walletClient.writeContract).not.toHaveBeenCalled();
+  });
+
   it("allocate preflight probes condition contracts with the 4-arg signature", async () => {
     const { publicClient, walletClient } = mockClients();
     publicClient.readContract.mockResolvedValueOnce(1000n);
@@ -398,12 +453,19 @@ describe("Uploader", () => {
       readConditionData: "0x",
     });
 
-    // Once per side. The exact signature matters: regressing to the 3-arg
-    // form would silently misalign with deployed condition contracts.
-    expect(publicClient.simulateContract).toHaveBeenCalledTimes(2);
-    for (const call of publicClient.simulateContract.mock.calls) {
-      const { abi, functionName, args } = call[0];
-      expect(["checkWriteCondition", "checkReadCondition"]).toContain(functionName);
+    const calls = publicClient.simulateContract.mock.calls.map((c: any[]) => c[0]);
+    const realCalls = calls.filter(
+      (c: any) => c.functionName !== SENTINEL_CONDITION_FUNCTION,
+    );
+    const sentinelCalls = calls.filter(
+      (c: any) => c.functionName === SENTINEL_CONDITION_FUNCTION,
+    );
+    expect(realCalls).toHaveLength(2);
+    expect(realCalls.map((c: any) => c.functionName).sort()).toEqual([
+      "checkReadCondition",
+      "checkWriteCondition",
+    ]);
+    for (const { abi, args } of realCalls) {
       expect(abi[0].inputs).toEqual([
         { name: "uuid", type: "uint32" },
         { name: "accessAuxData", type: "bytes" },
@@ -412,6 +474,7 @@ describe("Uploader", () => {
       ]);
       expect(args).toHaveLength(4);
     }
+    expect(sentinelCalls).toHaveLength(2);
   });
 
   it("write sends tx with correct fee", async () => {

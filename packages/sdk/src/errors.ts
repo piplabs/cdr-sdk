@@ -73,7 +73,7 @@ export class InvalidConditionContractError extends CDRError {
   ) {
     const detail =
       reason === "ambiguous-fallback"
-        ? "preflight conservatively rejected: contract has a non-empty-revert fallback that shadows the selector check. If the contract is correct, pass `skipConditionValidation: true` to bypass this preflight"
+        ? "preflight conservatively rejected: a catch-all fallback answered an unknown selector by returning a value or reverting with data. If the contract is correct, pass `skipConditionValidation: true` to bypass this preflight"
         : "does not implement the required interface";
     super(
       `${type} condition contract at ${address} ${detail}`,
