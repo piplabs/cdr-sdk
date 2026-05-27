@@ -74,6 +74,10 @@ const READ_ONLY_ENV = {
   CDR_RPC_URL: RPC_URL!,
 };
 
+// Accepts the deployed CDR condition selectors and cleanly rejects unknown selectors.
+const OPEN_CONDITION_BYTECODE =
+  "0x602a600c600039602a6000f360003560e01c80635645dbbf14601f5780638db3eb1714601f5760006000fd5b600160005260206000f3" as `0x${string}`;
+
 /**
  * Spawn the built CLI binary with an explicit env (no parent inheritance,
  * so the test's own env doesn't leak). `reject: false` lets us inspect
@@ -106,13 +110,10 @@ beforeAll(async () => {
   const publicClient = createPublicClient({ transport: http(RPC_URL) }) as PublicClient;
   const walletClient = createWalletClient({ account, transport: http(RPC_URL) }) as WalletClient;
 
-  // Same 10-byte runtime as packages/sdk/__integration__: returns 32-byte
-  // 0x...01 for any call → CDR contract reads as "condition met".
-  const bytecode = "0x600a600c600039600a6000f3600160005260206000f3" as `0x${string}`;
   const txHash = await walletClient.sendTransaction({
     chain: walletClient.chain ?? null,
     account: walletClient.account ?? null,
-    data: bytecode,
+    data: OPEN_CONDITION_BYTECODE,
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
   if (!receipt.contractAddress) {
