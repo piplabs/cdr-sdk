@@ -75,11 +75,21 @@ jobs:
       - id: resolve
         name: Resolve effective inputs
         run: |
-          # workflow_call (from cdr-monitor-per-round.yml) carries the same
-          # input shape as workflow_dispatch, so the two paths are treated
-          # identically. Only pull_request falls back to the safe defaults.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
-             || [ "${{ github.event_name }}" = "workflow_call" ]; then
+          # Key off the presence of `inputs.network`, NOT `github.event_name`.
+          #
+          # In a reusable workflow `github.event_name` reflects the CALLER's
+          # top-level trigger, not "workflow_call". cdr-monitor-per-round.yml
+          # is `schedule`-triggered, so when it invokes this workflow via
+          # `workflow_call` the event_name here is "schedule" — the old
+          # `event_name == workflow_call` check never matched and silently
+          # fell through to the devnet default, running the aeneid monitor's
+          # suite against devnet (run 26495210233: monitor fired on aeneid
+          # round 12→13 but tested devnet).
+          #
+          # `inputs.network` is populated for BOTH workflow_dispatch (has a
+          # `default`) and workflow_call (`required: true`), and is empty for
+          # pull_request (no inputs). So presence is the reliable signal.
+          if [ -n "${{ inputs.network }}" ]; then
             NETWORK="${{ inputs.network }}"
             SUITE="${{ inputs.test_suite }}"
           else
