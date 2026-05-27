@@ -134,7 +134,10 @@ export async function waitForReceiptResilient(
       await new Promise((resolve) => setTimeout(resolve, 2000));
     }
   }
-  throw lastError;
+  // The loop always runs at least once (deadlineMs is now + 5 min), so
+  // lastError is always set here — the fallback is for the type-checker and
+  // to avoid a stackless `throw undefined` if the deadline logic ever changes.
+  throw lastError ?? new Error("waitForReceiptResilient: receipt wait deadline exceeded");
 }
 
 /**
