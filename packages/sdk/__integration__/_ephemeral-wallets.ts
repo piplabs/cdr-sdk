@@ -24,6 +24,7 @@ import {
   type Chain,
   type Hex,
   type PublicClient,
+  type Transport,
   type WalletClient,
   createWalletClient,
   http,
@@ -39,6 +40,7 @@ import {
   MULTICALL3_ABI,
   buildMulticall3CreationBytecode,
 } from "./_multicall3-artifact.js";
+import { waitForReceiptResilient } from "./_rpc-resilience.js";
 
 export interface EphemeralWallet {
   privateKey: Hex;
@@ -94,7 +96,7 @@ export async function ensureMulticall3(
     to: null,
     data: buildMulticall3CreationBytecode(),
   });
-  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  const receipt = await waitForReceiptResilient(publicClient, hash);
   if (!receipt.contractAddress) {
     throw new Error(
       `ensureMulticall3: deployment receipt missing contractAddress (tx ${hash})`,
@@ -150,7 +152,7 @@ export async function fundWallets(
     args: [calls],
     value: totalFundedWei,
   });
-  await publicClient.waitForTransactionReceipt({ hash: txHash });
+  await waitForReceiptResilient(publicClient, txHash);
 
   return { multicall3Address, totalFundedWei, txHash };
 }
@@ -173,6 +175,13 @@ export interface RefundResult {
  * the failure and continues. The reasoning: a single ephemeral wallet
  * being un-refundable (e.g. it ran out of gas mid-workload, or its
  * nonce is wedged) should not mask the test's primary outcome.
+ *
+ * `transportFactory` defaults to viem's bare `http`; on rate-limited
+ * public endpoints (e.g. Aeneid) callers may pass `resilientHttp` so
+ * a 429 storm during the refund pass doesn't silently inflate the
+ * `failedRefunds` count (which would in turn overstate the cost-model
+ * `burned_wei` derived from refund totals). DevNet callers omit the
+ * arg and behavior is byte-identical to the pre-arg version.
  */
 export async function refundWallets(
   publicClient: PublicClient,
@@ -180,6 +189,7 @@ export async function refundWallets(
   recipient: Address,
   rpcUrl: string,
   gasReserveWei: bigint = parseEther("0.001"),
+  transportFactory: (url: string) => Transport = http,
 ): Promise<RefundResult> {
   const chain = publicClient.chain as Chain;
 
@@ -193,14 +203,14 @@ export async function refundWallets(
         const wc = createWalletClient({
           account: w.account,
           chain,
-          transport: http(rpcUrl),
+          transport: transportFactory(rpcUrl),
         });
         const hash = await wc.sendTransaction({
           to: recipient,
           value: sweepAmount,
           gas: 21_000n,
         });
-        await publicClient.waitForTransactionReceipt({ hash });
+        await waitForReceiptResilient(publicClient, hash);
         return sweepAmount;
       } catch {
         return -1n; // sentinel for failed sweep

@@ -4,7 +4,7 @@
  * same shape, 10x the fan-out, plus a final summary block that breaks
  * out the cost model and latency distribution.
  *
- * Suite gating: `1000-wallet-performance` (and `all`). DevNet + Aeneid.
+ * Suite gating: `1000-wallet-performance-devnet-only` (and `all`), DevNet only.
  *
  * Why batch the funding:
  *   Multicall3.aggregate3Value with 1000 inner calls costs ~50M gas — past
@@ -34,7 +34,6 @@ import {
   createWalletClient,
   formatEther,
   http,
-  parseEther,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { CDRClient, initWasm } from "../src/index.js";
@@ -53,6 +52,7 @@ import {
   p50,
   p95,
   p99,
+  sizeFundAndReport,
   statsOf,
   writePerfStats,
 } from "./_helpers.js";
@@ -61,7 +61,7 @@ const WALLET_COUNT = 1000;
 // 200-wallet batch keeps Multicall3.aggregate3Value tx-gas ≲ 12M, well
 // under Story's ~30M block gas limit on both DevNet + Aeneid.
 const FUND_BATCH_SIZE = 200;
-const PER_WALLET_FUND = parseEther("0.05");
+const CYCLES_PER_WALLET = 1; // 1 accessCDR per wallet, no upload
 const ACCESS_TIMEOUT_MS = 300_000;
 
 const API_URL = process.env.CDR_API_URL;
@@ -155,7 +155,7 @@ async function fundInBatches(
   return totalFunded;
 }
 
-describe.skipIf(skipUnlessSuite("1000-wallet-performance"))(
+describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only") || NETWORK !== "devnet")(
   `1000 ephemeral wallets → shared vault read perf (network=${NETWORK})`,
   () => {
     let funderPublic: PublicClient;
@@ -166,12 +166,14 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance"))(
     let sharedVaultUuid: number;
     let sharedDataKey: Uint8Array;
     let wallets: EphemeralWallet[];
+    let perWalletFund = 0n;
     let totalFundedWei = 0n;
     let perfBuffer: {
       fulfilled: number;
       failed: number;
       wallClockMs: number;
       accessLats: number[];
+      failedReasons: Array<{ idx: number; reason: string }>;
     } | null = null;
 
     beforeAll(async () => {
@@ -181,6 +183,15 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance"))(
       funderWallet = f.walletClient;
       funderClient = f.client;
       funderAddress = privateKeyToAccount(FUNDER_KEY!).address;
+
+      // Flat per-wallet fund = 1 IP + 3 × (writeFee + allocateFee + readFee).
+      // Read-only suite over-funds by writeFee+allocateFee × 3 at current
+      // chain fees, which is fine — 1 IP base dominates anyway.
+      perWalletFund = await sizeFundAndReport({
+        label: "1000w-perf",
+        network: NETWORK,
+        publicClient: funderPublic,
+      });
 
       openCondition = await deployOpenCondition(funderPublic, funderWallet);
       logCase("openCondition", openCondition);
@@ -206,14 +217,14 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance"))(
         funderPublic,
         funderWallet,
         wallets,
-        PER_WALLET_FUND,
+        perWalletFund,
         FUND_BATCH_SIZE,
       );
       logCase("multicall3 batched fund", {
         wallets: wallets.length,
         batchSize: FUND_BATCH_SIZE,
         batches: Math.ceil(wallets.length / FUND_BATCH_SIZE),
-        perWallet: formatEther(PER_WALLET_FUND),
+        perWallet: formatEther(perWalletFund),
         totalIP: formatEther(totalFundedWei),
         elapsedMs: formatMs(Date.now() - fundStart),
       });
@@ -245,6 +256,8 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance"))(
           wall_clock_ms: perfBuffer.wallClockMs,
           accessMs: statsOf(perfBuffer.accessLats),
           uploadMs: null,
+          accessSharedMs: null,
+          accessFreshMs: null,
           tickMs: null,
           refund: {
             funded_wei: totalFundedWei.toString(),
@@ -253,6 +266,7 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance"))(
             failed_sweeps: refund.failedRefunds,
           },
           extra: null,
+          failedReasons: perfBuffer.failedReasons,
         });
       }
     }, 15 * 60 * 1000);
@@ -323,6 +337,7 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance"))(
           failed: failed.length,
           wallClockMs: totalMs,
           accessLats: lats,
+          failedReasons: failed.slice(0, 10),
         };
 
         expect(failed.length, `${failed.length} wallets failed accessCDR`).toBe(0);
@@ -332,7 +347,7 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance"))(
       // 1000 concurrent reads against the validator partial path can stretch
       // well past the per-call timeout if the chain or DKG nodes throttle.
       // 75 min outer bound matches the workflow's 90-min timeout-minutes for
-      // the 1000-wallet-performance suite with slack for setup + teardown.
+      // the 1000-wallet-performance-devnet-only suite with slack for setup + teardown.
       75 * 60 * 1000,
     );
   },

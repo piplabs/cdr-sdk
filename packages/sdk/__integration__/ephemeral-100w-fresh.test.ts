@@ -35,7 +35,6 @@ import {
   createPublicClient,
   createWalletClient,
   http,
-  parseEther,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { CDRClient, initWasm } from "../src/index.js";
@@ -46,10 +45,19 @@ import {
   generateEphemeralWallets,
   refundWallets,
 } from "./_ephemeral-wallets.js";
-import { formatMs, logCase, mean, p50, p95, statsOf, writePerfStats } from "./_helpers.js";
+import {
+  formatMs,
+  logCase,
+  mean,
+  p50,
+  p95,
+  sizeFundAndReport,
+  statsOf,
+  writePerfStats,
+} from "./_helpers.js";
 
 const WALLET_COUNT = 100;
-const PER_WALLET_FUND = parseEther("0.1");
+const CYCLES_PER_WALLET = 1; // upload + access
 const ACCESS_TIMEOUT_MS = 180_000;
 
 const API_URL = process.env.CDR_API_URL;
@@ -118,7 +126,7 @@ async function deployOpenCondition(
   return receipt.contractAddress;
 }
 
-describe.skipIf(skipUnlessSuite("default"))(
+describe.skipIf(skipUnlessSuite("default") || NETWORK !== "devnet")(
   `100 ephemeral wallets → fresh vault per wallet (network=${NETWORK})`,
   () => {
     let funderPublic: PublicClient;
@@ -126,6 +134,7 @@ describe.skipIf(skipUnlessSuite("default"))(
     let funderAddress: `0x${string}`;
     let openCondition: `0x${string}`;
     let wallets: EphemeralWallet[];
+    let perWalletFund = 0n;
     let totalFundedWei = 0n;
     let perfBuffer: {
       fulfilled: number;
@@ -133,6 +142,7 @@ describe.skipIf(skipUnlessSuite("default"))(
       wallClockMs: number;
       uploadLats: number[];
       accessLats: number[];
+      failedReasons: Array<{ idx: number; reason: string }>;
     } | null = null;
 
     beforeAll(async () => {
@@ -142,6 +152,14 @@ describe.skipIf(skipUnlessSuite("default"))(
       funderWallet = f.walletClient;
       funderAddress = privateKeyToAccount(FUNDER_KEY!).address;
 
+      // Flat per-wallet fund = 1 IP + 3 × (writeFee + allocateFee + readFee).
+      // See _helpers.ts::computePerWalletFund for the rationale.
+      perWalletFund = await sizeFundAndReport({
+        label: "100w-fresh",
+        network: NETWORK,
+        publicClient: funderPublic,
+      });
+
       openCondition = await deployOpenCondition(funderPublic, funderWallet);
       logCase("openCondition", openCondition);
 
@@ -150,13 +168,13 @@ describe.skipIf(skipUnlessSuite("default"))(
         funderPublic,
         funderWallet,
         wallets,
-        PER_WALLET_FUND,
+        perWalletFund,
       );
       totalFundedWei = fund.totalFundedWei;
       logCase("multicall3 batch fund", {
         multicall3: fund.multicall3Address,
         wallets: wallets.length,
-        perWallet: PER_WALLET_FUND.toString(),
+        perWallet: perWalletFund.toString(),
         totalWei: fund.totalFundedWei.toString(),
         txHash: fund.txHash,
       });
@@ -184,6 +202,8 @@ describe.skipIf(skipUnlessSuite("default"))(
           wall_clock_ms: perfBuffer.wallClockMs,
           accessMs: statsOf(perfBuffer.accessLats),
           uploadMs: statsOf(perfBuffer.uploadLats),
+          accessSharedMs: null,
+          accessFreshMs: null,
           tickMs: null,
           refund: {
             funded_wei: totalFundedWei.toString(),
@@ -192,6 +212,7 @@ describe.skipIf(skipUnlessSuite("default"))(
             failed_sweeps: refund.failedRefunds,
           },
           extra: null,
+          failedReasons: perfBuffer.failedReasons,
         });
       }
     }, 5 * 60 * 1000);
@@ -281,6 +302,7 @@ describe.skipIf(skipUnlessSuite("default"))(
           wallClockMs: totalMs,
           uploadLats,
           accessLats,
+          failedReasons: failed.slice(0, 10),
         };
 
         expect(failed.length, `${failed.length} wallets failed`).toBe(0);

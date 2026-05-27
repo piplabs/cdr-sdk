@@ -32,6 +32,7 @@ const client = new CDRClient({
   network: "testnet",
   publicClient: createPublicClient({ transport: http("https://aeneid.storyrpc.io") }),
   walletClient: createWalletClient({ account, transport: http("https://aeneid.storyrpc.io") }),
+  apiUrl: "http://172.192.41.96:1317", // Story-API REST endpoint — see Networks table in repo README
 });
 
 const globalPubKey = await client.observer.getGlobalPubKey();

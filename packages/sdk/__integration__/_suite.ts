@@ -4,11 +4,11 @@
  * The workflow dispatches with one of:
  *   default                   — basic integration + 100-wallet ephemeral tests
  *   all                       — everything including 1000w perf + 60min stress
- *   1000-wallet-performance   — only the 1000-wallet perf suite
+ *   1000-wallet-performance-devnet-only   — only the 1000-wallet perf suite
  *   1H-stress-devnet-only     — only the 60-min combined stress (DevNet only)
  *
  * Test files gate their `describe` block via:
- *   describe.skipIf(skipUnlessSuite("1000-wallet-performance"))(...)
+ *   describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only"))(...)
  *
  * `all` always runs every gated suite.
  */
@@ -16,7 +16,7 @@
 export type TestSuite =
   | "default"
   | "all"
-  | "1000-wallet-performance"
+  | "1000-wallet-performance-devnet-only"
   | "1H-stress-devnet-only";
 
 export type Network = "devnet" | "aeneid";

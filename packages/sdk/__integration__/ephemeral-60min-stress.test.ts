@@ -7,22 +7,33 @@
  *
  * Pattern (1 hour total, **no artificial pacing**):
  *   1. Funder deploys an open-condition contract + uploads 1 shared CDR
- *      vault with a random dataKey.
+ *      vault with a random dataKey (the "old shared uuid" all wallets
+ *      will read every cycle).
  *   2. 10 ephemeral wallets, Multicall3 batch-funded with 1000 IP each
  *      (deliberately oversized — pipeline mode does hundreds of cycles
  *      per wallet over the hour).
- *   3. **Pipeline mode:** each wallet runs an independent async loop —
- *      `while (elapsed < 60min) { uploadCDR(fresh vault); accessCDR(shared); }` —
+ *   3. **Pipeline mode (3 ops per cycle):** each wallet runs an
+ *      independent async loop covering both read patterns —
+ *      `while (elapsed < 60min) {
+ *         uploadCDR(fresh vault);          // write fresh-uuid
+ *         accessCDR(sharedVault);          // read same-uuid (validator cache benefit)
+ *         accessCDR(ownFreshVault);        // read fresh-uuid (no caching)
+ *       }`
  *      with no sleep between cycles. 10 wallet loops in parallel via
- *      `Promise.all`. The chain + DKG path see steady back-to-back load.
- *   4. **Soft failures:** a single cycle that throws (or recovers a
+ *      `Promise.all`. Replaces the deleted Workflow A
+ *      (cdr-sdk-stress-test.yml) from the e2e repo — same-uuid +
+ *      fresh-uuid coverage in a single 1h run.
+ *   4. **Failure handling:** a single cycle that throws (or recovers a
  *      mismatched dataKey on the shared vault) is recorded in a failure
- *      counter, but does NOT abort the wallet — the loop moves on to the
- *      next cycle. This matches what stress is for: surface failure
- *      rates under load, not assert zero failures.
- *   5. Final assertion: at least some cycles completed (smoke check).
- *      The real signal is the perf-stats JSON output: upload + access
- *      latency distribution, total cycles, failure ratio.
+ *      counter and the wallet's loop continues so we collect ALL
+ *      failures across the wave (not just the first one). At the end of
+ *      the run the test asserts `failedCycles === 0` — any non-zero
+ *      count fails the test. To diagnose, grep the output for
+ *      `[w[N] cycle=M FAILED] <msg>`.
+ *   5. Final assertions: (a) at least one cycle was attempted, (b)
+ *      zero cycles failed. The perf-stats JSON output (upload + access
+ *      latency distributions, total cycles, failure ratio) remains
+ *      available for trend analysis.
  *
  * Why pipeline (vs the old 10s-tick model):
  *   The previous version slept up to 10s between batches to maintain a
@@ -38,9 +49,11 @@
  * (`cdr-stress-log-<run_id>`).
  *
  * Perf-stats JSON: `/tmp/perf-stats-stress.json` is written in afterAll
- * with the `PerfStatsFile` shape (uploadMs, accessMs, refund summary,
- * extra.total_cycles / extra.failed_cycles), so the workflow's summary
- * step renders the same per-suite perf row as the 100w/1000w suites.
+ * with the `PerfStatsFile` shape (uploadMs, accessSharedMs, accessFreshMs,
+ * refund summary, extra.total_cycles / extra.failed_cycles). The
+ * workflow's summary step renders 3 perf rows for stress (upload +
+ * access (shared) + access (fresh)) so the latency gap between
+ * cached same-uuid reads and uncached fresh-uuid reads is visible.
  *
  * Run locally (DevNet only):
  *   pnpm test:stress
@@ -71,11 +84,32 @@ import {
   generateEphemeralWallets,
   refundWallets,
 } from "./_ephemeral-wallets.js";
-import { statsOf, writePerfStats } from "./_helpers.js";
+import {
+  sizeFundAndReport,
+  statsOf,
+  writePerfStats,
+} from "./_helpers.js";
 
 const DURATION_MS = 60 * 60 * 1000; // 1 hour
 const CONCURRENCY = 10;
-const PER_WALLET_FUND = parseEther("1000");
+// Documentary constant — real run on devnet does ~120-200 cycles in 1 hour.
+const ESTIMATED_CYCLES_PER_WALLET = 1000;
+// Fixed per-wallet fund for the 1-hour stress run on devnet. Each cycle
+// pays `writeFee + allocateFee + 2 × readFee` (upload + 2 × accessCDR),
+// so at ~150 cycles × 0.04 IP/cycle (devnet) + gas overhead we need
+// ~7-10 IP per wallet. 100 IP gives ~10× safety on devnet (anvil-0
+// funder has effectively unlimited IP, and `refundWallets` sweeps any
+// unused balance back at teardown — over-funding is cheap, exhausting
+// mid-run is not). Stress is `skipUnlessDevnet`-gated, so aeneid /
+// mainnet never hit this code path.
+//
+// History: PR #109 inlined this into the dynamic-fee formula with
+// `cyclesPerWallet=1000` + `safetyMultiplier=3`, producing ~155 IP/wallet
+// on devnet. PR #113 flattened that formula but accidentally dropped the
+// cycle-count factor — the resulting ~1.09 IP/wallet exhausted after
+// ~25 cycles. Reverted to a fixed value here, queried-fee path lives in
+// `sizeFundAndReport`'s formula branch and is reserved for short suites.
+const STRESS_PER_WALLET_FUND = parseEther("100");
 // Generous reserve absorbs any pending-tx mempool cost when refund runs
 // right after the last cycle. Loses ~10 IP across 10 wallets — DevNet
 // anvil-0 has unlimited dev IP, so trading a little waste for refund
@@ -183,7 +217,7 @@ function logLine(line: string): void {
 }
 
 describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
-  `60-min pipelined stress: ${CONCURRENCY} wallets upload+access loop on DevNet`,
+  `60-min pipelined stress: ${CONCURRENCY} wallets 3-op (upload + read shared + read fresh) loop on DevNet`,
   () => {
     let funderPublic: PublicClient;
     let funderWallet: WalletClient;
@@ -193,6 +227,7 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
     let sharedVaultUuid: number;
     let sharedDataKey: Uint8Array;
     let stressWallets: StressWallet[] = [];
+    let perWalletFund = 0n;
     let totalFundedWei = 0n;
     // Populated by `it`, consumed by `afterAll` to emit the perf-stats
     // JSON. `null` until the workload completes; afterAll skips the write
@@ -200,7 +235,8 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
     // before reaching the workload).
     let perfBuffer: {
       uploadLats: number[];
-      accessLats: number[];
+      accessSharedLats: number[];
+      accessFreshLats: number[];
       totalCycles: number;
       failedCycles: number;
       wallClockMs: number;
@@ -217,6 +253,19 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
       funderWallet = f.walletClient;
       funderClient = f.client;
       funderAddress = privateKeyToAccount(FUNDER_KEY!).address;
+
+      // Stress uses a fixed override (100 IP/wallet) — the flat formula
+      // branch is for short suites and can't cover ~150 cycles' worth
+      // of fees over 1h. We still call `sizeFundAndReport` (not a bespoke
+      // path) so the workflow summary table has a row with live fees +
+      // gas price for this suite, same shape as every other suite. See
+      // STRESS_PER_WALLET_FUND comment above for the sizing rationale.
+      perWalletFund = await sizeFundAndReport({
+        label: "60min-stress",
+        network: NETWORK,
+        publicClient: funderPublic,
+        overrideFundWei: STRESS_PER_WALLET_FUND,
+      });
 
       openCondition = await deployOpenCondition(funderPublic, funderWallet);
       logLine(`[suite-setup] openCondition deployed at ${openCondition}`);
@@ -243,13 +292,13 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
         funderPublic,
         funderWallet,
         ephs,
-        PER_WALLET_FUND,
+        perWalletFund,
       );
       totalFundedWei = fund.totalFundedWei;
       stressWallets = ephs.map(makeStressWallet);
       logLine(
         `[suite-setup] funded ${stressWallets.length} wallets via Multicall3 ` +
-          `${fund.multicall3Address} (tx ${fund.txHash}); ${formatEther(PER_WALLET_FUND)} IP each`,
+          `${fund.multicall3Address} (tx ${fund.txHash}); ${formatEther(perWalletFund)} IP each`,
       );
     }, 10 * 60 * 1000);
 
@@ -303,7 +352,12 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
           failed: perfBuffer.failedCycles,
           wall_clock_ms: perfBuffer.wallClockMs,
           uploadMs: statsOf(perfBuffer.uploadLats),
-          accessMs: statsOf(perfBuffer.accessLats),
+          // Stress emits 2 access rows (shared + fresh); accessMs is
+          // left null so the workflow's perf-table jq skips the
+          // unified single-access row branch for this suite.
+          accessMs: null,
+          accessSharedMs: statsOf(perfBuffer.accessSharedLats),
+          accessFreshMs: statsOf(perfBuffer.accessFreshLats),
           tickMs: null,
           refund: {
             funded_wei: totalFundedWei.toString(),
@@ -321,30 +375,44 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
               100
             ).toFixed(2),
           },
+          // Stress reports failures per-cycle in `extra.failed_cycles`,
+          // not per-wallet; there's no per-failure reason to surface.
+          failedReasons: null,
         });
       }
     }, 10 * 60 * 1000);
 
     it(
-      `${CONCURRENCY} wallets pipeline upload+access for 1h, no inter-cycle delay`,
+      `${CONCURRENCY} wallets pipeline upload + read(shared) + read(fresh) for 1h, no inter-cycle delay`,
       async () => {
         const startTime = Date.now();
         const uploadLats: number[] = [];
-        const accessLats: number[] = [];
+        const accessSharedLats: number[] = [];
+        const accessFreshLats: number[] = [];
         let totalCycles = 0;
         let failedCycles = 0;
+        // First-failure capture for the zero-tolerance assert at the
+        // end. The `[w[N] cycle=M FAILED]` log lines go to
+        // /tmp/cdr-stress.log which the workflow archives as an
+        // artifact, but vitest's CI failure surface usually just shows
+        // the assertion message — operators shouldn't have to download
+        // an artifact to find the first failing wallet/cycle. JS is
+        // single-threaded so the `if (!firstFailure)` check + assign
+        // can't race even though 10 wallets run concurrently.
+        let firstFailure: string | null = null;
 
         // Each wallet's loop is independent — Promise.all runs all 10 in
-        // parallel. Within a wallet the cycle is sequential (upload then
-        // access) so the wallet's nonce stream stays monotonic; across
-        // wallets there's no synchronization (no tick boundary).
+        // parallel. Within a wallet the cycle is strictly sequential
+        // (upload → read shared → read own fresh) so the wallet's nonce
+        // stream stays monotonic; across wallets there's no
+        // synchronization (no tick boundary, no phase barrier).
         await Promise.all(
           stressWallets.map(async (w, idx) => {
             let cycleIdx = 0;
             while (Date.now() - startTime < DURATION_MS) {
               cycleIdx++;
               try {
-                // ----- UPLOAD (own fresh vault) -----
+                // ----- PHASE 1: UPLOAD (own fresh vault) -----
                 const dataKey = crypto.getRandomValues(new Uint8Array(32));
                 const globalPubKey = await w.client.observer.getGlobalPubKey();
                 const tUpload = Date.now();
@@ -363,30 +431,63 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
                   `[w[${idx}] cycle=${cycleIdx} UPLOAD ok] uuid=${upload.uuid} ${uploadDur}ms`,
                 );
 
-                // ----- ACCESS shared vault -----
-                const tAccess = Date.now();
-                const access = await w.client.consumer.accessCDR({
+                // ----- PHASE 2: ACCESS shared vault (same-uuid read) -----
+                const tShared = Date.now();
+                const sharedAccess = await w.client.consumer.accessCDR({
                   uuid: sharedVaultUuid,
                   accessAuxData: "0x",
                   timeoutMs: ACCESS_TIMEOUT_MS,
                 });
-                const accessDur = Date.now() - tAccess;
-                const ok = bytesEqual(access.dataKey, sharedDataKey);
+                const sharedDur = Date.now() - tShared;
+                const sharedOk = bytesEqual(sharedAccess.dataKey, sharedDataKey);
                 logLine(
-                  `[w[${idx}] cycle=${cycleIdx} ACCESS ${ok ? "ok" : "MISMATCH"}] uuid=${sharedVaultUuid} tx=${access.txHash} ${accessDur}ms`,
+                  `[w[${idx}] cycle=${cycleIdx} ACCESS_SHARED ${sharedOk ? "ok" : "MISMATCH"}] uuid=${sharedVaultUuid} tx=${sharedAccess.txHash} ${sharedDur}ms`,
                 );
-                if (!ok) {
+                if (!sharedOk) {
                   throw new Error(
                     `w[${idx}] cycle=${cycleIdx} dataKey mismatch on shared uuid=${sharedVaultUuid}`,
                   );
                 }
-                // Push BOTH latencies together — only when the full cycle
-                // succeeded end-to-end. Pushing uploadDur eagerly above
-                // would let partially-failed cycles' upload times bias
-                // the upload p50/p95, decoupling the two arrays from
-                // `totalCycles`. Reviewer caught this on PR #83.
+
+                // ----- PHASE 3: ACCESS own fresh vault (fresh-uuid read) -----
+                // The settlement window between Phase 1's write tx and
+                // this read is implicit — whatever Phase 2's shared
+                // read happened to take (typically 10-120s). When Phase
+                // 2 hits a hot validator cache it can return in just a
+                // few seconds, in which case `upload.uuid` may still be
+                // propagating across validators when this call fires.
+                // `ACCESS_TIMEOUT_MS` (120s) is LOAD-BEARING here: it's
+                // not a generic safety margin but the actual headroom
+                // accessCDR uses to poll until the new uuid lands. Do
+                // not shrink it without explicit fresh-uuid propagation
+                // benchmarks — a "fast" timeout would turn occasional
+                // hot-cache cycles into spurious failures.
+                const tFresh = Date.now();
+                const freshAccess = await w.client.consumer.accessCDR({
+                  uuid: upload.uuid,
+                  accessAuxData: "0x",
+                  timeoutMs: ACCESS_TIMEOUT_MS,
+                });
+                const freshDur = Date.now() - tFresh;
+                const freshOk = bytesEqual(freshAccess.dataKey, dataKey);
+                logLine(
+                  `[w[${idx}] cycle=${cycleIdx} ACCESS_FRESH ${freshOk ? "ok" : "MISMATCH"}] uuid=${upload.uuid} tx=${freshAccess.txHash} ${freshDur}ms`,
+                );
+                if (!freshOk) {
+                  throw new Error(
+                    `w[${idx}] cycle=${cycleIdx} dataKey mismatch on fresh uuid=${upload.uuid}`,
+                  );
+                }
+
+                // Push ALL THREE latencies in lockstep — only when the
+                // full cycle (upload + read shared + read own fresh)
+                // succeeded end-to-end. Pushing eagerly per-phase would
+                // let partially-failed cycles bias one array's p50/p95
+                // and decouple lengths from `totalCycles`. Same fix as
+                // PR #83's 1b9a80d, extended to 3 arrays.
                 uploadLats.push(uploadDur);
-                accessLats.push(accessDur);
+                accessSharedLats.push(sharedDur);
+                accessFreshLats.push(freshDur);
                 totalCycles++;
               } catch (e) {
                 failedCycles++;
@@ -394,8 +495,13 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
                 logLine(
                   `[w[${idx}] cycle=${cycleIdx} FAILED] ${msg.slice(0, 240)}`,
                 );
-                // Continue to next cycle — stress measures failure rate,
-                // not absence of failures.
+                if (!firstFailure) {
+                  firstFailure = `w[${idx}] cycle=${cycleIdx}: ${msg.slice(0, 240)}`;
+                }
+                // Continue the loop so other wallets keep running and we
+                // get a full picture of failures across the wave; the
+                // final `expect(failedCycles).toBe(0)` after the loop
+                // turns any non-zero count into a test failure.
               }
             }
             logLine(`[w[${idx}] done] cycles_attempted=${cycleIdx}`);
@@ -418,23 +524,44 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
             100
           ).toFixed(2),
           upload: statsOf(uploadLats),
-          access: statsOf(accessLats),
+          access_shared: statsOf(accessSharedLats),
+          access_fresh: statsOf(accessFreshLats),
         };
         logLine(`[stress summary] ${JSON.stringify(stats)}`);
         perfBuffer = {
           uploadLats,
-          accessLats,
+          accessSharedLats,
+          accessFreshLats,
           totalCycles,
           failedCycles,
           wallClockMs,
         };
 
-        // Smoke check only — stress doesn't assert zero failures. The
-        // signal is in the perf-stats JSON.
+        // 1) Driver liveness — wallets must have attempted at least one cycle.
         expect(
           totalCycles + failedCycles,
           "stress test finished with zero cycle attempts — wallets didn't even reach the first try",
         ).toBeGreaterThan(0);
+
+        // 2) Zero-tolerance for cycle failures. Every per-wallet 3-op
+        //    cycle (upload + read shared + read fresh) must succeed.
+        //    Individual cycle failures are logged with the
+        //    `[w[N] cycle=M FAILED] <msg>` pattern — grep the test
+        //    output to find the first failing cycle. Common causes seen
+        //    on this stack:
+        //      - "Timed out collecting partials after 120000ms: got X/Y"
+        //        → TDH2 threshold not met: one or more DKG vals didn't
+        //          respond within the access timeout. Check
+        //          /dkg/latest_active.{total,threshold} and validator
+        //          kernel logs for `Kernel partial decrypt failed`.
+        //      - dataKey MISMATCH → wrong-key delivery; chain GPK drift
+        //        or wrong DKG round captured during upload.
+        expect(
+          failedCycles,
+          `stress test had ${failedCycles}/${totalCycles + failedCycles} cycles fail. ` +
+            `First failure: ${firstFailure ?? "(none captured — likely a logic bug, failedCycles>0 but firstFailure is null)"}. ` +
+            `Full per-cycle log: /tmp/cdr-stress.log (uploaded as cdr-stress-log-<run_id> artifact).`,
+        ).toBe(0);
       },
       DURATION_MS + 15 * 60 * 1000,
     );

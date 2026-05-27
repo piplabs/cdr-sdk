@@ -1,0 +1,338 @@
+name: CDR monitor per active round (aeneid)
+
+run-name: cdr-monitor-aeneid${{ inputs.force == true && ' (force)' || '' }}
+
+# Cron-fired watcher that detects new DKG active rounds on aeneid and
+# fires the existing integration-aeneid-default suite against each one,
+# then posts the result to the CDR Slack channel.
+#
+# Architecture:
+#
+#   schedule (*/5 min) ─┐
+#   workflow_dispatch ──┴─→ [watch] ──→ [test] ──→ [notify]
+#                            │            │           │
+#                            │            └─ reusable workflow_call to
+#                            │               integration.yml on aeneid/default
+#                            │
+#                            └─ Compares Story-API /dkg/latest_active.round
+#                               against the cached state.json from the last
+#                               watcher run. Re-saves the cache only when
+#                               fire-decision is positive, so a transient
+#                               API outage doesn't lose round-edge detection.
+#
+# State (actions/cache, JSON blob):
+#   ./state.json = {round, gpk} — round we last fired a test against and
+#                                 the 20-char GPK prefix at the time.
+#                                 A GPK change paired with a round drop
+#                                 signals a chain reset (the round id
+#                                 won't match the old chain either).
+#
+# Why actions/cache (over repo variables / commits / external KV):
+#   - works with the default GITHUB_TOKEN; no repo-settings change, no
+#     PAT (repo variables route 403'd on cdr-sdk because the workflow
+#     permissions setting defaults to read-only — see PR #111 run
+#     26388392700)
+#   - state file is tiny (~50 B), GitHub's 10 GB cache budget is
+#     effectively unlimited for this use case
+#   - cache save is gated on should_test=true so we only write a new
+#     entry when state changes, keeping LRU eviction healthy
+#
+# Slack secret required: CDR_SLACK_WEBHOOK_URL (incoming webhook URL for
+# the CDR channel). Without it the notify job will fail visibly so the
+# operator knows to configure it.
+
+on:
+  schedule:
+    # Every 5 min (the finest cron granularity GH Actions offers). Aeneid
+    # DKG rounds turn over far slower (typically tens of minutes per
+    # round), so most cron firings will detect no change and exit cheap.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force test even if no new round detected"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # Serialize monitor runs so two cron firings can't both decide to test
+  # against the same round. cancel-in-progress=false: don't kill an
+  # in-flight test; queue the next watcher behind it.
+  group: cdr-monitor-aeneid
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_test: ${{ steps.compare.outputs.should_test }}
+      cur_round: ${{ steps.query.outputs.round }}
+      cur_gpk: ${{ steps.query.outputs.gpk }}
+      last_round: ${{ steps.last.outputs.last_round }}
+      chain_reset: ${{ steps.compare.outputs.chain_reset }}
+      forced: ${{ steps.compare.outputs.forced }}
+    steps:
+      # State storage: a tiny `./state.json` file ({round, gpk}) shared
+      # across watcher runs via actions/cache. Picked over repo variables
+      # (the obvious choice) because `gh variable set` against the default
+      # GITHUB_TOKEN requires the repo-wide "Workflow permissions" to be
+      # toggled to "Read and write" — see PR #111 run 26388392700 which
+      # 403'd. Cache works with no repo-settings change, no PAT, no
+      # cross-workflow API access. Cache keys:
+      #   - `key` is unique per run so save always lands (no exact-key hit)
+      #   - `restore-keys` is the shared prefix; restore picks the most
+      #     recently saved entry under that prefix on each fresh run
+      # `actions/cache/save@v4` is gated on `should_test == 'true'` so we
+      # only commit a new cache entry when state actually changed, keeping
+      # the repo's 10 GB cache budget from filling with redundant copies.
+      - name: Restore last-seen state from cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ./state.json
+          key: cdr-monitor-aeneid-state-${{ github.run_id }}
+          restore-keys: |
+            cdr-monitor-aeneid-state-
+
+      - name: Query aeneid /dkg/latest_active
+        id: query
+        # Story-API is HTTP-only (same host integration.yml's CDR_API_URL
+        # uses on aeneid). The strict regex validation below limits the
+        # blast radius of a hostile / corrupted response: any value that
+        # doesn't match the expected shape exits the step instead of
+        # flowing into downstream shells. Combined with the env-var
+        # pass-through in later steps this closes the
+        # `${{ steps.x.outputs.y }}` → bash injection vector flagged on
+        # PR #111.
+        run: |
+          set -euo pipefail
+          API=http://172.192.41.96:1317
+          resp=$(curl -fsS --max-time 10 "$API/dkg/latest_active")
+          echo "$resp" | jq '.msg.network | {round, total, threshold, stage, start_block_height, gpk: (.global_public_key[:20])}'
+          round=$(echo "$resp" | jq -r '.msg.network.round')
+          gpk=$(echo "$resp" | jq -r '.msg.network.global_public_key[:20]')
+          # round must be a positive integer; gpk must be exactly 20 chars
+          # of the standard base64 alphabet (the 20-char prefix of the
+          # network's globalPublicKey field, base64-encoded server-side).
+          if ! [[ "$round" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::round=$round is not a positive integer"; exit 1
+          fi
+          if ! [[ "$gpk" =~ ^[A-Za-z0-9+/=]{20}$ ]]; then
+            echo "::error::gpk prefix has unexpected shape: $gpk"; exit 1
+          fi
+          echo "round=$round" >> "$GITHUB_OUTPUT"
+          echo "gpk=$gpk" >> "$GITHUB_OUTPUT"
+
+      - name: Read last seen round + GPK from cache
+        id: last
+        run: |
+          set -euo pipefail
+          # `./state.json` is absent on the very first run (no prior
+          # cache to restore) — fall back to zero/empty so the first
+          # watcher tick treats the current round as new.
+          if [ -f ./state.json ]; then
+            last_round=$(jq -r '.round // "0"' ./state.json)
+            last_gpk=$(jq -r '.gpk // ""' ./state.json)
+          else
+            last_round="0"
+            last_gpk=""
+          fi
+          # Same validation as the live-query step: if the cache entry
+          # was malformed (e.g. truncated write from a previous run),
+          # refuse to use it. Empty `last_gpk` is allowed (first-run
+          # sentinel).
+          if ! [[ "$last_round" =~ ^[0-9]+$ ]]; then
+            echo "::error::cached last_round=$last_round is not an integer"; exit 1
+          fi
+          if [ -n "$last_gpk" ] && ! [[ "$last_gpk" =~ ^[A-Za-z0-9+/=]{20}$ ]]; then
+            echo "::error::cached last_gpk has unexpected shape"; exit 1
+          fi
+          echo "last_round=$last_round" >> "$GITHUB_OUTPUT"
+          echo "last_gpk=$last_gpk" >> "$GITHUB_OUTPUT"
+          echo "Last seen: round=$last_round gpk=$last_gpk"
+
+      - name: Compare + decide whether to fire test
+        id: compare
+        env:
+          # Pass values through env: rather than `${{ ... }}` template
+          # interpolation so a hostile API response can't break out of
+          # the string context into bash. Even though the values are
+          # regex-validated upstream this defense-in-depth keeps any
+          # future loosening of those regexes safe by default.
+          FORCE: ${{ inputs.force }}
+          CUR_ROUND: ${{ steps.query.outputs.round }}
+          CUR_GPK: ${{ steps.query.outputs.gpk }}
+          LAST_ROUND: ${{ steps.last.outputs.last_round }}
+          LAST_GPK: ${{ steps.last.outputs.last_gpk }}
+        run: |
+          set -euo pipefail
+          should_test="false" chain_reset="false" forced="false"
+          if [ "$FORCE" = "true" ]; then
+            should_test="true"; forced="true"
+            echo "→ force=true; firing regardless of round delta"
+          elif [ -n "$LAST_GPK" ] \
+               && [ "$CUR_ROUND" -le "$LAST_ROUND" ] \
+               && [ "$CUR_GPK" != "$LAST_GPK" ]; then
+            # Both conditions required: chain reset = round id drops back
+            # AND the GPK no longer matches the old chain. GPK alone is
+            # too broad — if Story ever runs a non-resharing round
+            # (is_resharing=false on advance) the GPK can change while
+            # the round id still moves forward, and that's a normal
+            # round advance, not a reset. Aeneid is steady-state
+            # is_resharing=true so this is currently belt-and-suspenders,
+            # but the tightening keeps the label honest if that ever
+            # changes.
+            should_test="true"; chain_reset="true"
+            echo "→ chain reset detected (round $LAST_ROUND → $CUR_ROUND, gpk $LAST_GPK → $CUR_GPK)"
+          elif [ "$CUR_ROUND" -gt "$LAST_ROUND" ]; then
+            should_test="true"
+            echo "→ new round detected (round $LAST_ROUND → $CUR_ROUND)"
+          else
+            echo "→ no change (round=$CUR_ROUND unchanged); skip test"
+          fi
+          {
+            echo "should_test=$should_test"
+            echo "chain_reset=$chain_reset"
+            echo "forced=$forced"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write new state.json when firing
+        if: steps.compare.outputs.should_test == 'true'
+        env:
+          CUR_ROUND: ${{ steps.query.outputs.round }}
+          CUR_GPK: ${{ steps.query.outputs.gpk }}
+        run: |
+          set -euo pipefail
+          # File is committed to cache by the next step. Concurrent
+          # cron firings are still serialized by the concurrency group
+          # above, so there's no "two writers, last one wins" race —
+          # the next tick reads the post-write state via cache restore.
+          jq -nc --arg round "$CUR_ROUND" --arg gpk "$CUR_GPK" \
+            '{round: $round, gpk: $gpk}' > ./state.json
+          echo "Wrote ./state.json:"; cat ./state.json
+
+      - name: Save new state to cache
+        if: steps.compare.outputs.should_test == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ./state.json
+          # Save under the run-unique key the restore step looked for;
+          # the next watcher's restore-keys prefix match will find this
+          # as the most recent entry.
+          key: cdr-monitor-aeneid-state-${{ github.run_id }}
+
+  test:
+    needs: watch
+    if: needs.watch.outputs.should_test == 'true'
+    # Reusable-workflow call into integration.yml (NOT `gh workflow run` —
+    # the latter, when invoked with the default GITHUB_TOKEN, silently
+    # fails to trigger downstream workflow runs as a recursion guard).
+    # workflow_call sidesteps that by running integration.yml as part of
+    # this run's job graph; the same Actions UI shows both stages.
+    uses: ./.github/workflows/integration.yml
+    with:
+      network: aeneid
+      test_suite: default
+    secrets: inherit
+
+  notify:
+    needs: [watch, test]
+    # Three Slack-post conditions:
+    #   1. watch succeeded AND fired a test       — post the test outcome
+    #   2. watch itself failed (API down, etc.)   — post a watcher-health alert
+    # Skip silently when watch succeeded but decided no test was needed
+    # (`should_test=false`) — that's the normal idle path.
+    if: |
+      always() && (
+        needs.watch.outputs.should_test == 'true'
+        || needs.watch.result == 'failure'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Post Slack message
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.CDR_SLACK_WEBHOOK_URL }}
+          WATCH_RESULT: ${{ needs.watch.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          CUR_ROUND: ${{ needs.watch.outputs.cur_round }}
+          LAST_ROUND: ${{ needs.watch.outputs.last_round }}
+          CUR_GPK: ${{ needs.watch.outputs.cur_gpk }}
+          CHAIN_RESET: ${{ needs.watch.outputs.chain_reset }}
+          FORCED: ${{ needs.watch.outputs.forced }}
+          RUN_URL: ${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "::error::CDR_SLACK_WEBHOOK_URL secret is not set; cannot post"
+            echo "::notice::Add the incoming-webhook URL via 'gh secret set CDR_SLACK_WEBHOOK_URL'"
+            exit 1
+          fi
+
+          # Resolve {emoji, headline, subline, body} for the message
+          # shape we want to post. Three branches share the trailing
+          # jq + curl, so the payload shape stays uniform regardless of
+          # what triggered the post.
+          if [ "$WATCH_RESULT" != "success" ]; then
+            # Watcher itself broke — round detection is offline. Don't
+            # claim a CDR state we can't observe; surface the failure
+            # so the operator can investigate the workflow run.
+            emoji="🚨"
+            headline="$emoji CDR monitor (aeneid) — WATCHER FAILED"
+            subline="trigger: watcher step error (round detection offline)"
+            body=$(printf '• *Watch job result*: *%s*\n• *Last known round*: %s\n• *Suite fired*: no (watcher fault — no test attempted)' \
+              "$WATCH_RESULT" "${LAST_ROUND:-?}")
+          else
+            # Normal test-outcome path. CHAIN_RESET / FORCED / new-round
+            # control the headline trigger line; CONCLUSION drives the
+            # emoji + status word.
+            case "$TEST_RESULT" in
+              success)   emoji="✅"; status="passed"    ;;
+              failure)   emoji="❌"; status="FAILED"    ;;
+              cancelled) emoji="⚠️"; status="cancelled" ;;
+              *)         emoji="❓"; status="$TEST_RESULT" ;;
+            esac
+            if [ "$CHAIN_RESET" = "true" ]; then
+              emoji="🔄"; trigger="chain reset (gpk → ${CUR_GPK})"
+            elif [ "$FORCED" = "true" ]; then
+              trigger="manual force"
+            else
+              trigger="round $LAST_ROUND → $CUR_ROUND"
+            fi
+            headline="$emoji CDR monitor (aeneid) — round $CUR_ROUND $status"
+            subline="trigger: $trigger"
+            # Slack mrkdwn bold is single `*…*` not standard `**`.
+            # Bold the outcome value (not just the label) for at-a-glance
+            # success/failure scan.
+            body=$(printf '• *Active round*: %s\n• *GPK prefix*: `%s`\n• *Test outcome*: *%s*\n• *Suite*: aeneid / default (~13 min)' \
+              "$CUR_ROUND" "$CUR_GPK" "$TEST_RESULT")
+          fi
+
+          payload=$(jq -nc \
+            --arg headline "$headline" \
+            --arg subline "$subline" \
+            --arg body "$body" \
+            --arg url "$RUN_URL" \
+            '{
+              text: $headline,
+              blocks: [
+                {type: "section", text: {type: "mrkdwn", text: ("*" + $headline + "*\n_" + $subline + "_")}},
+                {type: "section", text: {type: "mrkdwn", text: $body}},
+                {type: "actions", elements: [
+                  {type: "button", text: {type: "plain_text", text: "View workflow run"}, url: $url}
+                ]}
+              ]
+            }')
+
+          # Print payload for debugging (Slack webhook responses are
+          # opaque on failure; visible jq output helps).
+          echo "$payload" | jq .
+
+          curl -fsS -X POST \
+            -H 'Content-Type: application/json' \
+            -d "$payload" \
+            "$SLACK_WEBHOOK_URL"
