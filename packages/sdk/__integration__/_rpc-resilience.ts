@@ -16,7 +16,13 @@
  *                                 two known public-pool consistency bugs
  */
 
-import { http, type Hash, type PublicClient } from "viem";
+import {
+  http,
+  TransactionReceiptNotFoundError,
+  WaitForTransactionReceiptTimeoutError,
+  type Hash,
+  type PublicClient,
+} from "viem";
 
 /**
  * `http()` with retry budget tuned for public-RPC throttling.
@@ -85,14 +91,19 @@ export function pLimit(maxConcurrency: number) {
 }
 
 /**
- * `publicClient.waitForTransactionReceipt` with `timeout` widened to 5 min
- * for public-RPC endpoints whose `eth_getTransactionReceipt` can lag block
- * production by tens of seconds (viem default `timeout: 180_000` is too
- * tight for the tail — e.g. cdr-sdk run 26379164817 wallet idx=29 allocate
- * tx 0x914c3c... mined in block 0x11d2547 status=1 but viem gave up
- * first; run 26380050980 wallet idx=31 same pattern with tx 0x13cdcd...
- * in block 0x11d2980 — both failures rendered as "Transaction receipt
- * with hash X could not be found" in the workflow summary).
+ * `publicClient.waitForTransactionReceipt` hardened for public-RPC endpoints
+ * whose `eth_getTransactionReceipt` lags block production by tens of seconds.
+ *
+ * viem's `timeout` / `retryCount` do NOT cover the case where the tx is
+ * observed in a block but the receipt is momentarily null on the pool node
+ * serving that call — viem throws `TransactionReceiptNotFoundError` straight
+ * out of its block-watcher callback (e.g. cdr-sdk run 26379164817 wallet
+ * idx=29 allocate 0x914c3c... block 0x11d2547 status=1; run 26501253421
+ * uploadCDR write 0x8d1ae... block 0x11eb8d2 status=1 — both threw despite
+ * landing). So we re-poll the whole wait on that error (and on the overall
+ * timeout), bounded by a 5 min deadline. A reverted tx returns a
+ * `status: "reverted"` receipt rather than throwing, so this never masks a
+ * real revert.
  *
  * Mirrors the SDK-internal helper in `packages/sdk/src/uploader.ts`; the
  * duplication is intentional — the SDK shouldn't take a dependency on
@@ -102,12 +113,28 @@ export async function waitForReceiptResilient(
   publicClient: PublicClient,
   hash: Hash,
 ) {
-  return publicClient.waitForTransactionReceipt({
-    hash,
-    timeout: 5 * 60 * 1000,
-    pollingInterval: 2000,
-    retryCount: 30,
-  });
+  const deadlineMs = Date.now() + 5 * 60 * 1000;
+  let lastError: unknown;
+  while (Date.now() < deadlineMs) {
+    try {
+      return await publicClient.waitForTransactionReceipt({
+        hash,
+        timeout: 30_000,
+        pollingInterval: 2000,
+        retryCount: 10,
+      });
+    } catch (err) {
+      if (
+        !(err instanceof TransactionReceiptNotFoundError) &&
+        !(err instanceof WaitForTransactionReceiptTimeoutError)
+      ) {
+        throw err;
+      }
+      lastError = err;
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  }
+  throw lastError;
 }
 
 /**

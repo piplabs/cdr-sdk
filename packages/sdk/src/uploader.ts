@@ -1,4 +1,4 @@
-import { parseEventLogs, toHex, toBytes, type Hash, type PublicClient, type WalletClient } from "viem";
+import { parseEventLogs, toHex, toBytes, TransactionReceiptNotFoundError, WaitForTransactionReceiptTimeoutError, type Hash, type PublicClient, type WalletClient } from "viem";
 import { cdrAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
 import { tdh2Encrypt, encryptFile, getWasm, type TDH2Ciphertext } from "@piplabs/cdr-crypto";
 import { uuidToLabel } from "./label.js";
@@ -7,32 +7,56 @@ import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
 
 /**
- * Wraps `publicClient.waitForTransactionReceipt` with parameters tuned for
- * public RPC endpoints (e.g. `https://aeneid.storyrpc.io`) where receipt
- * propagation can lag block production by tens of seconds for a small tail
- * of txs. Viem's defaults (`timeout: 180_000`, `retryCount: 6`) are tuned
- * for a directly-connected node; on a public RPC the 180s overall window
- * occasionally fires on a tx that DID land on chain — the receipt just
- * hadn't surfaced yet on the pool node serving `eth_getTransactionReceipt`
- * (e.g. cdr-sdk run 26379164817, wallet idx=29: allocate tx 0x914c3c...
- * mined in block 0x11d2547 status=1 but viem gave up first, failing 1/100
- * wallets in 100w-fresh-aeneid; run 26380050980 hit the same pattern on
- * wallet idx=31 with tx 0x13cdcd... in block 0x11d2980).
+ * Wraps `publicClient.waitForTransactionReceipt` for public RPC endpoints
+ * (e.g. `https://aeneid.storyrpc.io`) where receipt propagation can lag
+ * block production by tens of seconds for a small tail of txs.
  *
- * Bumping `timeout` to 5 min covers any realistic propagation tail and
- * `retryCount: 30` widens the transient-HTTP-error tolerance; the SDK
- * still surfaces a real receipt error if the tx genuinely failed. Test
- * code has a mirror in `packages/sdk/__integration__/_rpc-resilience.ts`;
- * the duplication is intentional — the SDK shouldn't take a dependency
- * on test-only files.
+ * The key failure this guards against: viem observes the tx included in a
+ * block, immediately calls `eth_getTransactionReceipt`, and the pool node
+ * serving that call hasn't surfaced the receipt yet → viem throws
+ * `TransactionReceiptNotFoundError` out of its block-watcher callback. That
+ * throw does NOT respect the `timeout` / `retryCount` options — those cover
+ * the overall deadline and transport-level errors, not a receipt that is
+ * momentarily null after the block is seen. So bumping `timeout`/`retryCount`
+ * alone (the previous approach) still failed on this race:
+ *   - run 26379164817 wallet idx=29: allocate 0x914c3c... mined block
+ *     0x11d2547 status=1, viem gave up first (1/100 fail in 100w-fresh-aeneid)
+ *   - run 26501253421: uploadCDR write 0x8d1ae... committed block 0x11eb8d2
+ *     status=1, threw TransactionReceiptNotFoundError after ~8s, failing the
+ *     consumer feeOverride test (which itself never waits on a receipt — the
+ *     throw came from its uploadCDR preamble)
+ *
+ * Fix: re-poll the whole `waitForTransactionReceipt` on
+ * `TransactionReceiptNotFoundError` / `WaitForTransactionReceiptTimeoutError`,
+ * bounded by an overall 5 min deadline. A genuinely reverted tx returns a
+ * receipt with `status: "reverted"` (it does NOT throw), so this never masks
+ * a real revert. Test code has a mirror in
+ * `packages/sdk/__integration__/_rpc-resilience.ts`; the duplication is
+ * intentional — the SDK shouldn't take a dependency on test-only files.
  */
 async function waitForReceiptResilient(publicClient: PublicClient, hash: Hash) {
-  return publicClient.waitForTransactionReceipt({
-    hash,
-    timeout: 5 * 60 * 1000,
-    pollingInterval: 2000,
-    retryCount: 30,
-  });
+  const deadlineMs = Date.now() + 5 * 60 * 1000;
+  let lastError: unknown;
+  while (Date.now() < deadlineMs) {
+    try {
+      return await publicClient.waitForTransactionReceipt({
+        hash,
+        timeout: 30_000,
+        pollingInterval: 2000,
+        retryCount: 10,
+      });
+    } catch (err) {
+      if (
+        !(err instanceof TransactionReceiptNotFoundError) &&
+        !(err instanceof WaitForTransactionReceiptTimeoutError)
+      ) {
+        throw err;
+      }
+      lastError = err;
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  }
+  throw lastError;
 }
 
 export class Uploader {
