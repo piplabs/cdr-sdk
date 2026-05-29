@@ -218,22 +218,37 @@ export async function refundWallets(
   if (gasReserveWei !== undefined) {
     effectiveReserveWei = gasReserveWei;
   } else {
-    // viem's `estimateFeesPerGas()` default-returns the EIP-1559 shape on
-    // chains that support it (all Story networks do) — TypeScript types
-    // `maxFeePerGas: bigint`. Widen the static type so a future cross-chain
-    // caller running against a legacy / non-EIP-1559 chain falls back to
-    // `gasPrice` without a runtime `TypeError: Cannot mix BigInt and other
-    // types` on `bigint * undefined`. The 50 gwei final fallback is a sane
-    // default if viem ever returns neither (shouldn't happen in practice).
-    const fees = (await publicClient.estimateFeesPerGas()) as {
-      maxFeePerGas?: bigint;
-      gasPrice?: bigint;
-    };
-    const perGasWei = fees.maxFeePerGas ?? fees.gasPrice ?? 50_000_000_000n;
-    // 21000 (sweep tx gas) × maxFeePerGas × 1.5 — see header comment for the
-    // 1.5× rationale (covers viem's 1.2× baseFeeMultiplier prep padding +
-    // ~25% spike headroom).
-    effectiveReserveWei = (21_000n * perGasWei * 3n) / 2n;
+    // Wrap the fee-market probe so a transient RPC error here doesn't
+    // throw the whole refundWallets call. The contract — "always returns
+    // a RefundResult, individual sweep errors counted as failedRefunds" —
+    // pre-dated this fee probe; preserve it by falling back to a sane
+    // fixed reserve if the probe fails. 50 gwei × 21000 × 1.5 ≈ 0.00158 IP
+    // covers the viem prep-padded gas cost on networks up to ~40 gwei
+    // base+priority (well above Story chains in practice).
+    const FALLBACK_RESERVE_WEI = (21_000n * 50_000_000_000n * 3n) / 2n;
+    try {
+      // viem's `estimateFeesPerGas()` default-returns the EIP-1559 shape on
+      // chains that support it (all Story networks do) — TypeScript types
+      // `maxFeePerGas: bigint`. Widen the static type so a future cross-chain
+      // caller running against a legacy / non-EIP-1559 chain falls back to
+      // `gasPrice` without a runtime `TypeError: Cannot mix BigInt and other
+      // types` on `bigint * undefined`. The 50 gwei final fallback is a sane
+      // default if viem ever returns neither (shouldn't happen in practice).
+      const fees = (await publicClient.estimateFeesPerGas()) as {
+        maxFeePerGas?: bigint;
+        gasPrice?: bigint;
+      };
+      const perGasWei = fees.maxFeePerGas ?? fees.gasPrice ?? 50_000_000_000n;
+      // 21000 (sweep tx gas) × maxFeePerGas × 1.5 — see header comment for
+      // the 1.5× rationale (covers viem's 1.2× baseFeeMultiplier prep
+      // padding + ~25% spike headroom).
+      effectiveReserveWei = (21_000n * perGasWei * 3n) / 2n;
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      const e = err as { shortMessage?: string; message?: string };
+      console.warn(`[refundWallets] estimateFeesPerGas probe failed, using ${FALLBACK_RESERVE_WEI} wei fallback: ${e.shortMessage ?? e.message ?? String(err)}`);
+      effectiveReserveWei = FALLBACK_RESERVE_WEI;
+    }
   }
 
   const perWalletRefundWei = await Promise.all(
