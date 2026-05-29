@@ -28,7 +28,6 @@ import {
   type WalletClient,
   createWalletClient,
   http,
-  parseEther,
 } from "viem";
 import {
   generatePrivateKey,
@@ -168,8 +167,30 @@ export interface RefundResult {
 
 /**
  * Sweep every ephemeral wallet's remaining balance back to `recipient`,
- * minus `gasReserveWei` per wallet (covers the sweep tx's own gas).
- * Per-wallet refunds run concurrently — order-independent.
+ * minus a per-tx gas reserve. Per-wallet refunds run concurrently —
+ * order-independent.
+ *
+ * `gasReserveWei` defaults to `undefined`; in that case the reserve is
+ * computed once at entry from the live fee market:
+ *
+ *   reserve = 21000 × maxFeePerGas × 1.5
+ *
+ * `maxFeePerGas` here is `estimateFeesPerGas` — but viem's
+ * `prepareTransactionRequest` pads that by another **1.2×** (the default
+ * `baseFeeMultiplier`) when actually building the tx, so the true
+ * worst-case gas cost is `21000 × estimateFeesPerGas × 1.2`. The 1.5×
+ * multiplier covers the 1.2× prep padding (25% headroom over that) plus
+ * any fee spike between this probe and the sweep tx.
+ *
+ * The previous fixed default `parseEther("0.001")` (≈ 21000 × 50 gwei)
+ * was just under the prep-padded cost on aeneid — 21000 × 1.2 × 42.71
+ * gwei ≈ 0.00108 IP > 0.001 IP — so every sweep tx was rejected by viem
+ * with "insufficient funds for gas * price + value", surfaced as
+ * `failedRefunds: <wallet_count>` in cdr-sdk runs 26501253421 and
+ * 26561212732 on `100w-fresh-aeneid` + `100w-shared` (~200 IP stranded
+ * per run across the two suites' ephemeral wallets). On a directly-
+ * connected DevNet at 10 gwei the static default worked fine; dynamic
+ * sizing makes the helper safe across chains regardless of gas market.
  *
  * On any individual sweep failure the helper does NOT throw; it counts
  * the failure and continues. The reasoning: a single ephemeral wallet
@@ -188,18 +209,29 @@ export async function refundWallets(
   wallets: EphemeralWallet[],
   recipient: Address,
   rpcUrl: string,
-  gasReserveWei: bigint = parseEther("0.001"),
+  gasReserveWei?: bigint,
   transportFactory: (url: string) => Transport = http,
 ): Promise<RefundResult> {
   const chain = publicClient.chain as Chain;
+
+  let effectiveReserveWei: bigint;
+  if (gasReserveWei !== undefined) {
+    effectiveReserveWei = gasReserveWei;
+  } else {
+    const fees = await publicClient.estimateFeesPerGas();
+    // 21000 (sweep tx gas) × maxFeePerGas × 1.5 — see header comment for the
+    // 1.5× rationale (covers viem's 1.2× baseFeeMultiplier prep padding +
+    // ~25% spike headroom).
+    effectiveReserveWei = (21_000n * fees.maxFeePerGas * 3n) / 2n;
+  }
 
   const perWalletRefundWei = await Promise.all(
     wallets.map(async (w) => {
       try {
         const balance = await publicClient.getBalance({ address: w.address });
-        if (balance <= gasReserveWei) return 0n;
+        if (balance <= effectiveReserveWei) return 0n;
 
-        const sweepAmount = balance - gasReserveWei;
+        const sweepAmount = balance - effectiveReserveWei;
         const wc = createWalletClient({
           account: w.account,
           chain,
@@ -212,7 +244,10 @@ export async function refundWallets(
         });
         await waitForReceiptResilient(publicClient, hash);
         return sweepAmount;
-      } catch {
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        const e = err as { shortMessage?: string; message?: string };
+        console.warn(`[refundWallets][${w.address}] sweep failed: ${e.shortMessage ?? e.message ?? String(err)}`);
         return -1n; // sentinel for failed sweep
       }
     }),
