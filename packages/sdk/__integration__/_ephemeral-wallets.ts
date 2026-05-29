@@ -218,11 +218,22 @@ export async function refundWallets(
   if (gasReserveWei !== undefined) {
     effectiveReserveWei = gasReserveWei;
   } else {
-    const fees = await publicClient.estimateFeesPerGas();
+    // viem's `estimateFeesPerGas()` default-returns the EIP-1559 shape on
+    // chains that support it (all Story networks do) — TypeScript types
+    // `maxFeePerGas: bigint`. Widen the static type so a future cross-chain
+    // caller running against a legacy / non-EIP-1559 chain falls back to
+    // `gasPrice` without a runtime `TypeError: Cannot mix BigInt and other
+    // types` on `bigint * undefined`. The 50 gwei final fallback is a sane
+    // default if viem ever returns neither (shouldn't happen in practice).
+    const fees = (await publicClient.estimateFeesPerGas()) as {
+      maxFeePerGas?: bigint;
+      gasPrice?: bigint;
+    };
+    const perGasWei = fees.maxFeePerGas ?? fees.gasPrice ?? 50_000_000_000n;
     // 21000 (sweep tx gas) × maxFeePerGas × 1.5 — see header comment for the
     // 1.5× rationale (covers viem's 1.2× baseFeeMultiplier prep padding +
     // ~25% spike headroom).
-    effectiveReserveWei = (21_000n * fees.maxFeePerGas * 3n) / 2n;
+    effectiveReserveWei = (21_000n * perGasWei * 3n) / 2n;
   }
 
   const perWalletRefundWei = await Promise.all(
