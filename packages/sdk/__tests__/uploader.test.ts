@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { encodeAbiParameters, keccak256, toBytes } from "viem";
 
 // Mock @piplabs/cdr-crypto before importing Uploader so the WASM loader is never executed.
@@ -9,7 +9,11 @@ vi.mock("@piplabs/cdr-crypto", () => ({
 
 import { Uploader } from "../src/uploader.js";
 import { tdh2Encrypt } from "@piplabs/cdr-crypto";
-import { ContentSizeExceededError } from "../src/errors.js";
+import {
+  ContentSizeExceededError,
+  InvalidParamsError,
+  VaultAllocatedEventNotFoundError,
+} from "../src/errors.js";
 import type { Observer } from "../src/observer.js";
 
 /**
@@ -83,6 +87,10 @@ describe("Uploader", () => {
     vi.clearAllMocks();
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("allocate sends tx with correct fee and returns uuid from event", async () => {
     const { publicClient, walletClient } = mockClients();
     publicClient.readContract.mockResolvedValueOnce(1000n);
@@ -140,6 +148,45 @@ describe("Uploader", () => {
     expect(callArgs.value).toBe(500n);
     expect(publicClient.readContract).not.toHaveBeenCalled();
     expect(result.uuid).toBe(7);
+  });
+
+  it("retries receipt waits for structurally named viem receipt errors", async () => {
+    vi.useFakeTimers();
+
+    const { publicClient, walletClient } = mockClients();
+    walletClient.writeContract.mockResolvedValueOnce("0xtxhash" as `0x${string}`);
+    const receiptError = new Error("receipt not found");
+    receiptError.name = "TransactionReceiptNotFoundError";
+    publicClient.waitForTransactionReceipt
+      .mockRejectedValueOnce(receiptError)
+      .mockResolvedValueOnce({
+        logs: [makeVaultAllocatedLog(43)],
+      });
+
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer: fakeObserver(),
+    });
+
+    const resultPromise = uploader.allocate({
+      updatable: false,
+      writeConditionAddr: "0x1111111111111111111111111111111111111111",
+      readConditionAddr: "0x2222222222222222222222222222222222222222",
+      writeConditionData: "0x",
+      readConditionData: "0x",
+      feeOverride: 0n,
+      skipConditionValidation: true,
+    });
+
+    await vi.advanceTimersByTimeAsync(2000);
+
+    await expect(resultPromise).resolves.toEqual({
+      txHash: "0xtxhash",
+      uuid: 43,
+    });
+    expect(publicClient.waitForTransactionReceipt).toHaveBeenCalledTimes(2);
   });
 
   it("write sends tx with correct fee", async () => {
@@ -212,7 +259,32 @@ describe("Uploader", () => {
         feeOverride: 0n,
         skipConditionValidation: true,
       }),
-    ).rejects.toThrow("VaultAllocated event not found in transaction logs");
+    ).rejects.toThrow(VaultAllocatedEventNotFoundError);
+  });
+
+  it("requires simulateContract for condition validation", async () => {
+    const { publicClient, walletClient } = mockClients();
+    delete publicClient.simulateContract;
+
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer: fakeObserver(),
+    });
+
+    await expect(
+      uploader.allocate({
+        updatable: false,
+        writeConditionAddr: "0x1111111111111111111111111111111111111111",
+        readConditionAddr: "0x2222222222222222222222222222222222222222",
+        writeConditionData: "0x",
+        readConditionData: "0x",
+        feeOverride: 0n,
+      }),
+    ).rejects.toThrow(InvalidParamsError);
+
+    expect(walletClient.writeContract).not.toHaveBeenCalled();
   });
 
   it("encryptDataKey delegates to tdh2Encrypt with correct args (explicit globalPubKey)", async () => {

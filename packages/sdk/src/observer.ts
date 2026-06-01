@@ -1,8 +1,9 @@
-import { type PublicClient } from "viem";
 import { cdrAbi, dkgAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
 import { CURVE_ED25519 } from "@piplabs/cdr-crypto";
 import type { Vault } from "./types.js";
 import { InvalidParamsError } from "./errors.js";
+import type { CDRPublicClient } from "./client-types.js";
+import { type CDRLogger, noopLogger, errorMessage } from "./logger.js";
 import {
   queryLatestActiveDKGNetwork,
   queryDKGNetwork,
@@ -45,10 +46,11 @@ const STATUS_FINALIZED = 2;
  *   single round-trip.
  */
 export class Observer {
-  private publicClient: PublicClient;
+  private publicClient: CDRPublicClient;
   private network: Network;
   private apiUrl: string;
   private minThresholdRatio?: number;
+  private logger: CDRLogger;
 
   /** Per-round network snapshot cache (Promise-valued for in-flight dedup). */
   private networkSnapshots = new Map<number, Promise<DKGNetwork>>();
@@ -64,7 +66,7 @@ export class Observer {
 
   constructor(params: {
     network: Network;
-    publicClient: PublicClient;
+    publicClient: CDRPublicClient;
     /** Story-API REST base URL, e.g. `"http://node:1317"`. */
     apiUrl: string;
     /**
@@ -74,6 +76,8 @@ export class Observer {
      * make `collectPartials` time out forever, so they are rejected.
      */
     minThresholdRatio?: number;
+    /** Optional structured logger; defaults to a no-op. */
+    logger?: CDRLogger;
   }) {
     if (params.minThresholdRatio !== undefined) {
       const r = params.minThresholdRatio;
@@ -87,6 +91,7 @@ export class Observer {
     this.network = params.network;
     this.apiUrl = params.apiUrl;
     this.minThresholdRatio = params.minThresholdRatio;
+    this.logger = params.logger ?? noopLogger;
   }
 
   // =========================================================================
@@ -102,40 +107,40 @@ export class Observer {
    * ```
    */
   async getVault(uuid: number): Promise<Vault> {
-    const result = await this.publicClient.readContract({
+    const result = (await this.publicClient.readContract({
       address: contractAddresses[this.network].cdr,
       abi: cdrAbi,
       functionName: "vaults",
       args: [uuid],
-    });
+    })) as Record<string, unknown>;
     return { uuid, ...result } as unknown as Vault;
   }
 
   /** Get current allocation fee. */
   async getAllocateFee(): Promise<bigint> {
-    return this.publicClient.readContract({
+    return (await this.publicClient.readContract({
       address: contractAddresses[this.network].cdr,
       abi: cdrAbi,
       functionName: "allocateFee",
-    });
+    })) as bigint;
   }
 
   /** Get current write fee. */
   async getWriteFee(): Promise<bigint> {
-    return this.publicClient.readContract({
+    return (await this.publicClient.readContract({
       address: contractAddresses[this.network].cdr,
       abi: cdrAbi,
       functionName: "writeFee",
-    });
+    })) as bigint;
   }
 
   /** Get current read fee. */
   async getReadFee(): Promise<bigint> {
-    return this.publicClient.readContract({
+    return (await this.publicClient.readContract({
       address: contractAddresses[this.network].cdr,
       abi: cdrAbi,
       functionName: "readFee",
-    });
+    })) as bigint;
   }
 
   /**
@@ -151,6 +156,7 @@ export class Observer {
           abi: cdrAbi,
           functionName: "maxEncryptedDataSize",
         })
+        .then((v) => v as bigint)
         .catch((e) => {
           this.maxEncryptedDataSizePromise = null;
           throw e;
@@ -161,11 +167,11 @@ export class Observer {
 
   /** Get DKG operational threshold (basis-points constant from the DKG contract). */
   async getOperationalThreshold(): Promise<bigint> {
-    return this.publicClient.readContract({
+    return (await this.publicClient.readContract({
       address: contractAddresses[this.network].dkg,
       abi: dkgAbi,
       functionName: "operationalThreshold",
-    });
+    })) as bigint;
   }
 
   // =========================================================================
@@ -334,16 +340,23 @@ export class Observer {
     if (cached) return cached;
 
     const networkPromise = this.loadNetwork(round);
+    this.logger.debug("registry.load.start", { round });
     const regsPromise = queryAllRegistrations({ apiUrl: this.apiUrl, round });
 
     const promise = regsPromise.then(
-      (allRegs) =>
-        new Map<string, DKGRegistration>(
+      (allRegs) => {
+        const finalized = new Map<string, DKGRegistration>(
           allRegs
             .filter((r) => r.status === STATUS_FINALIZED)
             .map((r) => [r.validatorAddr.toLowerCase(), r]),
-        ),
-    );
+        );
+        this.logger.debug("registry.load.ready", { round, count: finalized.size });
+        return finalized;
+      },
+    ).catch((err) => {
+      this.logger.warn("registry.load.failed", { round, reason: errorMessage(err) });
+      throw err;
+    });
 
     this.registrationSnapshots.set(round, promise);
 

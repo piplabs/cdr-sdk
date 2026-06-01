@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { parseSgxQuote, verifyAttestation } from "../src/attestation.js";
+import { AttestationQuoteError } from "../src/errors.js";
 
 const SGX_MIN_QUOTE_SIZE = 432;
 const MRENCLAVE_OFFSET = 112;
@@ -81,6 +82,7 @@ describe("parseSgxQuote", () => {
     expect(() => parseSgxQuote(quote)).toThrow(
       "Invalid SGX quote: 431 bytes, minimum 432 required",
     );
+    expect(() => parseSgxQuote(quote)).toThrow(AttestationQuoteError);
   });
 
   it("works for exactly 432 bytes (boundary)", () => {

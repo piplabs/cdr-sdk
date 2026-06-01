@@ -5,6 +5,7 @@ import {
   hexToBytes,
   bytesToHex,
 } from "../src/story-api/bytes.js";
+import { InvalidHexError } from "../src/errors.js";
 
 describe("story-api/bytes", () => {
   describe("base64ToBytes / bytesToBase64", () => {
@@ -85,11 +86,13 @@ describe("story-api/bytes", () => {
     it("rejects odd-length hex", () => {
       expect(() => hexToBytes("abc")).toThrow(/odd-length/);
       expect(() => hexToBytes("0xabc")).toThrow(/odd-length/);
+      expect(() => hexToBytes("abc")).toThrow(InvalidHexError);
     });
 
     it("rejects invalid hex characters", () => {
       expect(() => hexToBytes("xx")).toThrow(/invalid hex character/);
       expect(() => hexToBytes("a!")).toThrow(/invalid hex character/);
+      expect(() => hexToBytes("xx")).toThrow(InvalidHexError);
     });
 
     it("encodes empty bytes to empty string", () => {

@@ -1,8 +1,9 @@
-import { type PublicClient, type WalletClient } from "viem";
 import type { Network } from "@piplabs/cdr-contracts";
 import { Uploader } from "./uploader.js";
 import { Consumer } from "./consumer.js";
 import { Observer } from "./observer.js";
+import type { CDRPublicClient, CDRWalletClient } from "./client-types.js";
+import { type CDRLogger, noopLogger } from "./logger.js";
 import { WalletClientRequiredError } from "./errors.js";
 
 export class CDRClient {
@@ -12,20 +13,24 @@ export class CDRClient {
 
   constructor(params: {
     network: Network;
-    publicClient: PublicClient;
-    walletClient?: WalletClient;
+    publicClient: CDRPublicClient;
+    walletClient?: CDRWalletClient;
     /** Story-API REST base URL, e.g. `"http://node:1317"`. */
     apiUrl: string;
     /** Minimum threshold ratio override (0-1). The effective threshold is max(source threshold, ceil(participants * minThresholdRatio)). */
     minThresholdRatio?: number;
+    /** Optional structured logger; defaults to a no-op. See {@link CDRLogger}. */
+    logger?: CDRLogger;
   }) {
     const { network, publicClient, walletClient, apiUrl } = params;
+    const logger = params.logger ?? noopLogger;
 
     this.observer = new Observer({
       network,
       publicClient,
       apiUrl,
       minThresholdRatio: params.minThresholdRatio,
+      logger,
     });
 
     if (walletClient) {
@@ -34,6 +39,7 @@ export class CDRClient {
         publicClient,
         walletClient,
         observer: this.observer,
+        logger,
       });
       this._consumer = new Consumer({
         network,
@@ -41,6 +47,7 @@ export class CDRClient {
         walletClient,
         observer: this.observer,
         apiUrl,
+        logger,
       });
     } else {
       this._uploader = null;

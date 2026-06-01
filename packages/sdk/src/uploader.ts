@@ -1,10 +1,18 @@
-import { parseEventLogs, toHex, toBytes, TransactionReceiptNotFoundError, WaitForTransactionReceiptTimeoutError, type Hash, type PublicClient, type WalletClient } from "viem";
+import { parseEventLogs, toHex, toBytes, TransactionReceiptNotFoundError, WaitForTransactionReceiptTimeoutError, type Log } from "viem";
 import { cdrAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
 import { tdh2Encrypt, encryptFile, getWasm, type TDH2Ciphertext } from "@piplabs/cdr-crypto";
 import { uuidToLabel } from "./label.js";
-import { ContentSizeExceededError, LabelMismatchError, InvalidConditionContractError } from "./errors.js";
+import {
+  ContentSizeExceededError,
+  LabelMismatchError,
+  InvalidConditionContractError,
+  InvalidParamsError,
+  VaultAllocatedEventNotFoundError,
+} from "./errors.js";
 import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
+import type { CDRPublicClient, CDRWalletClient } from "./client-types.js";
+import { type CDRLogger, noopLogger } from "./logger.js";
 
 /**
  * Wraps `publicClient.waitForTransactionReceipt` for public RPC endpoints
@@ -34,7 +42,7 @@ import { Observer } from "./observer.js";
  * `packages/sdk/__integration__/_rpc-resilience.ts`; the duplication is
  * intentional — the SDK shouldn't take a dependency on test-only files.
  */
-async function waitForReceiptResilient(publicClient: PublicClient, hash: Hash) {
+async function waitForReceiptResilient(publicClient: CDRPublicClient, hash: `0x${string}`) {
   const deadlineMs = Date.now() + 5 * 60 * 1000;
   let lastError: unknown;
   while (Date.now() < deadlineMs) {
@@ -46,10 +54,7 @@ async function waitForReceiptResilient(publicClient: PublicClient, hash: Hash) {
         retryCount: 10,
       });
     } catch (err) {
-      if (
-        !(err instanceof TransactionReceiptNotFoundError) &&
-        !(err instanceof WaitForTransactionReceiptTimeoutError)
-      ) {
+      if (!isRetryableReceiptWaitError(err)) {
         throw err;
       }
       lastError = err;
@@ -62,11 +67,29 @@ async function waitForReceiptResilient(publicClient: PublicClient, hash: Hash) {
   throw lastError ?? new Error("waitForReceiptResilient: receipt wait deadline exceeded");
 }
 
+function isRetryableReceiptWaitError(err: unknown): boolean {
+  if (
+    err instanceof TransactionReceiptNotFoundError ||
+    err instanceof WaitForTransactionReceiptTimeoutError
+  ) {
+    return true;
+  }
+  const name =
+    err && typeof err === "object" && "name" in err
+      ? (err as { name?: unknown }).name
+      : undefined;
+  return (
+    name === "TransactionReceiptNotFoundError" ||
+    name === "WaitForTransactionReceiptTimeoutError"
+  );
+}
+
 export class Uploader {
-  private publicClient: PublicClient;
-  private walletClient: WalletClient;
+  private publicClient: CDRPublicClient;
+  private walletClient: CDRWalletClient;
   private network: Network;
   private observer: Observer;
+  private logger: CDRLogger;
 
   /** Alias for {@link uploadCDR} */
   createVault: Uploader["uploadCDR"];
@@ -75,15 +98,18 @@ export class Uploader {
 
   constructor(params: {
     network: Network;
-    publicClient: PublicClient;
-    walletClient: WalletClient;
+    publicClient: CDRPublicClient;
+    walletClient: CDRWalletClient;
     /** Observer instance — required. Used by `write` to look up `maxEncryptedDataSize` (cached for the Observer's lifetime). */
     observer: Observer;
+    /** Optional structured logger; defaults to a no-op. */
+    logger?: CDRLogger;
   }) {
     this.publicClient = params.publicClient;
     this.walletClient = params.walletClient;
     this.network = params.network;
     this.observer = params.observer;
+    this.logger = params.logger ?? noopLogger;
     this.createVault = this.uploadCDR.bind(this);
     this.createFileVault = this.uploadFile.bind(this);
   }
@@ -156,11 +182,13 @@ export class Uploader {
 
     const cdrAddress = contractAddresses[this.network].cdr;
 
-    const fee = params.feeOverride ?? await this.publicClient.readContract({
-      address: cdrAddress,
-      abi: cdrAbi,
-      functionName: "allocateFee",
-    });
+    const fee =
+      params.feeOverride ??
+      ((await this.publicClient.readContract({
+        address: cdrAddress,
+        abi: cdrAbi,
+        functionName: "allocateFee",
+      })) as bigint);
 
     const txHash = await this.walletClient.writeContract({
       chain: this.walletClient.chain ?? null,
@@ -181,6 +209,7 @@ export class Uploader {
     const receipt = await waitForReceiptResilient(this.publicClient, txHash);
     const uuid = this.parseVaultAllocatedUuid(receipt.logs);
 
+    this.logger.debug("allocate.tx.mined", { txHash, uuid });
     return { txHash, uuid };
   }
 
@@ -238,11 +267,13 @@ export class Uploader {
 
     const cdrAddress = contractAddresses[this.network].cdr;
 
-    const fee = params.feeOverride ?? await this.publicClient.readContract({
-      address: cdrAddress,
-      abi: cdrAbi,
-      functionName: "writeFee",
-    });
+    const fee =
+      params.feeOverride ??
+      ((await this.publicClient.readContract({
+        address: cdrAddress,
+        abi: cdrAbi,
+        functionName: "writeFee",
+      })) as bigint);
 
     const txHash = await this.walletClient.writeContract({
       chain: this.walletClient.chain ?? null,
@@ -256,6 +287,7 @@ export class Uploader {
 
     await waitForReceiptResilient(this.publicClient, txHash);
 
+    this.logger.debug("write.tx.mined", { uuid: params.uuid, txHash });
     return { txHash };
   }
 
@@ -433,6 +465,12 @@ export class Uploader {
       stateMutability: "view" as const,
     }];
 
+    if (!this.publicClient.simulateContract) {
+      throw new InvalidParamsError(
+        "publicClient.simulateContract is required for condition validation",
+      );
+    }
+
     try {
       await this.publicClient.simulateContract({
         address,
@@ -454,14 +492,14 @@ export class Uploader {
     }
   }
 
-  private parseVaultAllocatedUuid(logs: any[]): number {
+  private parseVaultAllocatedUuid(logs: unknown[]): number {
     const parsed = parseEventLogs({
       abi: cdrAbi,
-      logs,
+      logs: logs as Log[],
       eventName: "VaultAllocated",
     });
     if (parsed.length === 0) {
-      throw new Error("VaultAllocated event not found in transaction logs");
+      throw new VaultAllocatedEventNotFoundError();
     }
     return parsed[0].args.uuid;
   }
