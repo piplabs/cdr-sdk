@@ -291,7 +291,7 @@ jobs:
             # control the headline trigger line; CONCLUSION drives the
             # emoji + status word.
             case "$TEST_RESULT" in
-              success)   emoji="✅"; status="passed"    ;;
+              success)   emoji="✅"; status="activated" ;;
               failure)   emoji="❌"; status="FAILED"    ;;
               cancelled) emoji="⚠️"; status="cancelled" ;;
               *)         emoji="❓"; status="$TEST_RESULT" ;;
