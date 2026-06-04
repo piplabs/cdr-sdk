@@ -85,6 +85,31 @@ importers:
         specifier: ^2
         version: 2.1.9(@types/node@20.19.37)(terser@5.46.1)
 
+  apps/monitor:
+    dependencies:
+      '@piplabs/cdr-sdk':
+        specifier: workspace:*
+        version: link:../../packages/sdk
+      viem:
+        specifier: ^2.47.6
+        version: 2.47.6(typescript@5.9.3)(zod@4.3.6)
+    devDependencies:
+      '@types/node':
+        specifier: ^20
+        version: 20.19.37
+      '@vitest/coverage-v8':
+        specifier: ^2
+        version: 2.1.9(vitest@2.1.9(@types/node@20.19.37)(terser@5.46.1))
+      tsx:
+        specifier: ^4
+        version: 4.21.0
+      typescript:
+        specifier: ^5.5
+        version: 5.9.3
+      vitest:
+        specifier: ^2
+        version: 2.1.9(@types/node@20.19.37)(terser@5.46.1)
+
   packages/contracts:
     devDependencies:
       typescript:

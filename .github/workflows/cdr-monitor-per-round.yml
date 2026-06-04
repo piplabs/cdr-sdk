@@ -100,17 +100,19 @@ jobs:
 
       - name: Query aeneid /dkg/latest_active
         id: query
-        # Story-API is HTTP-only (same host integration.yml's CDR_API_URL
-        # uses on aeneid). The strict regex validation below limits the
-        # blast radius of a hostile / corrupted response: any value that
-        # doesn't match the expected shape exits the step instead of
+        # Story-API base URL is read from the CDR_API_URL secret (passed via
+        # env, not interpolated inline). The strict regex validation below
+        # limits the blast radius of a hostile / corrupted response: any value
+        # that doesn't match the expected shape exits the step instead of
         # flowing into downstream shells. Combined with the env-var
         # pass-through in later steps this closes the
         # `${{ steps.x.outputs.y }}` → bash injection vector flagged on
         # PR #111.
+        env:
+          CDR_API_URL: ${{ secrets.CDR_API_URL }}
         run: |
           set -euo pipefail
-          API=http://172.192.41.96:1317
+          API="$CDR_API_URL"
           resp=$(curl -fsS --max-time 10 "$API/dkg/latest_active")
           echo "$resp" | jq '.msg.network | {round, total, threshold, stage, start_block_height, gpk: (.global_public_key[:20])}'
           round=$(echo "$resp" | jq -r '.msg.network.round')
