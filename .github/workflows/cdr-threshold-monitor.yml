@@ -1,0 +1,100 @@
+name: CDR threshold-shortfall monitor (aeneid)
+
+run-name: cdr-threshold-monitor-aeneid
+
+# Cron-fired watcher that alerts when a CDR decrypt request expires without
+# reaching its partial-decryption threshold. Reads the chain only through
+# public interfaces (EVM JSON-RPC + Story-API REST) — no node-side code.
+#
+#   schedule (*/5 min) ─→ [monitor]
+#   workflow_dispatch ──┘     │
+#                             ├─ restore read_requests.json from actions/cache
+#                             ├─ run @piplabs/cdr-monitor:
+#                             │    1. sweep expired requests → query
+#                             │       /dkg/cdr_partials; threshold met → drop,
+#                             │       below threshold → collect
+#                             │    2. ingest new VaultRead logs (eth_getLogs)
+#                             │    3. post ONE batched Slack message, drop the
+#                             │       alerted requests so the next tick doesn't
+#                             │       repeat them
+#                             └─ save read_requests.json back to cache
+#
+# State: ./read_requests.json = {lastScannedBlock, requests[]}. Carried across
+# runs via actions/cache under its own key prefix (distinct from the
+# per-round monitor's `cdr-monitor-aeneid-state-`).
+#
+# Secrets (none hardcoded — endpoints are not exposed in this file):
+#   CDR_API_URL            Story-API REST base URL (required)
+#   CDR_RPC_URL            EVM JSON-RPC URL (optional; falls back to the public
+#                          aeneid RPC when unset)
+#   CDR_SLACK_WEBHOOK_URL  incoming webhook for the CDR channel; consulted only
+#                          when a shortfall is found
+# Set them with `gh secret set <NAME>`. Secret values are masked in logs.
+
+on:
+  schedule:
+    # Every 5 min. Decrypt timeout is 200 blocks (~7-10 min at Story block
+    # times), so a shortfall is alerted within ~one tick of the deadline.
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  # Serialize runs so two cron firings can't both advance lastScannedBlock and
+  # race on the cached state file.
+  group: cdr-threshold-monitor-aeneid
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CDR_NETWORK: aeneid
+      # Endpoints come from secrets so the internal Story-API host is not
+      # exposed in the repo. CDR_RPC_URL is optional (public aeneid RPC default).
+      CDR_API_URL: ${{ secrets.CDR_API_URL }}
+      CDR_RPC_URL: ${{ secrets.CDR_RPC_URL }}
+      CDR_SLACK_WEBHOOK_URL: ${{ secrets.CDR_SLACK_WEBHOOK_URL }}
+      READ_REQUESTS_PATH: ./read_requests.json
+      RUN_URL: ${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # State file shared across runs via actions/cache (run-unique save key,
+      # shared restore-keys prefix — most recent entry wins on restore).
+      - name: Restore read_requests.json from cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ./read_requests.json
+          key: cdr-threshold-read-requests-${{ github.run_id }}
+          restore-keys: |
+            cdr-threshold-read-requests-
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+      - run: pnpm install
+      - run: pnpm build
+
+      - name: Verify required secrets are set
+        run: |
+          if [ -z "$CDR_API_URL" ]; then
+            echo "::error::CDR_API_URL is empty (set the repo secret: gh secret set CDR_API_URL)"
+            exit 1
+          fi
+
+      - name: Run threshold monitor
+        run: pnpm --filter @piplabs/cdr-monitor partials-threshold
+
+      - name: Save read_requests.json to cache
+        # Always save: lastScannedBlock advances almost every run.
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ./read_requests.json
+          key: cdr-threshold-read-requests-${{ github.run_id }}
