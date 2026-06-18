@@ -47,7 +47,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AENEID_REST: http://172.192.41.96:1317
+  # Public aeneid REST endpoint. Overridable via repo variable so the node can
+  # be reprovisioned without editing the workflow (falls back to the default).
+  AENEID_REST: ${{ vars.AENEID_REST || 'http://172.192.41.96:1317' }}
   DEFAULT_START_ROUND: '24'
   MAX_ADVANCES_PER_RUN: '6'
 
@@ -111,6 +113,7 @@ jobs:
           }
 
           # --- initialize watch pointer ---
+          UNREACH=0
           if [ -n "${RESEED:-}" ]; then
             if ! [[ "$RESEED" =~ ^[0-9]+$ ]]; then
               echo "::error::start_round input must be an integer, got '$RESEED'"; exit 1
@@ -120,18 +123,29 @@ jobs:
           elif [ -f ./state.json ]; then
             WR=$(jq -r '.watch_round // empty' ./state.json)
             LS=$(jq -r '.last_stage // 0' ./state.json)
+            UNREACH=$(jq -r '.unreachable // 0' ./state.json)
           else
             WR="$DEFAULT_START_ROUND"; LS=0
             echo "no cached state; starting at default watch_round=$WR"
           fi
           [[ "$WR" =~ ^[0-9]+$ ]] || { echo "::error::bad watch_round='$WR'"; exit 1; }
           [[ "$LS" =~ ^[0-6]$ ]] || LS=0
+          [[ "${UNREACH:-0}" =~ ^[01]$ ]] || UNREACH=0
 
           changed=0
+          rest_down=0
           i=0
           while [ "$i" -lt "$MAX_ADVANCES_PER_RUN" ]; do
             i=$((i + 1))
-            resp=$(curl -fsS --max-time 10 "$AENEID_REST/dkg/dkg_network?round=$WR" 2>/dev/null || echo '{}')
+            # Distinguish a real REST failure (network/HTTP error -> curl -f
+            # non-zero) from a valid response for a not-yet-created round
+            # (stage 0). A swallowed failure would let monitoring go dark
+            # silently, so we surface it as an alert below.
+            if ! resp=$(curl -fsS --max-time 10 "$AENEID_REST/dkg/dkg_network?round=$WR" 2>/dev/null); then
+              echo "REST query failed for round=$WR"
+              rest_down=1
+              break
+            fi
             S=$(echo "$resp" | jq -r '.msg.network.stage // 0')
             [[ "$S" =~ ^[0-9]+$ ]] || S=0
             echo "watch_round=$WR observed stage=$S (last_stage=$LS)"
@@ -159,7 +173,17 @@ jobs:
             break
           done
 
-          printf '{"watch_round":%s,"last_stage":%s}\n' "$WR" "$LS" > ./state.json
+          # Edge-triggered reachability alerts (no spam): one warning when the
+          # REST endpoint goes dark, one all-clear when it recovers.
+          if [ "$rest_down" = "1" ] && [ "${UNREACH:-0}" = "0" ]; then
+            notify "$(stage_emoji 5) WARNING: DKG monitor cannot reach aeneid REST ($AENEID_REST); round notifications are paused"
+            UNREACH=1; changed=1
+          elif [ "$rest_down" = "0" ] && [ "${UNREACH:-0}" = "1" ]; then
+            notify "$(stage_emoji 4) DKG monitor: aeneid REST reachable again; resuming (watching round $WR)"
+            UNREACH=0; changed=1
+          fi
+
+          printf '{"watch_round":%s,"last_stage":%s,"unreachable":%s}\n' "$WR" "$LS" "${UNREACH:-0}" > ./state.json
           echo "new state: $(cat ./state.json)"
           echo "changed=$changed" >> "$GITHUB_OUTPUT"
 
