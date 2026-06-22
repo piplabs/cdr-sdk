@@ -13,9 +13,14 @@ run-name: dkg-round-monitor-aeneid${{ github.event.inputs.start_round != '' && f
 # Each run:
 #   1. query /dkg/dkg_network?round=<watch_round> -> stage S
 #   2. if S != last_stage -> post a Slack notification for S, set last_stage=S
-#   3. if S is terminal (5 FAILED / 6 ENDED) -> watch_round += 1, last_stage = 0,
-#      and re-check the next round in the same run (so "Round N ENDED" and
-#      "Round N+1 → REGISTRATION" can fire back-to-back). Bounded per run.
+#   3. if S means the round is done (4 ACTIVE / 5 FAILED / 6 ENDED) ->
+#      watch_round += 1, last_stage = 0, and re-check the next round in the same
+#      run (so "Round N → ACTIVE" and "Round N+1 → REGISTRATION" can fire
+#      back-to-back). Bounded per run. ACTIVE must advance the pointer: a
+#      resharing round begins forming while the previous round is still ACTIVE,
+#      and a *failed* forming round never evicts the ACTIVE one -> a pointer
+#      parked on ACTIVE would never see the next round's REGISTRATION/DEALING/
+#      FINALIZATION or report a FAILED round.
 #   4. otherwise stop until the next tick (the round is still progressing).
 #
 # Stage codes (story x/dkg DKGStage): 1=REGISTRATION 2=DEALING 3=FINALIZATION
@@ -164,8 +169,12 @@ jobs:
               LS="$S"; changed=1
             fi
 
-            # terminal stage -> advance the pointer and re-check the next round
-            if [ "$S" = "5" ] || [ "$S" = "6" ]; then
+            # round done -> advance the pointer and follow the next forming round.
+            # ACTIVE (4) advances too: the next resharing round forms while this
+            # one is still ACTIVE, and a failed forming round never evicts the
+            # ACTIVE one, so a pointer left on ACTIVE would go blind to every
+            # later round (REG/DEAL/FIN and, critically, FAILED).
+            if [ "$S" = "4" ] || [ "$S" = "5" ] || [ "$S" = "6" ]; then
               WR=$((WR + 1)); LS=0; changed=1
               continue
             fi
