@@ -15,6 +15,11 @@ const SAMPLE_ABI = [
 
 const ACCOUNT = {
   address: "0x5B07483b0D1235a399A483aC8cCE665eCB5E3a75" as const,
+  type: "local" as const,
+};
+
+const JSON_RPC_ACCOUNT = {
+  address: "0x5B07483b0D1235a399A483aC8cCE665eCB5E3a75" as const,
   type: "json-rpc" as const,
 };
 
@@ -40,6 +45,7 @@ function mockWallet(opts: {
     })),
     signTransaction: vi.fn(async () => SAMPLE_SERIALIZED),
     sendRawTransaction: vi.fn(opts.sendImpl),
+    writeContract: vi.fn(async () => EXPECTED_HASH),
   } as any;
   return wallet;
 }
@@ -174,12 +180,34 @@ describe("safeWriteContract", () => {
     ).rejects.toThrow(/ContractFunctionExecutionError/);
   });
 
-  it("passes account=null / chain=null through to viem unchanged (matches writeContract)", async () => {
+  it("falls back to writeContract for a JSON-RPC account (cannot pre-sign locally)", async () => {
+    // A node-managed account (MetaMask / json-rpc) has no in-process key, so
+    // signTransaction would hit eth_signTransaction (unsupported on public
+    // RPCs). The helper must defer to writeContract instead of pre-signing.
+    const wallet = mockWallet({ sendImpl: async () => EXPECTED_HASH });
+    const hash = await safeWriteContract(wallet, {
+      account: JSON_RPC_ACCOUNT,
+      chain: CHAIN,
+      address: ADDRESS,
+      abi: SAMPLE_ABI as any,
+      functionName: "ping",
+      args: [42n],
+    });
+    expect(hash).toBe(EXPECTED_HASH);
+    expect(wallet.writeContract).toHaveBeenCalledTimes(1);
+    expect(wallet.signTransaction).not.toHaveBeenCalled();
+    expect(wallet.sendRawTransaction).not.toHaveBeenCalled();
+    const wcArg = wallet.writeContract.mock.calls[0][0];
+    expect(wcArg.functionName).toBe("ping");
+    expect(wcArg.account).toBe(JSON_RPC_ACCOUNT);
+  });
+
+  it("falls back to writeContract when account is null (node-managed, matches old call path)", async () => {
     // Historical writeContract usage in this SDK is
     //   account: walletClient.account ?? null,
     //   chain:   walletClient.chain   ?? null,
-    // so the helper must accept null without throwing of its own accord and
-    // let viem do the same validation the old call path did.
+    // With no resolvable local account the helper defers to writeContract,
+    // exactly as the pre-existing call path did.
     const wallet = mockWallet({ sendImpl: async () => EXPECTED_HASH });
     const hash = await safeWriteContract(wallet, {
       account: null,
@@ -190,9 +218,10 @@ describe("safeWriteContract", () => {
       args: [42n],
     });
     expect(hash).toBe(EXPECTED_HASH);
-    const prepArg = wallet.prepareTransactionRequest.mock.calls[0][0];
-    expect(prepArg.account).toBeUndefined();
-    expect(prepArg.chain).toBeUndefined();
+    expect(wallet.writeContract).toHaveBeenCalledTimes(1);
+    const wcArg = wallet.writeContract.mock.calls[0][0];
+    expect(wcArg.account).toBeNull();
+    expect(wcArg.chain).toBeNull();
   });
 });
 

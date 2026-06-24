@@ -149,7 +149,7 @@ function mockClients(opts: { vaultEncryptedData?: `0x${string}` } = {}) {
   };
   const walletClient = {
     ...makeWalletMock(),
-    account: { address: "0xfeed" },
+    account: { address: "0xfeed", type: "local" },
     chain: { id: 1 },
   };
   walletClient.sendRawTransaction.mockResolvedValue("0xtxhash" as `0x${string}`);

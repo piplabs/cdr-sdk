@@ -8,7 +8,9 @@ import { decodeFunctionData, type Abi } from "viem";
  */
 export function makeWalletMock() {
   return {
-    account: { address: "0xaaaa" } as const,
+    // type: "local" so safeWriteContract takes the pre-sign path these mocks
+    // exercise (prepareTransactionRequest → signTransaction → sendRawTransaction).
+    account: { address: "0xaaaa", type: "local" } as const,
     prepareTransactionRequest: vi.fn(async (args: any) => ({
       ...args,
       type: "eip1559",

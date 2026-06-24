@@ -40,11 +40,43 @@ export interface SafeWriteContractParams {
  * NOT in this set: it can also mean a *different* tx consumed the
  * nonce, in which case ours never lands and the precomputed hash
  * would hang `waitForTransactionReceipt`.
+ *
+ * Account types: only a LOCAL account (private key in-process, e.g.
+ * `privateKeyToAccount`) can be signed without the node, which is what lets
+ * us precompute the hash. A JSON-RPC account (browser wallet / MetaMask /
+ * node-managed keystore) signs through the node (`eth_sendTransaction`) and
+ * cannot be pre-signed locally — for those we fall back to viem's
+ * `writeContract` (exactly the pre-existing call path). That fallback does
+ * NOT get the retry-self-collision recovery, but it keeps JSON-RPC-account
+ * wallets working.
  */
 export async function safeWriteContract(
   walletClient: WalletClient,
   params: SafeWriteContractParams,
 ): Promise<Hash> {
+  // Decide whether we can sign locally (and thus precompute the hash). Only a
+  // local account (type === "local") holds the key in-process; a JSON-RPC
+  // account or bare address is signed by the node.
+  const account = params.account ?? walletClient.account ?? null;
+  const isLocalAccount =
+    typeof account === "object" && account !== null && (account as Account).type === "local";
+
+  if (!isLocalAccount) {
+    // Node-managed signer (MetaMask / JSON-RPC account / bare address): we
+    // cannot pre-sign to learn the hash, so defer to viem's writeContract —
+    // the same path the call sites used before this helper. No idempotent
+    // retry recovery on this path, but it keeps these wallets working.
+    return walletClient.writeContract({
+      account: params.account,
+      chain: params.chain,
+      address: params.address,
+      abi: params.abi,
+      functionName: params.functionName,
+      args: params.args as readonly unknown[],
+      value: params.value,
+    } as Parameters<typeof walletClient.writeContract>[0]);
+  }
+
   const data: Hex = encodeFunctionData({
     abi: params.abi,
     functionName: params.functionName,
