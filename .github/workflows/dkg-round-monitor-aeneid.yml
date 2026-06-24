@@ -142,15 +142,27 @@ jobs:
           i=0
           while [ "$i" -lt "$MAX_ADVANCES_PER_RUN" ]; do
             i=$((i + 1))
-            # Distinguish a real REST failure (network/HTTP error -> curl -f
-            # non-zero) from a valid response for a not-yet-created round
-            # (stage 0). A swallowed failure would let monitoring go dark
-            # silently, so we surface it as an alert below.
-            if ! resp=$(curl -fsS --max-time 10 "$AENEID_REST/dkg/dkg_network?round=$WR" 2>/dev/null); then
-              echo "REST query failed for round=$WR"
+            # Probe the REAL DKG API endpoint. Distinguish a genuine connection
+            # failure (host down / DNS / timeout -> curl exits non-zero, no HTTP
+            # response) from an HTTP error (server reachable but returns non-2xx,
+            # e.g. a transient 5xx or a 404 on an odd path/round). ONLY a
+            # connection failure means "REST unreachable". The old `curl -f`
+            # conflated the two and fired a false "cannot reach REST" alert while
+            # the API was actually up (bare `/` 404s, but /dkg/* serves fine).
+            rc=0
+            http=$(curl -sS -o /tmp/dkg_resp.json -w '%{http_code}' --max-time 10 "$AENEID_REST/dkg/dkg_network?round=$WR" 2>/tmp/dkg_err) || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "REST connection failed (curl rc=$rc) for round=$WR: $(cat /tmp/dkg_err 2>/dev/null)"
               rest_down=1
               break
             fi
+            if ! [[ "$http" =~ ^2 ]]; then
+              # Server is UP (returned HTTP $http) but this query errored — not an
+              # unreachability condition. Skip this tick without a false alert.
+              echo "REST reachable (HTTP $http) but round=$WR query non-2xx; skipping tick"
+              break
+            fi
+            resp=$(cat /tmp/dkg_resp.json)
             S=$(echo "$resp" | jq -r '.msg.network.stage // 0')
             [[ "$S" =~ ^[0-9]+$ ]] || S=0
             echo "watch_round=$WR observed stage=$S (last_stage=$LS)"
