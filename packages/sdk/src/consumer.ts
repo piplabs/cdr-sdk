@@ -21,6 +21,7 @@ import { Observer } from "./observer.js";
 import { verifyAttestation, type AttestationConfig } from "./attestation.js";
 import { queryCDRPartials } from "./story-api/client.js";
 import type { DKGPartialDecryptionSubmission } from "./story-api/types.js";
+import { safeWriteContract } from "./_tx-submit.js";
 
 /**
  * Consumer reads encrypted vault data from the CDR contract and recovers the
@@ -136,7 +137,7 @@ export class Consumer {
       functionName: "readFee",
     });
 
-    const txHash = await this.walletClient.writeContract({
+    const txHash = await safeWriteContract(this.walletClient, {
       chain: this.walletClient.chain ?? null,
       account: this.walletClient.account ?? null,
       address: cdrAddress,

@@ -5,6 +5,7 @@ import { uuidToLabel } from "./label.js";
 import { ContentSizeExceededError, LabelMismatchError, InvalidConditionContractError } from "./errors.js";
 import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
+import { safeWriteContract } from "./_tx-submit.js";
 
 /**
  * Wraps `publicClient.waitForTransactionReceipt` for public RPC endpoints
@@ -162,7 +163,7 @@ export class Uploader {
       functionName: "allocateFee",
     });
 
-    const txHash = await this.walletClient.writeContract({
+    const txHash = await safeWriteContract(this.walletClient, {
       chain: this.walletClient.chain ?? null,
       account: this.walletClient.account ?? null,
       address: cdrAddress,
@@ -244,7 +245,7 @@ export class Uploader {
       functionName: "writeFee",
     });
 
-    const txHash = await this.walletClient.writeContract({
+    const txHash = await safeWriteContract(this.walletClient, {
       chain: this.walletClient.chain ?? null,
       account: this.walletClient.account ?? null,
       address: cdrAddress,
