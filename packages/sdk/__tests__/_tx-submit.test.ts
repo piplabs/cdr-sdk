@@ -25,6 +25,11 @@ const JSON_RPC_ACCOUNT = {
 
 const CHAIN = { id: 1315 } as any;
 
+// Minimal publicClient stub. The local (pre-sign) path never touches it; the
+// json-rpc path reads getTransactionCount/getBlockNumber best-effort (failures
+// are swallowed). Tests that exercise nonce recovery build their own.
+const PUBLIC = {} as any;
+
 const ADDRESS = "0xcccccc0000000000000000000000000000000005" as const;
 
 const SAMPLE_SERIALIZED =
@@ -61,7 +66,7 @@ function rpcErrLike(opts: { details?: string; message?: string; cause?: unknown 
 describe("safeWriteContract", () => {
   it("happy path: returns the hash from sendRawTransaction", async () => {
     const wallet = mockWallet({ sendImpl: async () => EXPECTED_HASH });
-    const hash = await safeWriteContract(wallet, {
+    const hash = await safeWriteContract(wallet, PUBLIC, {
       account: ACCOUNT,
       chain: CHAIN,
       address: ADDRESS,
@@ -85,7 +90,7 @@ describe("safeWriteContract", () => {
         });
       },
     });
-    const hash = await safeWriteContract(wallet, {
+    const hash = await safeWriteContract(wallet, PUBLIC, {
       account: ACCOUNT,
       chain: CHAIN,
       address: ADDRESS,
@@ -102,7 +107,7 @@ describe("safeWriteContract", () => {
         throw rpcErrLike({ details: "already known" });
       },
     });
-    const hash = await safeWriteContract(wallet, {
+    const hash = await safeWriteContract(wallet, PUBLIC, {
       account: ACCOUNT,
       chain: CHAIN,
       address: ADDRESS,
@@ -120,7 +125,7 @@ describe("safeWriteContract", () => {
       },
     });
     await expect(
-      safeWriteContract(wallet, {
+      safeWriteContract(wallet, PUBLIC, {
         account: ACCOUNT,
         chain: CHAIN,
         address: ADDRESS,
@@ -148,7 +153,7 @@ describe("safeWriteContract", () => {
         throw outer;
       },
     });
-    const hash = await safeWriteContract(wallet, {
+    const hash = await safeWriteContract(wallet, PUBLIC, {
       account: ACCOUNT,
       chain: CHAIN,
       address: ADDRESS,
@@ -169,7 +174,7 @@ describe("safeWriteContract", () => {
       },
     });
     await expect(
-      safeWriteContract(wallet, {
+      safeWriteContract(wallet, PUBLIC, {
         account: ACCOUNT,
         chain: CHAIN,
         address: ADDRESS,
@@ -185,7 +190,7 @@ describe("safeWriteContract", () => {
     // signTransaction would hit eth_signTransaction (unsupported on public
     // RPCs). The helper must defer to writeContract instead of pre-signing.
     const wallet = mockWallet({ sendImpl: async () => EXPECTED_HASH });
-    const hash = await safeWriteContract(wallet, {
+    const hash = await safeWriteContract(wallet, PUBLIC, {
       account: JSON_RPC_ACCOUNT,
       chain: CHAIN,
       address: ADDRESS,
@@ -209,7 +214,7 @@ describe("safeWriteContract", () => {
     // With no resolvable local account the helper defers to writeContract,
     // exactly as the pre-existing call path did.
     const wallet = mockWallet({ sendImpl: async () => EXPECTED_HASH });
-    const hash = await safeWriteContract(wallet, {
+    const hash = await safeWriteContract(wallet, PUBLIC, {
       account: null,
       chain: null,
       address: ADDRESS,
@@ -222,6 +227,49 @@ describe("safeWriteContract", () => {
     const wcArg = wallet.writeContract.mock.calls[0][0];
     expect(wcArg.account).toBeNull();
     expect(wcArg.chain).toBeNull();
+  });
+
+  it("JSON-RPC account: recovers the hash by (sender,nonce) block scan on a retry collision", async () => {
+    // The node-managed send collides (already in mempool) but writeContract
+    // never gave us the hash. We captured the pending nonce before sending and
+    // recover the hash by finding the mined tx with that (sender, nonce).
+    const FROM = JSON_RPC_ACCOUNT.address;
+    const RECOVERED = "0xdecafbad" as `0x${string}`;
+    const wallet = mockWallet({ sendImpl: async () => EXPECTED_HASH });
+    wallet.writeContract = vi.fn(async () => {
+      throw rpcErrLike({ details: "replacement transaction underpriced" });
+    });
+    const publicClient = {
+      getTransactionCount: vi.fn(async () => 7),
+      getBlockNumber: vi.fn(async () => 100n),
+      getBlock: vi.fn(async ({ blockNumber }: { blockNumber: bigint }) => {
+        // tx with (FROM, nonce 7) lands in block 101
+        if (blockNumber === 101n) {
+          return {
+            transactions: [
+              { from: "0x0000000000000000000000000000000000000001", nonce: 3, hash: "0xother" },
+              { from: FROM.toLowerCase(), nonce: 7, hash: RECOVERED },
+            ],
+          };
+        }
+        return { transactions: [] };
+      }),
+    } as any;
+    // head advances to 101 on the second poll
+    publicClient.getBlockNumber
+      .mockResolvedValueOnce(100n)
+      .mockResolvedValue(101n);
+
+    const hash = await safeWriteContract(wallet, publicClient, {
+      account: JSON_RPC_ACCOUNT,
+      chain: CHAIN,
+      address: ADDRESS,
+      abi: SAMPLE_ABI as any,
+      functionName: "ping",
+      args: [42n],
+    });
+    expect(hash).toBe(RECOVERED);
+    expect(publicClient.getTransactionCount).toHaveBeenCalledWith({ address: FROM, blockTag: "pending" });
   });
 });
 

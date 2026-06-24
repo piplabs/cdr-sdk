@@ -163,7 +163,7 @@ export class Uploader {
       functionName: "allocateFee",
     });
 
-    const txHash = await safeWriteContract(this.walletClient, {
+    const txHash = await safeWriteContract(this.walletClient, this.publicClient, {
       chain: this.walletClient.chain ?? null,
       account: this.walletClient.account ?? null,
       address: cdrAddress,
@@ -245,7 +245,7 @@ export class Uploader {
       functionName: "writeFee",
     });
 
-    const txHash = await safeWriteContract(this.walletClient, {
+    const txHash = await safeWriteContract(this.walletClient, this.publicClient, {
       chain: this.walletClient.chain ?? null,
       account: this.walletClient.account ?? null,
       address: cdrAddress,

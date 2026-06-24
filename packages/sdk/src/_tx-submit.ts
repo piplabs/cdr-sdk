@@ -7,6 +7,7 @@ import {
   type Chain,
   type Hash,
   type Hex,
+  type PublicClient,
   type WalletClient,
 } from "viem";
 
@@ -20,63 +21,64 @@ export interface SafeWriteContractParams {
   value?: bigint;
 }
 
+// How long to keep looking for an already-broadcast tx (json-rpc recovery)
+// before giving up. The colliding tx is already in the pool, so it normally
+// mines within a few blocks; this is just a backstop.
+const NONCE_RECOVERY_DEADLINE_MS = 2 * 60 * 1000;
+const NONCE_RECOVERY_POLL_MS = 2000;
+
 /**
  * Idempotent replacement for `walletClient.writeContract(...)` against
  * shared/slow public RPCs.
  *
- * viem's default HTTP transport retries `eth_sendRawTransaction` on slow
- * acks. The first broadcast may have already landed in the mempool, so a
- * naive retry collides as a same-nonce non-bumped replacement and the
- * node rejects it with `replacement transaction underpriced` (surfaced
- * by viem as the misleading top-line `Missing or invalid parameters`).
- * See piplabs/cdr-sdk#122.
+ * viem's default HTTP transport retries `eth_sendRawTransaction` /
+ * `eth_sendTransaction` on slow acks. The first broadcast may have already
+ * landed in the mempool, so a naive retry collides as a same-nonce
+ * non-bumped replacement and the node rejects it with `replacement
+ * transaction underpriced` / `already known` (surfaced by viem as the
+ * misleading top-line `Missing or invalid parameters`). See
+ * piplabs/cdr-sdk#122. The error is not actionable — the tx really is in
+ * flight; the SDK just needs to learn its hash and wait on the receipt.
  *
- * The fix here pre-signs the tx so we know its hash up front, then
- * recognises the "already submitted" error family — `replacement
- * transaction underpriced` and `already known`, which unambiguously
- * mean *this exact tx* is already in flight — and returns the
- * precomputed hash so the caller can wait for the receipt as if the
- * original broadcast had succeeded. `nonce too low` is intentionally
- * NOT in this set: it can also mean a *different* tx consumed the
- * nonce, in which case ours never lands and the precomputed hash
- * would hang `waitForTransactionReceipt`.
+ * Two account types, two recovery mechanisms (both end at the real tx hash):
  *
- * Account types: only a LOCAL account (private key in-process, e.g.
- * `privateKeyToAccount`) can be signed without the node, which is what lets
- * us precompute the hash. A JSON-RPC account (browser wallet / MetaMask /
- * node-managed keystore) signs through the node (`eth_sendTransaction`) and
- * cannot be pre-signed locally — for those we fall back to viem's
- * `writeContract` (exactly the pre-existing call path). That fallback does
- * NOT get the retry-self-collision recovery, but it keeps JSON-RPC-account
- * wallets working.
+ * - LOCAL account (key in-process, e.g. `privateKeyToAccount`): we pre-sign
+ *   so we know the hash up front, then on an "already submitted" collision
+ *   return that precomputed hash.
+ * - JSON-RPC account (browser wallet / MetaMask / node-managed keystore): the
+ *   node signs via `eth_sendTransaction`, so we cannot pre-sign. We capture
+ *   the sender + pending nonce before sending, defer to `writeContract`, and
+ *   on a collision recover the hash by scanning for the mined tx with that
+ *   `(sender, nonce)`. There is no standard RPC to look a tx up by nonce, so
+ *   this is a bounded block scan — fine on a low-volume chain like aeneid.
+ *
+ * `nonce too low` is intentionally NOT treated as "already submitted": it can
+ * mean a *different* tx consumed the nonce, in which case ours never lands.
  */
 export async function safeWriteContract(
   walletClient: WalletClient,
+  publicClient: PublicClient,
   params: SafeWriteContractParams,
 ): Promise<Hash> {
-  // Decide whether we can sign locally (and thus precompute the hash). Only a
-  // local account (type === "local") holds the key in-process; a JSON-RPC
-  // account or bare address is signed by the node.
   const account = params.account ?? walletClient.account ?? null;
   const isLocalAccount =
     typeof account === "object" && account !== null && (account as Account).type === "local";
 
   if (!isLocalAccount) {
-    // Node-managed signer (MetaMask / JSON-RPC account / bare address): we
-    // cannot pre-sign to learn the hash, so defer to viem's writeContract —
-    // the same path the call sites used before this helper. No idempotent
-    // retry recovery on this path, but it keeps these wallets working.
-    return walletClient.writeContract({
-      account: params.account,
-      chain: params.chain,
-      address: params.address,
-      abi: params.abi,
-      functionName: params.functionName,
-      args: params.args as readonly unknown[],
-      value: params.value,
-    } as Parameters<typeof walletClient.writeContract>[0]);
+    return submitViaNode(walletClient, publicClient, params, account);
   }
 
+  return submitPreSigned(walletClient, params);
+}
+
+/**
+ * Local-account path: pre-sign to learn the hash, broadcast the raw tx, and
+ * return the precomputed hash on an already-submitted collision.
+ */
+async function submitPreSigned(
+  walletClient: WalletClient,
+  params: SafeWriteContractParams,
+): Promise<Hash> {
   const data: Hex = encodeFunctionData({
     abi: params.abi,
     functionName: params.functionName,
@@ -118,6 +120,105 @@ export async function safeWriteContract(
     }
     throw err;
   }
+}
+
+/**
+ * JSON-RPC-account path: the node signs, so we can't pre-sign. Capture the
+ * sender + pending nonce, defer to writeContract, and on an already-submitted
+ * collision recover the hash by finding the mined tx with that (sender, nonce).
+ */
+async function submitViaNode(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  params: SafeWriteContractParams,
+  account: Account | Address | null,
+): Promise<Hash> {
+  const from = accountAddress(account);
+
+  // Capture (nonce, startBlock) BEFORE sending so a collision is recoverable.
+  // Best-effort: if these reads fail we still attempt the send and just can't
+  // recover a colliding hash (same as before this path existed).
+  let nonce: number | undefined;
+  let startBlock: bigint | undefined;
+  if (from) {
+    try {
+      nonce = await publicClient.getTransactionCount({ address: from, blockTag: "pending" });
+      startBlock = await publicClient.getBlockNumber();
+    } catch {
+      // ignore — recovery just won't be possible
+    }
+  }
+
+  try {
+    return await walletClient.writeContract({
+      account: params.account,
+      chain: params.chain,
+      address: params.address,
+      abi: params.abi,
+      functionName: params.functionName,
+      args: params.args as readonly unknown[],
+      value: params.value,
+    } as Parameters<typeof walletClient.writeContract>[0]);
+  } catch (err) {
+    if (
+      isAlreadySubmittedError(err) &&
+      from &&
+      nonce !== undefined &&
+      startBlock !== undefined
+    ) {
+      return recoverHashBySenderNonce(publicClient, from, nonce, startBlock);
+    }
+    throw err;
+  }
+}
+
+function accountAddress(account: Account | Address | null): Address | null {
+  if (typeof account === "string") return account;
+  if (account && typeof account === "object" && typeof (account as Account).address === "string") {
+    return (account as Account).address;
+  }
+  return null;
+}
+
+/**
+ * Find the hash of an already-broadcast tx by its (sender, nonce) — used to
+ * recover from a json-rpc retry self-collision where we never learned the
+ * hash. There is no standard RPC for nonce lookup, so we scan blocks from
+ * `fromBlock` forward (a given (sender, nonce) maps to at most one mined tx).
+ * Bounded by a deadline; throws if not found in time.
+ */
+async function recoverHashBySenderNonce(
+  publicClient: PublicClient,
+  from: Address,
+  nonce: number,
+  fromBlock: bigint,
+): Promise<Hash> {
+  const fromLc = from.toLowerCase();
+  const deadline = Date.now() + NONCE_RECOVERY_DEADLINE_MS;
+  let next = fromBlock;
+
+  while (Date.now() < deadline) {
+    const head = await publicClient.getBlockNumber();
+    for (; next <= head; next++) {
+      const block = await publicClient.getBlock({ blockNumber: next, includeTransactions: true });
+      for (const tx of block.transactions) {
+        if (
+          typeof tx === "object" &&
+          tx.from?.toLowerCase() === fromLc &&
+          tx.nonce === nonce
+        ) {
+          return tx.hash;
+        }
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, NONCE_RECOVERY_POLL_MS));
+  }
+
+  throw new Error(
+    `safeWriteContract: tx was accepted by the node (already-in-mempool) but its hash ` +
+      `could not be recovered for sender ${from} nonce ${nonce} within ` +
+      `${NONCE_RECOVERY_DEADLINE_MS}ms`,
+  );
 }
 
 const ALREADY_SUBMITTED_PATTERNS = [

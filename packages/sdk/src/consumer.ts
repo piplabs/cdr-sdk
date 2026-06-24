@@ -137,7 +137,7 @@ export class Consumer {
       functionName: "readFee",
     });
 
-    const txHash = await safeWriteContract(this.walletClient, {
+    const txHash = await safeWriteContract(this.walletClient, this.publicClient, {
       chain: this.walletClient.chain ?? null,
       account: this.walletClient.account ?? null,
       address: cdrAddress,
