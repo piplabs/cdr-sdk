@@ -139,6 +139,11 @@ jobs:
 
           changed=0
           rest_down=0
+          # got_ok=1 only after a genuine 2xx response was processed this run.
+          # The "reachable again; resuming" all-clear keys off this, NOT off
+          # rest_down=0, so an HTTP-error (non-2xx) tick — which skips without
+          # processing a round — does not prematurely claim we resumed.
+          got_ok=0
           i=0
           while [ "$i" -lt "$MAX_ADVANCES_PER_RUN" ]; do
             i=$((i + 1))
@@ -163,6 +168,7 @@ jobs:
               break
             fi
             resp=$(cat /tmp/dkg_resp.json)
+            got_ok=1   # genuine 2xx: round data actually processed this run
             S=$(echo "$resp" | jq -r '.msg.network.stage // 0')
             [[ "$S" =~ ^[0-9]+$ ]] || S=0
             echo "watch_round=$WR observed stage=$S (last_stage=$LS)"
@@ -199,7 +205,7 @@ jobs:
           if [ "$rest_down" = "1" ] && [ "${UNREACH:-0}" = "0" ]; then
             notify "$(stage_emoji 5) WARNING: DKG monitor cannot reach aeneid REST ($AENEID_REST); round notifications are paused"
             UNREACH=1; changed=1
-          elif [ "$rest_down" = "0" ] && [ "${UNREACH:-0}" = "1" ]; then
+          elif [ "$got_ok" = "1" ] && [ "${UNREACH:-0}" = "1" ]; then
             notify "$(stage_emoji 4) DKG monitor: aeneid REST reachable again; resuming (watching round $WR)"
             UNREACH=0; changed=1
           fi
