@@ -12,8 +12,11 @@ import {
 } from "viem";
 
 export interface SafeWriteContractParams {
-  account: Account | Address | null;
-  chain: Chain | null;
+  // account / chain default to the walletClient's own when omitted (matching
+  // the historical `walletClient.account ?? null` / `walletClient.chain ?? null`
+  // call sites). Pass explicitly only to override.
+  account?: Account | Address | null;
+  chain?: Chain | null;
   address: Address;
   abi: Abi;
   functionName: string;
@@ -60,15 +63,20 @@ export async function safeWriteContract(
   publicClient: PublicClient,
   params: SafeWriteContractParams,
 ): Promise<Hash> {
+  // Resolve account/chain from the walletClient when the caller omitted them,
+  // so every call site stops repeating `walletClient.account ?? null` etc.
   const account = params.account ?? walletClient.account ?? null;
+  const chain = params.chain ?? walletClient.chain ?? null;
+  const resolved: SafeWriteContractParams = { ...params, account, chain };
+
   const isLocalAccount =
     typeof account === "object" && account !== null && (account as Account).type === "local";
 
   if (!isLocalAccount) {
-    return submitViaNode(walletClient, publicClient, params, account);
+    return submitViaNode(walletClient, publicClient, resolved, account);
   }
 
-  return submitPreSigned(walletClient, params);
+  return submitPreSigned(walletClient, resolved);
 }
 
 /**

@@ -138,8 +138,6 @@ export class Consumer {
     });
 
     const txHash = await safeWriteContract(this.walletClient, this.publicClient, {
-      chain: this.walletClient.chain ?? null,
-      account: this.walletClient.account ?? null,
       address: cdrAddress,
       abi: cdrAbi,
       functionName: "read",
