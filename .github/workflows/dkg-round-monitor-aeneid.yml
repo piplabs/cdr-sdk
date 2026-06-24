@@ -140,9 +140,10 @@ jobs:
           changed=0
           rest_down=0
           # got_ok=1 only after a genuine 2xx response was processed this run.
-          # The "reachable again; resuming" all-clear keys off this, NOT off
-          # rest_down=0, so an HTTP-error (non-2xx) tick — which skips without
-          # processing a round — does not prematurely claim we resumed.
+          # Used purely to word the recovery all-clear accurately (round actually
+          # processed vs endpoint reachable but round not formed yet). The un-pause
+          # itself keys off rest_down=0 (connection restored), so a non-2xx tick
+          # still clears a stale pause without claiming a round resumed.
           got_ok=0
           i=0
           while [ "$i" -lt "$MAX_ADVANCES_PER_RUN" ]; do
@@ -205,8 +206,17 @@ jobs:
           if [ "$rest_down" = "1" ] && [ "${UNREACH:-0}" = "0" ]; then
             notify "$(stage_emoji 5) WARNING: DKG monitor cannot reach aeneid REST ($AENEID_REST); round notifications are paused"
             UNREACH=1; changed=1
-          elif [ "$got_ok" = "1" ] && [ "${UNREACH:-0}" = "1" ]; then
-            notify "$(stage_emoji 4) DKG monitor: aeneid REST reachable again; resuming (watching round $WR)"
+          elif [ "$rest_down" = "0" ] && [ "${UNREACH:-0}" = "1" ]; then
+            # Connection restored: we got an HTTP response this run (2xx or not).
+            # Un-pause on reachability, NOT on a 2xx — aeneid returns HTTP 500 for
+            # a not-yet-created round, so requiring a 2xx would leave the pause
+            # stuck whenever the watch pointer sits on a future round. got_ok only
+            # picks accurate wording (round processed vs not formed yet).
+            if [ "$got_ok" = "1" ]; then
+              notify "$(stage_emoji 4) DKG monitor: aeneid REST reachable again; resuming (watching round $WR)"
+            else
+              notify "$(stage_emoji 4) DKG monitor: aeneid REST reachable again (HTTP responding); round $WR not formed yet, will resume on its first stage"
+            fi
             UNREACH=0; changed=1
           fi
 
