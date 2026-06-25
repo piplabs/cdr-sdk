@@ -63,18 +63,28 @@ function rpcErrLike(opts: { details?: string; message?: string; cause?: unknown 
   });
 }
 
+// Invoke safeWriteContract with the common writeContract-shape boilerplate.
+// account defaults to the local ACCOUNT and chain to CHAIN; pass overrides
+// (e.g. a JSON-RPC account, or null) to exercise the other paths.
+function callPing(
+  wallet: any,
+  publicClient: any = PUBLIC,
+  overrides: { account?: unknown; chain?: unknown } = {},
+) {
+  return safeWriteContract(wallet, publicClient, {
+    account: ("account" in overrides ? overrides.account : ACCOUNT) as any,
+    chain: ("chain" in overrides ? overrides.chain : CHAIN) as any,
+    address: ADDRESS,
+    abi: SAMPLE_ABI as any,
+    functionName: "ping",
+    args: [42n],
+  });
+}
+
 describe("safeWriteContract", () => {
   it("happy path: returns the hash from sendRawTransaction", async () => {
     const wallet = mockWallet({ sendImpl: async () => EXPECTED_HASH });
-    const hash = await safeWriteContract(wallet, PUBLIC, {
-      account: ACCOUNT,
-      chain: CHAIN,
-      address: ADDRESS,
-      abi: SAMPLE_ABI as any,
-      functionName: "ping",
-      args: [42n],
-      value: 0n,
-    });
+    const hash = await callPing(wallet);
     expect(hash).toBe(EXPECTED_HASH);
     expect(wallet.prepareTransactionRequest).toHaveBeenCalledTimes(1);
     expect(wallet.signTransaction).toHaveBeenCalledTimes(1);
@@ -90,15 +100,7 @@ describe("safeWriteContract", () => {
         });
       },
     });
-    const hash = await safeWriteContract(wallet, PUBLIC, {
-      account: ACCOUNT,
-      chain: CHAIN,
-      address: ADDRESS,
-      abi: SAMPLE_ABI as any,
-      functionName: "ping",
-      args: [42n],
-    });
-    expect(hash).toBe(EXPECTED_HASH);
+    expect(await callPing(wallet)).toBe(EXPECTED_HASH);
   });
 
   it("recovers from `already known`", async () => {
@@ -107,15 +109,7 @@ describe("safeWriteContract", () => {
         throw rpcErrLike({ details: "already known" });
       },
     });
-    const hash = await safeWriteContract(wallet, PUBLIC, {
-      account: ACCOUNT,
-      chain: CHAIN,
-      address: ADDRESS,
-      abi: SAMPLE_ABI as any,
-      functionName: "ping",
-      args: [42n],
-    });
-    expect(hash).toBe(EXPECTED_HASH);
+    expect(await callPing(wallet)).toBe(EXPECTED_HASH);
   });
 
   it("rethrows `nonce too low` (ambiguous — a different tx may have consumed the nonce)", async () => {
@@ -124,16 +118,7 @@ describe("safeWriteContract", () => {
         throw rpcErrLike({ details: "nonce too low" });
       },
     });
-    await expect(
-      safeWriteContract(wallet, PUBLIC, {
-        account: ACCOUNT,
-        chain: CHAIN,
-        address: ADDRESS,
-        abi: SAMPLE_ABI as any,
-        functionName: "ping",
-        args: [42n],
-      }),
-    ).rejects.toThrow(/Missing or invalid parameters|nonce too low/);
+    await expect(callPing(wallet)).rejects.toThrow(/Missing or invalid parameters|nonce too low/);
   });
 
   it("walks the `cause` chain to find the real error", async () => {
@@ -153,15 +138,7 @@ describe("safeWriteContract", () => {
         throw outer;
       },
     });
-    const hash = await safeWriteContract(wallet, PUBLIC, {
-      account: ACCOUNT,
-      chain: CHAIN,
-      address: ADDRESS,
-      abi: SAMPLE_ABI as any,
-      functionName: "ping",
-      args: [42n],
-    });
-    expect(hash).toBe(EXPECTED_HASH);
+    expect(await callPing(wallet)).toBe(EXPECTED_HASH);
   });
 
   it("rethrows unrelated errors (e.g. revert / out of gas)", async () => {
@@ -173,16 +150,7 @@ describe("safeWriteContract", () => {
         });
       },
     });
-    await expect(
-      safeWriteContract(wallet, PUBLIC, {
-        account: ACCOUNT,
-        chain: CHAIN,
-        address: ADDRESS,
-        abi: SAMPLE_ABI as any,
-        functionName: "ping",
-        args: [42n],
-      }),
-    ).rejects.toThrow(/ContractFunctionExecutionError/);
+    await expect(callPing(wallet)).rejects.toThrow(/ContractFunctionExecutionError/);
   });
 
   it("falls back to writeContract for a JSON-RPC account (cannot pre-sign locally)", async () => {
@@ -190,14 +158,7 @@ describe("safeWriteContract", () => {
     // signTransaction would hit eth_signTransaction (unsupported on public
     // RPCs). The helper must defer to writeContract instead of pre-signing.
     const wallet = mockWallet({ sendImpl: async () => EXPECTED_HASH });
-    const hash = await safeWriteContract(wallet, PUBLIC, {
-      account: JSON_RPC_ACCOUNT,
-      chain: CHAIN,
-      address: ADDRESS,
-      abi: SAMPLE_ABI as any,
-      functionName: "ping",
-      args: [42n],
-    });
+    const hash = await callPing(wallet, PUBLIC, { account: JSON_RPC_ACCOUNT });
     expect(hash).toBe(EXPECTED_HASH);
     expect(wallet.writeContract).toHaveBeenCalledTimes(1);
     expect(wallet.signTransaction).not.toHaveBeenCalled();
@@ -214,14 +175,7 @@ describe("safeWriteContract", () => {
     // With no resolvable local account the helper defers to writeContract,
     // exactly as the pre-existing call path did.
     const wallet = mockWallet({ sendImpl: async () => EXPECTED_HASH });
-    const hash = await safeWriteContract(wallet, PUBLIC, {
-      account: null,
-      chain: null,
-      address: ADDRESS,
-      abi: SAMPLE_ABI as any,
-      functionName: "ping",
-      args: [42n],
-    });
+    const hash = await callPing(wallet, PUBLIC, { account: null, chain: null });
     expect(hash).toBe(EXPECTED_HASH);
     expect(wallet.writeContract).toHaveBeenCalledTimes(1);
     const wcArg = wallet.writeContract.mock.calls[0][0];
@@ -260,14 +214,7 @@ describe("safeWriteContract", () => {
       .mockResolvedValueOnce(100n)
       .mockResolvedValue(101n);
 
-    const hash = await safeWriteContract(wallet, publicClient, {
-      account: JSON_RPC_ACCOUNT,
-      chain: CHAIN,
-      address: ADDRESS,
-      abi: SAMPLE_ABI as any,
-      functionName: "ping",
-      args: [42n],
-    });
+    const hash = await callPing(wallet, publicClient, { account: JSON_RPC_ACCOUNT });
     expect(hash).toBe(RECOVERED);
     expect(publicClient.getTransactionCount).toHaveBeenCalledWith({ address: FROM, blockTag: "pending" });
   });
