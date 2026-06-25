@@ -10,6 +10,7 @@ vi.mock("@piplabs/cdr-crypto", () => ({
 import { Uploader } from "../src/uploader.js";
 import { tdh2Encrypt, encryptFile } from "@piplabs/cdr-crypto";
 import { ContentSizeExceededError } from "../src/errors.js";
+import { makeWalletMock } from "./_write-contract-mock.js";
 import type { StorageProvider } from "../src/storage/types.js";
 import type { Observer } from "../src/observer.js";
 
@@ -60,10 +61,7 @@ function mockClients() {
     waitForTransactionReceipt: vi.fn(),
     simulateContract: vi.fn().mockRejectedValue({ cause: { name: "ContractFunctionRevertedError" } }),
   } as any;
-  const walletClient = {
-    writeContract: vi.fn(),
-    account: { address: "0xaaaa" },
-  } as any;
+  const walletClient = makeWalletMock() as any;
   return { publicClient, walletClient };
 }
 
@@ -102,14 +100,14 @@ describe("Uploader.uploadFile", () => {
 
     // allocateFee
     publicClient.readContract.mockResolvedValueOnce(1000n);
-    walletClient.writeContract.mockResolvedValueOnce("0xalloctx" as `0x${string}`);
+    walletClient.sendRawTransaction.mockResolvedValueOnce("0xalloctx" as `0x${string}`);
     publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
       logs: [makeVaultAllocatedLog(42)],
     });
     // maxEncryptedDataSize check is now in `write`, served by Observer (mocked).
     // writeFee
     publicClient.readContract.mockResolvedValueOnce(200n);
-    walletClient.writeContract.mockResolvedValueOnce("0xwritetx" as `0x${string}`);
+    walletClient.sendRawTransaction.mockResolvedValueOnce("0xwritetx" as `0x${string}`);
     publicClient.waitForTransactionReceipt.mockResolvedValueOnce({});
 
     const uploader = new Uploader({
@@ -157,7 +155,7 @@ describe("Uploader.uploadFile", () => {
 
     // allocateFee
     publicClient.readContract.mockResolvedValueOnce(1000n);
-    walletClient.writeContract.mockResolvedValueOnce("0xalloctx" as `0x${string}`);
+    walletClient.sendRawTransaction.mockResolvedValueOnce("0xalloctx" as `0x${string}`);
     publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
       logs: [makeVaultAllocatedLog(42)],
     });
@@ -178,6 +176,6 @@ describe("Uploader.uploadFile", () => {
     ).rejects.toThrow(ContentSizeExceededError);
 
     // Allocate happened (size check is in `write`, after allocate); write was NOT.
-    expect(walletClient.writeContract).toHaveBeenCalledOnce(); // allocate only
+    expect(walletClient.sendRawTransaction).toHaveBeenCalledOnce(); // allocate only
   });
 });

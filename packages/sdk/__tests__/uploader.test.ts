@@ -11,6 +11,8 @@ import { Uploader } from "../src/uploader.js";
 import { tdh2Encrypt } from "@piplabs/cdr-crypto";
 import { ContentSizeExceededError } from "../src/errors.js";
 import type { Observer } from "../src/observer.js";
+import { cdrAbi } from "@piplabs/cdr-contracts";
+import { makeWalletMock, decodeWriteCalls } from "./_write-contract-mock.js";
 
 /**
  * Minimal Observer stub for Uploader unit tests. Uploader consults Observer
@@ -71,10 +73,7 @@ function mockClients() {
     getTransactionReceipt: vi.fn(),
     simulateContract: vi.fn().mockRejectedValue({ cause: { name: "ContractFunctionRevertedError" } }),
   } as any;
-  const walletClient = {
-    writeContract: vi.fn(),
-    account: { address: "0xaaaa" },
-  } as any;
+  const walletClient = makeWalletMock() as any;
   return { publicClient, walletClient };
 }
 
@@ -86,7 +85,7 @@ describe("Uploader", () => {
   it("allocate sends tx with correct fee and returns uuid from event", async () => {
     const { publicClient, walletClient } = mockClients();
     publicClient.readContract.mockResolvedValueOnce(1000n);
-    walletClient.writeContract.mockResolvedValueOnce("0xtxhash" as `0x${string}`);
+    walletClient.sendRawTransaction.mockResolvedValueOnce("0xtxhash" as `0x${string}`);
     publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
       logs: [makeVaultAllocatedLog(42)],
     });
@@ -106,16 +105,17 @@ describe("Uploader", () => {
       readConditionData: "0x",
     });
 
-    expect(walletClient.writeContract).toHaveBeenCalledOnce();
-    const callArgs = walletClient.writeContract.mock.calls[0][0];
-    expect(callArgs.value).toBe(1000n);
+    expect(walletClient.sendRawTransaction).toHaveBeenCalledOnce();
+    const [call] = decodeWriteCalls(walletClient, cdrAbi);
+    expect(call.value).toBe(1000n);
+    expect(call.functionName).toBe("allocate");
     expect(result.uuid).toBe(42);
     expect(result.txHash).toBe("0xtxhash");
   });
 
   it("allocate uses feeOverride when provided and skips readContract", async () => {
     const { publicClient, walletClient } = mockClients();
-    walletClient.writeContract.mockResolvedValueOnce("0xtxhash2" as `0x${string}`);
+    walletClient.sendRawTransaction.mockResolvedValueOnce("0xtxhash2" as `0x${string}`);
     publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
       logs: [makeVaultAllocatedLog(7)],
     });
@@ -136,8 +136,8 @@ describe("Uploader", () => {
       feeOverride: 500n,
     });
 
-    const callArgs = walletClient.writeContract.mock.calls[0][0];
-    expect(callArgs.value).toBe(500n);
+    const [call] = decodeWriteCalls(walletClient, cdrAbi);
+    expect(call.value).toBe(500n);
     expect(publicClient.readContract).not.toHaveBeenCalled();
     expect(result.uuid).toBe(7);
   });
@@ -145,7 +145,7 @@ describe("Uploader", () => {
   it("write sends tx with correct fee", async () => {
     const { publicClient, walletClient } = mockClients();
     publicClient.readContract.mockResolvedValueOnce(200n);
-    walletClient.writeContract.mockResolvedValueOnce("0xwritetx" as `0x${string}`);
+    walletClient.sendRawTransaction.mockResolvedValueOnce("0xwritetx" as `0x${string}`);
 
     const uploader = new Uploader({
       network: "testnet",
@@ -160,16 +160,16 @@ describe("Uploader", () => {
       encryptedData: "0xdeadbeef",
     });
 
-    expect(walletClient.writeContract).toHaveBeenCalledOnce();
-    const callArgs = walletClient.writeContract.mock.calls[0][0];
-    expect(callArgs.value).toBe(200n);
-    expect(callArgs.functionName).toBe("write");
+    expect(walletClient.sendRawTransaction).toHaveBeenCalledOnce();
+    const [call] = decodeWriteCalls(walletClient, cdrAbi);
+    expect(call.value).toBe(200n);
+    expect(call.functionName).toBe("write");
     expect(result.txHash).toBe("0xwritetx");
   });
 
   it("write uses feeOverride when provided and skips readContract", async () => {
     const { publicClient, walletClient } = mockClients();
-    walletClient.writeContract.mockResolvedValueOnce("0xwritetx2" as `0x${string}`);
+    walletClient.sendRawTransaction.mockResolvedValueOnce("0xwritetx2" as `0x${string}`);
 
     const uploader = new Uploader({
       network: "testnet",
@@ -185,14 +185,14 @@ describe("Uploader", () => {
       feeOverride: 99n,
     });
 
-    const callArgs = walletClient.writeContract.mock.calls[0][0];
-    expect(callArgs.value).toBe(99n);
+    const [call] = decodeWriteCalls(walletClient, cdrAbi);
+    expect(call.value).toBe(99n);
     expect(publicClient.readContract).not.toHaveBeenCalled();
   });
 
   it("parseVaultAllocatedUuid throws when no VaultAllocated event in logs", async () => {
     const { publicClient, walletClient } = mockClients();
-    walletClient.writeContract.mockResolvedValueOnce("0xtxhash" as `0x${string}`);
+    walletClient.sendRawTransaction.mockResolvedValueOnce("0xtxhash" as `0x${string}`);
     publicClient.waitForTransactionReceipt.mockResolvedValueOnce({ logs: [] });
 
     const uploader = new Uploader({
@@ -288,14 +288,14 @@ describe("Uploader", () => {
     ).rejects.toThrow(ContentSizeExceededError);
 
     // No tx ever submitted — fail-fast before writeContract.
-    expect(walletClient.writeContract).not.toHaveBeenCalled();
+    expect(walletClient.sendRawTransaction).not.toHaveBeenCalled();
     expect(observer.getMaxEncryptedDataSize).toHaveBeenCalledOnce();
   });
 
   it("write passes when encryptedData is within maxEncryptedDataSize", async () => {
     const { publicClient, walletClient } = mockClients();
     const observer = fakeObserver({ maxSize: 100n });
-    walletClient.writeContract.mockResolvedValueOnce("0xtxh" as `0x${string}`);
+    walletClient.sendRawTransaction.mockResolvedValueOnce("0xtxh" as `0x${string}`);
 
     const uploader = new Uploader({
       network: "testnet",
@@ -311,6 +311,6 @@ describe("Uploader", () => {
       feeOverride: 0n,
     });
 
-    expect(walletClient.writeContract).toHaveBeenCalledOnce();
+    expect(walletClient.sendRawTransaction).toHaveBeenCalledOnce();
   });
 });
