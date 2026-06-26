@@ -44,7 +44,7 @@ import { CDRClient, initWasm } from "../src/index.js";
 import { PartialCollectionTimeoutError, EmptyVaultError } from "../src/errors.js";
 import { uuidToLabel } from "../src/label.js";
 import { queryCDRPartials, queryLatestActiveDKGNetwork } from "../src/story-api/index.js";
-import { logCase, countFetchCallsTo } from "./_helpers.js";
+import { OPEN_CONDITION_BYTECODE, logCase, countFetchCallsTo } from "./_helpers.js";
 
 const API_URL = process.env.CDR_API_URL;
 const RPC_URL = process.env.CDR_RPC_URL;
@@ -83,20 +83,17 @@ function makeCDRClient(): {
 }
 
 /**
- * Deploy a minimal "always-true" condition contract — same pattern as
- * `__integration__/uploader.test.ts`. The runtime returns 32-byte `0x...01`
- * for any call, which the CDR contract reads as "condition met".
+ * Deploy a minimal "always-true" condition contract that implements the
+ * condition selectors and cleanly rejects unknown selectors.
  */
 async function deployOpenCondition(
   publicClient: PublicClient,
   walletClient: WalletClient,
 ): Promise<`0x${string}`> {
-  const bytecode =
-    "0x600a600c600039600a6000f3600160005260206000f3" as `0x${string}`;
   const txHash = await walletClient.sendTransaction({
     chain: walletClient.chain ?? null,
     account: walletClient.account ?? null,
-    data: bytecode,
+    data: OPEN_CONDITION_BYTECODE,
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
   if (!receipt.contractAddress) {

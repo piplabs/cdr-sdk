@@ -34,7 +34,6 @@ import {
   createWalletClient,
   formatEther,
   http,
-  parseEther,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { CDRClient, initWasm } from "../src/index.js";
@@ -50,9 +49,11 @@ import {
   logCase,
   max as arrMax,
   mean,
+  OPEN_CONDITION_BYTECODE,
   p50,
   p95,
   p99,
+  sizeFundAndReport,
   statsOf,
   writePerfStats,
 } from "./_helpers.js";
@@ -61,7 +62,7 @@ const WALLET_COUNT = 1000;
 // 200-wallet batch keeps Multicall3.aggregate3Value tx-gas ≲ 12M, well
 // under Story's ~30M block gas limit on both DevNet + Aeneid.
 const FUND_BATCH_SIZE = 200;
-const PER_WALLET_FUND = parseEther("0.05");
+const CYCLES_PER_WALLET = 1; // 1 accessCDR per wallet, no upload
 const ACCESS_TIMEOUT_MS = 300_000;
 
 const API_URL = process.env.CDR_API_URL;
@@ -116,12 +117,10 @@ async function deployOpenCondition(
   publicClient: PublicClient,
   walletClient: WalletClient,
 ): Promise<`0x${string}`> {
-  const bytecode =
-    "0x600a600c600039600a6000f3600160005260206000f3" as `0x${string}`;
   const tx = await walletClient.sendTransaction({
     chain: walletClient.chain ?? null,
     account: walletClient.account ?? null,
-    data: bytecode,
+    data: OPEN_CONDITION_BYTECODE,
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash: tx });
   if (!receipt.contractAddress) {
@@ -166,12 +165,14 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only") || NETWOR
     let sharedVaultUuid: number;
     let sharedDataKey: Uint8Array;
     let wallets: EphemeralWallet[];
+    let perWalletFund = 0n;
     let totalFundedWei = 0n;
     let perfBuffer: {
       fulfilled: number;
       failed: number;
       wallClockMs: number;
       accessLats: number[];
+      failedReasons: Array<{ idx: number; reason: string }>;
     } | null = null;
 
     beforeAll(async () => {
@@ -181,6 +182,15 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only") || NETWOR
       funderWallet = f.walletClient;
       funderClient = f.client;
       funderAddress = privateKeyToAccount(FUNDER_KEY!).address;
+
+      // Flat per-wallet fund = 1 IP + 3 × (writeFee + allocateFee + readFee).
+      // Read-only suite over-funds by writeFee+allocateFee × 3 at current
+      // chain fees, which is fine — 1 IP base dominates anyway.
+      perWalletFund = await sizeFundAndReport({
+        label: "1000w-perf",
+        network: NETWORK,
+        publicClient: funderPublic,
+      });
 
       openCondition = await deployOpenCondition(funderPublic, funderWallet);
       logCase("openCondition", openCondition);
@@ -206,14 +216,14 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only") || NETWOR
         funderPublic,
         funderWallet,
         wallets,
-        PER_WALLET_FUND,
+        perWalletFund,
         FUND_BATCH_SIZE,
       );
       logCase("multicall3 batched fund", {
         wallets: wallets.length,
         batchSize: FUND_BATCH_SIZE,
         batches: Math.ceil(wallets.length / FUND_BATCH_SIZE),
-        perWallet: formatEther(PER_WALLET_FUND),
+        perWallet: formatEther(perWalletFund),
         totalIP: formatEther(totalFundedWei),
         elapsedMs: formatMs(Date.now() - fundStart),
       });
@@ -245,6 +255,8 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only") || NETWOR
           wall_clock_ms: perfBuffer.wallClockMs,
           accessMs: statsOf(perfBuffer.accessLats),
           uploadMs: null,
+          accessSharedMs: null,
+          accessFreshMs: null,
           tickMs: null,
           refund: {
             funded_wei: totalFundedWei.toString(),
@@ -253,6 +265,7 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only") || NETWOR
             failed_sweeps: refund.failedRefunds,
           },
           extra: null,
+          failedReasons: perfBuffer.failedReasons,
         });
       }
     }, 15 * 60 * 1000);
@@ -323,6 +336,7 @@ describe.skipIf(skipUnlessSuite("1000-wallet-performance-devnet-only") || NETWOR
           failed: failed.length,
           wallClockMs: totalMs,
           accessLats: lats,
+          failedReasons: failed.slice(0, 10),
         };
 
         expect(failed.length, `${failed.length} wallets failed accessCDR`).toBe(0);

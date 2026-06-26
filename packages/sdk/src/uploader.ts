@@ -5,6 +5,10 @@ import { uuidToLabel } from "./label.js";
 import { ContentSizeExceededError, LabelMismatchError, InvalidConditionContractError } from "./errors.js";
 import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
+import { safeWriteContract } from "./_tx-submit.js";
+import { waitForReceiptResilient } from "./_rpc-resilience.js";
+
+const SENTINEL_CONDITION_FUNCTION = "__cdrSentinelProbeNoImpl__";
 
 export class Uploader {
   private publicClient: PublicClient;
@@ -106,9 +110,7 @@ export class Uploader {
       functionName: "allocateFee",
     });
 
-    const txHash = await this.walletClient.writeContract({
-      chain: this.walletClient.chain ?? null,
-      account: this.walletClient.account ?? null,
+    const txHash = await safeWriteContract(this.walletClient, this.publicClient, {
       address: cdrAddress,
       abi: cdrAbi,
       functionName: "allocate",
@@ -122,7 +124,7 @@ export class Uploader {
       value: fee,
     });
 
-    const receipt = await this.publicClient.waitForTransactionReceipt({ hash: txHash });
+    const receipt = await waitForReceiptResilient(this.publicClient, txHash);
     const uuid = this.parseVaultAllocatedUuid(receipt.logs);
 
     return { txHash, uuid };
@@ -188,9 +190,7 @@ export class Uploader {
       functionName: "writeFee",
     });
 
-    const txHash = await this.walletClient.writeContract({
-      chain: this.walletClient.chain ?? null,
-      account: this.walletClient.account ?? null,
+    const txHash = await safeWriteContract(this.walletClient, this.publicClient, {
       address: cdrAddress,
       abi: cdrAbi,
       functionName: "write",
@@ -198,7 +198,7 @@ export class Uploader {
       value: fee,
     });
 
-    await this.publicClient.waitForTransactionReceipt({ hash: txHash });
+    await waitForReceiptResilient(this.publicClient, txHash);
 
     return { txHash };
   }
@@ -375,32 +375,95 @@ export class Uploader {
       type: "function" as const,
       name: functionName,
       inputs: [
-        { name: "caller", type: "address" },
-        { name: "conditionData", type: "bytes" },
+        { name: "uuid", type: "uint32" },
         { name: "accessAuxData", type: "bytes" },
+        { name: "conditionData", type: "bytes" },
+        { name: "caller", type: "address" },
       ],
       outputs: [{ name: "", type: "bool" }],
       stateMutability: "view" as const,
     }];
+
+    // Keep dummy bytes ABI-decodable so empty reverts remain a selector-miss signal.
+    const dummyBytes = `0x${"00".repeat(256)}` as `0x${string}`;
+    const zeroAddr = "0x0000000000000000000000000000000000000000" as `0x${string}`;
 
     try {
       await this.publicClient.simulateContract({
         address,
         abi: conditionAbi,
         functionName,
-        args: [
-          "0x0000000000000000000000000000000000000000",
-          "0x",
-          "0x",
-        ],
+        args: [0, dummyBytes, dummyBytes, zeroAddr],
       });
     } catch (e: any) {
-      // A revert inside the function body means the function exists — contract is valid.
-      // Only throw if the function selector itself is missing (zero data / execution error).
-      if (e?.cause?.name === "ContractFunctionRevertedError") {
-        return; // Function exists but reverted with dummy args — expected
+      const cause = e?.cause;
+      const realRevertedWithPayload =
+        cause?.name === "ContractFunctionRevertedError" &&
+        typeof cause.raw === "string" &&
+        cause.raw !== "0x";
+      // Payload reverts are still ambiguous until the sentinel proves unknown
+      // selectors miss cleanly.
+      if (!realRevertedWithPayload) {
+        if (
+          cause?.name === "ContractFunctionRevertedError" ||
+          cause?.name === "ContractFunctionZeroDataError"
+        ) {
+          throw new InvalidConditionContractError(address, type);
+        }
+        throw e;
       }
-      throw new InvalidConditionContractError(address, type);
+    }
+
+    // Success and payload reverts can both come from catch-all fallbacks.
+    // Trust the real selector only after an unknown selector cleanly misses.
+    const sentinelClean = await this.sentinelProbeCleanlyMisses(address);
+    if (!sentinelClean) {
+      throw new InvalidConditionContractError(
+        address,
+        type,
+        "ambiguous-fallback",
+      );
+    }
+  }
+
+  private async sentinelProbeCleanlyMisses(
+    address: `0x${string}`,
+  ): Promise<boolean> {
+    // True means the unknown selector missed cleanly; false means a fallback answered it.
+    const sentinelAbi = [
+      {
+        type: "function" as const,
+        name: SENTINEL_CONDITION_FUNCTION,
+        inputs: [],
+        outputs: [{ name: "", type: "bool" }],
+        stateMutability: "view" as const,
+      },
+    ];
+    try {
+      await this.publicClient.simulateContract({
+        address,
+        abi: sentinelAbi,
+        functionName: SENTINEL_CONDITION_FUNCTION,
+      });
+      return false;
+    } catch (sErr: any) {
+      const sCause = sErr?.cause;
+      if (sCause?.name === "ContractFunctionZeroDataError") return true;
+      if (
+        sCause?.name === "ContractFunctionRevertedError" &&
+        typeof sCause.raw === "string" &&
+        sCause.raw === "0x"
+      ) {
+        return true;
+      }
+      if (
+        sCause?.name === "ContractFunctionRevertedError" &&
+        typeof sCause.raw === "string" &&
+        sCause.raw !== "0x"
+      ) {
+        return false;
+      }
+      throw sErr;
     }
   }
 

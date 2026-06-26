@@ -60,12 +60,26 @@ export class RpcConsensusError extends CDRError {
   }
 }
 
+export type InvalidConditionContractReason =
+  | "selector-miss"
+  | "ambiguous-fallback";
+
 export class InvalidConditionContractError extends CDRError {
-  constructor(address: string, type: "write" | "read") {
+  readonly reason: InvalidConditionContractReason;
+  constructor(
+    address: string,
+    type: "write" | "read",
+    reason: InvalidConditionContractReason = "selector-miss",
+  ) {
+    const detail =
+      reason === "ambiguous-fallback"
+        ? "preflight conservatively rejected: a catch-all fallback answered an unknown selector by returning a value or reverting with data. If the contract is correct, pass `skipConditionValidation: true` to bypass this preflight"
+        : "does not implement the required interface";
     super(
-      `${type} condition contract at ${address} does not implement the required interface`,
+      `${type} condition contract at ${address} ${detail}`,
       "INVALID_CONDITION_CONTRACT",
     );
+    this.reason = reason;
   }
 }
 
