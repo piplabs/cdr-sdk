@@ -1,0 +1,232 @@
+name: DKG round monitor (aeneid)
+
+run-name: dkg-round-monitor-aeneid${{ github.event.inputs.start_round != '' && format(' (reseed→{0})', github.event.inputs.start_round) || '' }}
+
+# Cron-fired watcher that follows ONE DKG round at a time on aeneid and posts a
+# Slack message on every stage transition of the round it is currently watching.
+#
+# Single-pointer state machine (NOT a range scan). State is a tiny JSON blob
+# kept across runs via actions/cache:
+#
+#   ./state.json = { "watch_round": <uint>, "last_stage": <0-6> }
+#
+# Each run:
+#   1. query /dkg/dkg_network?round=<watch_round> -> stage S
+#   2. if S != last_stage -> post a Slack notification for S, set last_stage=S
+#   3. if S means the round is done (4 ACTIVE / 5 FAILED / 6 ENDED) ->
+#      watch_round += 1, last_stage = 0, and re-check the next round in the same
+#      run (so "Round N → ACTIVE" and "Round N+1 → REGISTRATION" can fire
+#      back-to-back). Bounded per run. ACTIVE must advance the pointer: a
+#      resharing round begins forming while the previous round is still ACTIVE,
+#      and a *failed* forming round never evicts the ACTIVE one -> a pointer
+#      parked on ACTIVE would never see the next round's REGISTRATION/DEALING/
+#      FINALIZATION or report a FAILED round.
+#   4. otherwise stop until the next tick (the round is still progressing).
+#
+# Stage codes (story x/dkg DKGStage): 1=REGISTRATION 2=DEALING 3=FINALIZATION
+#   4=ACTIVE 5=FAILED 6=ENDED. A status of 5 always raises a WARNING.
+#
+# aeneid stages are ~34,560 blocks (~17h) each, active ~138,240 (~69h), so
+# transitions are slow; */15 min easily catches every edge.
+#
+# Secret required: DKG_MONITOR_SLACK_WEBHOOK_URL (incoming webhook for the
+# target Slack channel).
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      start_round:
+        description: "Re-seed the watch pointer to this round (blank = keep cached state)"
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  # Serialize runs so two firings can't both advance/notify on the same state.
+  group: dkg-round-monitor-aeneid
+  cancel-in-progress: false
+
+env:
+  # Public aeneid REST endpoint. Overridable via repo variable so the node can
+  # be reprovisioned without editing the workflow (falls back to the default).
+  AENEID_REST: ${{ vars.AENEID_REST || 'http://172.192.41.96:1317' }}
+  DEFAULT_START_ROUND: '24'
+  MAX_ADVANCES_PER_RUN: '6'
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Restore watch state from cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ./state.json
+          key: dkg-round-monitor-aeneid-state-${{ github.run_id }}
+          restore-keys: |
+            dkg-round-monitor-aeneid-state-
+
+      - name: Step the state machine and notify on transitions
+        id: run
+        env:
+          WEBHOOK: ${{ secrets.DKG_MONITOR_SLACK_WEBHOOK_URL }}
+          # Read the dispatch input via env to keep it out of the run-script
+          # interpolation (avoids shell injection from the free-text input).
+          RESEED: ${{ github.event.inputs.start_round }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WEBHOOK:-}" ]; then
+            echo "::error::DKG_MONITOR_SLACK_WEBHOOK_URL secret is not set"
+            exit 1
+          fi
+
+          stage_name() {
+            case "$1" in
+              1) echo "REGISTRATION" ;;
+              2) echo "DEALING" ;;
+              3) echo "FINALIZATION" ;;
+              4) echo "ACTIVE" ;;
+              5) echo "FAILED" ;;
+              6) echo "ENDED" ;;
+              *) echo "UNSPECIFIED" ;;
+            esac
+          }
+          stage_emoji() {
+            case "$1" in
+              1) printf '\xF0\x9F\x94\xB5' ;;   # blue circle
+              2) printf '\xF0\x9F\x9F\xA1' ;;   # yellow circle
+              3) printf '\xF0\x9F\x9F\xA1' ;;   # yellow circle
+              4) printf '\xE2\x9C\x85' ;;       # check mark
+              5) printf '\xE2\x9D\x8C' ;;       # cross mark
+              6) printf '\xE2\x9A\xAA' ;;       # white circle
+              *) printf '\xE2\x96\xAB' ;;       # small square
+            esac
+          }
+          notify() {
+            local text="$1"
+            local payload
+            payload=$(jq -n --arg t "$text" '{text: $t}')
+            curl -fsS --max-time 10 -X POST -H 'Content-type: application/json' \
+              --data "$payload" "$WEBHOOK" >/dev/null
+            echo "notified: $text"
+          }
+
+          # --- initialize watch pointer ---
+          UNREACH=0
+          if [ -n "${RESEED:-}" ]; then
+            if ! [[ "$RESEED" =~ ^[0-9]+$ ]]; then
+              echo "::error::start_round input must be an integer, got '$RESEED'"; exit 1
+            fi
+            WR="$RESEED"; LS=0
+            echo "re-seeded from dispatch input: watch_round=$WR"
+          elif [ -f ./state.json ]; then
+            WR=$(jq -r '.watch_round // empty' ./state.json)
+            LS=$(jq -r '.last_stage // 0' ./state.json)
+            UNREACH=$(jq -r '.unreachable // 0' ./state.json)
+          else
+            WR="$DEFAULT_START_ROUND"; LS=0
+            echo "no cached state; starting at default watch_round=$WR"
+          fi
+          [[ "$WR" =~ ^[0-9]+$ ]] || { echo "::error::bad watch_round='$WR'"; exit 1; }
+          [[ "$LS" =~ ^[0-6]$ ]] || LS=0
+          [[ "${UNREACH:-0}" =~ ^[01]$ ]] || UNREACH=0
+
+          changed=0
+          rest_down=0
+          # got_ok=1 only after a genuine 2xx response was processed this run.
+          # Used purely to word the recovery all-clear accurately (round actually
+          # processed vs endpoint reachable but round not formed yet). The un-pause
+          # itself keys off rest_down=0 (connection restored), so a non-2xx tick
+          # still clears a stale pause without claiming a round resumed.
+          got_ok=0
+          i=0
+          while [ "$i" -lt "$MAX_ADVANCES_PER_RUN" ]; do
+            i=$((i + 1))
+            # Probe the REAL DKG API endpoint. Distinguish a genuine connection
+            # failure (host down / DNS / timeout -> curl exits non-zero, no HTTP
+            # response) from an HTTP error (server reachable but returns non-2xx,
+            # e.g. a transient 5xx or a 404 on an odd path/round). ONLY a
+            # connection failure means "REST unreachable". The old `curl -f`
+            # conflated the two and fired a false "cannot reach REST" alert while
+            # the API was actually up (bare `/` 404s, but /dkg/* serves fine).
+            rc=0
+            http=$(curl -sS -o /tmp/dkg_resp.json -w '%{http_code}' --max-time 10 "$AENEID_REST/dkg/dkg_network?round=$WR" 2>/tmp/dkg_err) || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "REST connection failed (curl rc=$rc) for round=$WR: $(cat /tmp/dkg_err 2>/dev/null)"
+              rest_down=1
+              break
+            fi
+            if ! [[ "$http" =~ ^2 ]]; then
+              # Server is UP (returned HTTP $http) but this query errored — not an
+              # unreachability condition. Skip this tick without a false alert.
+              echo "REST reachable (HTTP $http) but round=$WR query non-2xx; skipping tick"
+              break
+            fi
+            resp=$(cat /tmp/dkg_resp.json)
+            got_ok=1   # genuine 2xx: round data actually processed this run
+            S=$(echo "$resp" | jq -r '.msg.network.stage // 0')
+            [[ "$S" =~ ^[0-9]+$ ]] || S=0
+            echo "watch_round=$WR observed stage=$S (last_stage=$LS)"
+
+            # stage 0 = not created yet / unspecified -> wait for the next tick
+            if [ "$S" = "0" ]; then
+              break
+            fi
+
+            if [ "$S" != "$LS" ]; then
+              if [ "$S" = "5" ]; then
+                notify "$(stage_emoji 5) WARNING: Round $WR -> FAILED (was $(stage_name "$LS"))"
+              else
+                notify "$(stage_emoji "$S") Round $WR -> $(stage_name "$S")"
+              fi
+              LS="$S"; changed=1
+            fi
+
+            # round done -> advance the pointer and follow the next forming round.
+            # ACTIVE (4) advances too: the next resharing round forms while this
+            # one is still ACTIVE, and a failed forming round never evicts the
+            # ACTIVE one, so a pointer left on ACTIVE would go blind to every
+            # later round (REG/DEAL/FIN and, critically, FAILED).
+            if [ "$S" = "4" ] || [ "$S" = "5" ] || [ "$S" = "6" ]; then
+              WR=$((WR + 1)); LS=0; changed=1
+              continue
+            fi
+
+            break
+          done
+
+          # Edge-triggered reachability alerts (no spam): one warning when the
+          # REST endpoint goes dark, one all-clear when it recovers.
+          if [ "$rest_down" = "1" ] && [ "${UNREACH:-0}" = "0" ]; then
+            notify "$(stage_emoji 5) WARNING: DKG monitor cannot reach aeneid REST ($AENEID_REST); round notifications are paused"
+            UNREACH=1; changed=1
+          elif [ "$rest_down" = "0" ] && [ "${UNREACH:-0}" = "1" ]; then
+            # Connection restored: we got an HTTP response this run (2xx or not).
+            # Un-pause on reachability, NOT on a 2xx — aeneid returns HTTP 500 for
+            # a not-yet-created round, so requiring a 2xx would leave the pause
+            # stuck whenever the watch pointer sits on a future round. got_ok only
+            # picks accurate wording (round processed vs not formed yet).
+            if [ "$got_ok" = "1" ]; then
+              notify "$(stage_emoji 4) DKG monitor: aeneid REST reachable again; resuming (watching round $WR)"
+            else
+              notify "$(stage_emoji 4) DKG monitor: aeneid REST reachable again (HTTP responding); round $WR not formed yet, will resume on its first stage"
+            fi
+            UNREACH=0; changed=1
+          fi
+
+          printf '{"watch_round":%s,"last_stage":%s,"unreachable":%s}\n' "$WR" "$LS" "${UNREACH:-0}" > ./state.json
+          echo "new state: $(cat ./state.json)"
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+      - name: Persist watch state (only when it changed)
+        if: steps.run.outputs.changed == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ./state.json
+          key: dkg-round-monitor-aeneid-state-${{ github.run_id }}

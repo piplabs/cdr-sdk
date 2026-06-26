@@ -1,4 +1,4 @@
-import { parseEventLogs, toHex, toBytes, TransactionReceiptNotFoundError, WaitForTransactionReceiptTimeoutError, type Log } from "viem";
+import { parseEventLogs, toHex, toBytes, type Log, type PublicClient, type WalletClient } from "viem";
 import { cdrAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
 import { tdh2Encrypt, encryptFile, getWasm, type TDH2Ciphertext } from "@piplabs/cdr-crypto";
 import { uuidToLabel } from "./label.js";
@@ -13,76 +13,10 @@ import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
 import type { CDRPublicClient, CDRWalletClient } from "./client-types.js";
 import { type CDRLogger, noopLogger } from "./logger.js";
+import { safeWriteContract } from "./_tx-submit.js";
+import { waitForReceiptResilient } from "./_rpc-resilience.js";
 
-/**
- * Wraps `publicClient.waitForTransactionReceipt` for public RPC endpoints
- * (e.g. `https://aeneid.storyrpc.io`) where receipt propagation can lag
- * block production by tens of seconds for a small tail of txs.
- *
- * The key failure this guards against: viem observes the tx included in a
- * block, immediately calls `eth_getTransactionReceipt`, and the pool node
- * serving that call hasn't surfaced the receipt yet → viem throws
- * `TransactionReceiptNotFoundError` out of its block-watcher callback. That
- * throw does NOT respect the `timeout` / `retryCount` options — those cover
- * the overall deadline and transport-level errors, not a receipt that is
- * momentarily null after the block is seen. So bumping `timeout`/`retryCount`
- * alone (the previous approach) still failed on this race:
- *   - run 26379164817 wallet idx=29: allocate 0x914c3c... mined block
- *     0x11d2547 status=1, viem gave up first (1/100 fail in 100w-fresh-aeneid)
- *   - run 26501253421: uploadCDR write 0x8d1ae... committed block 0x11eb8d2
- *     status=1, threw TransactionReceiptNotFoundError after ~8s, failing the
- *     consumer feeOverride test (which itself never waits on a receipt — the
- *     throw came from its uploadCDR preamble)
- *
- * Fix: re-poll the whole `waitForTransactionReceipt` on
- * `TransactionReceiptNotFoundError` / `WaitForTransactionReceiptTimeoutError`,
- * bounded by an overall 5 min deadline. A genuinely reverted tx returns a
- * receipt with `status: "reverted"` (it does NOT throw), so this never masks
- * a real revert. Test code has a mirror in
- * `packages/sdk/__integration__/_rpc-resilience.ts`; the duplication is
- * intentional — the SDK shouldn't take a dependency on test-only files.
- */
-async function waitForReceiptResilient(publicClient: CDRPublicClient, hash: `0x${string}`) {
-  const deadlineMs = Date.now() + 5 * 60 * 1000;
-  let lastError: unknown;
-  while (Date.now() < deadlineMs) {
-    try {
-      return await publicClient.waitForTransactionReceipt({
-        hash,
-        timeout: 30_000,
-        pollingInterval: 2000,
-        retryCount: 10,
-      });
-    } catch (err) {
-      if (!isRetryableReceiptWaitError(err)) {
-        throw err;
-      }
-      lastError = err;
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-    }
-  }
-  // The loop always runs at least once (deadlineMs is now + 5 min), so
-  // lastError is always set here — the fallback is for the type-checker and
-  // to avoid a stackless `throw undefined` if the deadline logic ever changes.
-  throw lastError ?? new Error("waitForReceiptResilient: receipt wait deadline exceeded");
-}
-
-function isRetryableReceiptWaitError(err: unknown): boolean {
-  if (
-    err instanceof TransactionReceiptNotFoundError ||
-    err instanceof WaitForTransactionReceiptTimeoutError
-  ) {
-    return true;
-  }
-  const name =
-    err && typeof err === "object" && "name" in err
-      ? (err as { name?: unknown }).name
-      : undefined;
-  return (
-    name === "TransactionReceiptNotFoundError" ||
-    name === "WaitForTransactionReceiptTimeoutError"
-  );
-}
+const SENTINEL_CONDITION_FUNCTION = "__cdrSentinelProbeNoImpl__";
 
 export class Uploader {
   private publicClient: CDRPublicClient;
@@ -190,9 +124,7 @@ export class Uploader {
         functionName: "allocateFee",
       })) as bigint);
 
-    const txHash = await this.walletClient.writeContract({
-      chain: this.walletClient.chain ?? null,
-      account: this.walletClient.account ?? null,
+    const txHash = await safeWriteContract(this.walletClient as unknown as WalletClient, this.publicClient as unknown as PublicClient, {
       address: cdrAddress,
       abi: cdrAbi,
       functionName: "allocate",
@@ -206,7 +138,7 @@ export class Uploader {
       value: fee,
     });
 
-    const receipt = await waitForReceiptResilient(this.publicClient, txHash);
+    const receipt = await waitForReceiptResilient(this.publicClient as unknown as PublicClient, txHash);
     const uuid = this.parseVaultAllocatedUuid(receipt.logs);
 
     this.logger.debug("allocate.tx.mined", { txHash, uuid });
@@ -275,9 +207,7 @@ export class Uploader {
         functionName: "writeFee",
       })) as bigint);
 
-    const txHash = await this.walletClient.writeContract({
-      chain: this.walletClient.chain ?? null,
-      account: this.walletClient.account ?? null,
+    const txHash = await safeWriteContract(this.walletClient as unknown as WalletClient, this.publicClient as unknown as PublicClient, {
       address: cdrAddress,
       abi: cdrAbi,
       functionName: "write",
@@ -285,7 +215,7 @@ export class Uploader {
       value: fee,
     });
 
-    await waitForReceiptResilient(this.publicClient, txHash);
+    await waitForReceiptResilient(this.publicClient as unknown as PublicClient, txHash);
 
     this.logger.debug("write.tx.mined", { uuid: params.uuid, txHash });
     return { txHash };
@@ -321,6 +251,8 @@ export class Uploader {
     allocateFeeOverride?: bigint;
     /** See {@link write}'s `feeOverride` — same strict-equality semantics. */
     writeFeeOverride?: bigint;
+    /** Skip condition contract interface validation (default: false). */
+    skipConditionValidation?: boolean;
   }): Promise<{
     uuid: number;
     ciphertext: TDH2Ciphertext;
@@ -334,6 +266,7 @@ export class Uploader {
       writeConditionData: params.writeConditionData,
       readConditionData: params.readConditionData,
       feeOverride: params.allocateFeeOverride,
+      skipConditionValidation: params.skipConditionValidation,
     });
 
     // Step 2: Encrypt using UUID-derived label (matches validator's uuidToLabel)
@@ -393,6 +326,8 @@ export class Uploader {
     allocateFeeOverride?: bigint;
     /** See {@link write}'s `feeOverride` — same strict-equality semantics. */
     writeFeeOverride?: bigint;
+    /** Skip condition contract interface validation (default: false). */
+    skipConditionValidation?: boolean;
   }): Promise<{
     uuid: number;
     cid: string;
@@ -419,6 +354,7 @@ export class Uploader {
       writeConditionData: params.writeConditionData,
       readConditionData: params.readConditionData,
       feeOverride: params.allocateFeeOverride,
+      skipConditionValidation: params.skipConditionValidation,
     });
 
     // Step 5: TDH2-encrypt the payload with UUID-derived label
@@ -457,9 +393,10 @@ export class Uploader {
       type: "function" as const,
       name: functionName,
       inputs: [
-        { name: "caller", type: "address" },
-        { name: "conditionData", type: "bytes" },
+        { name: "uuid", type: "uint32" },
         { name: "accessAuxData", type: "bytes" },
+        { name: "conditionData", type: "bytes" },
+        { name: "caller", type: "address" },
       ],
       outputs: [{ name: "", type: "bool" }],
       stateMutability: "view" as const,
@@ -471,24 +408,86 @@ export class Uploader {
       );
     }
 
+    // Keep dummy bytes ABI-decodable so empty reverts remain a selector-miss signal.
+    const dummyBytes = `0x${"00".repeat(256)}` as `0x${string}`;
+    const zeroAddr = "0x0000000000000000000000000000000000000000" as `0x${string}`;
+
     try {
-      await this.publicClient.simulateContract({
+      await this.publicClient.simulateContract!({
         address,
         abi: conditionAbi,
         functionName,
-        args: [
-          "0x0000000000000000000000000000000000000000",
-          "0x",
-          "0x",
-        ],
+        args: [0, dummyBytes, dummyBytes, zeroAddr],
       });
     } catch (e: any) {
-      // A revert inside the function body means the function exists — contract is valid.
-      // Only throw if the function selector itself is missing (zero data / execution error).
-      if (e?.cause?.name === "ContractFunctionRevertedError") {
-        return; // Function exists but reverted with dummy args — expected
+      const cause = e?.cause;
+      const realRevertedWithPayload =
+        cause?.name === "ContractFunctionRevertedError" &&
+        typeof cause.raw === "string" &&
+        cause.raw !== "0x";
+      // Payload reverts are still ambiguous until the sentinel proves unknown
+      // selectors miss cleanly.
+      if (!realRevertedWithPayload) {
+        if (
+          cause?.name === "ContractFunctionRevertedError" ||
+          cause?.name === "ContractFunctionZeroDataError"
+        ) {
+          throw new InvalidConditionContractError(address, type);
+        }
+        throw e;
       }
-      throw new InvalidConditionContractError(address, type);
+    }
+
+    // Success and payload reverts can both come from catch-all fallbacks.
+    // Trust the real selector only after an unknown selector cleanly misses.
+    const sentinelClean = await this.sentinelProbeCleanlyMisses(address);
+    if (!sentinelClean) {
+      throw new InvalidConditionContractError(
+        address,
+        type,
+        "ambiguous-fallback",
+      );
+    }
+  }
+
+  private async sentinelProbeCleanlyMisses(
+    address: `0x${string}`,
+  ): Promise<boolean> {
+    // True means the unknown selector missed cleanly; false means a fallback answered it.
+    const sentinelAbi = [
+      {
+        type: "function" as const,
+        name: SENTINEL_CONDITION_FUNCTION,
+        inputs: [],
+        outputs: [{ name: "", type: "bool" }],
+        stateMutability: "view" as const,
+      },
+    ];
+    try {
+      await this.publicClient.simulateContract!({
+        address,
+        abi: sentinelAbi,
+        functionName: SENTINEL_CONDITION_FUNCTION,
+      });
+      return false;
+    } catch (sErr: any) {
+      const sCause = sErr?.cause;
+      if (sCause?.name === "ContractFunctionZeroDataError") return true;
+      if (
+        sCause?.name === "ContractFunctionRevertedError" &&
+        typeof sCause.raw === "string" &&
+        sCause.raw === "0x"
+      ) {
+        return true;
+      }
+      if (
+        sCause?.name === "ContractFunctionRevertedError" &&
+        typeof sCause.raw === "string" &&
+        sCause.raw !== "0x"
+      ) {
+        return false;
+      }
+      throw sErr;
     }
   }
 

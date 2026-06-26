@@ -12,6 +12,18 @@ import { cdrAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts"
 import { bytesToHex } from "../src/story-api/index.js";
 
 /**
+ * Creation bytecode for a minimal always-true condition contract that
+ * implements the deployed CDR condition ABI:
+ *   - checkWriteCondition(uint32,bytes,bytes,address)
+ *   - checkReadCondition(uint32,bytes,bytes,address)
+ *
+ * Unknown selectors revert with empty data so the SDK's sentinel preflight
+ * can distinguish this from a catch-all fallback.
+ */
+export const OPEN_CONDITION_BYTECODE =
+  "0x602a600c600039602a6000f360003560e01c80635645dbbf14601f5780638db3eb1714601f5760006000fd5b600160005260206000f3" as `0x${string}`;
+
+/**
  * `JSON.stringify` replacer for live response logging:
  *   - `Map`        → plain object (so commPubKey-by-validator dumps cleanly)
  *   - `Uint8Array` → hex (truncated for fields longer than 80 hex chars,

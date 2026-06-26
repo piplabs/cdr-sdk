@@ -71,10 +71,27 @@ const { dataKey } = await client.consumer.accessCDR({
 When someone calls `write()` or `read()` on the CDR contract, the contract:
 
 1. Looks up the vault's condition address (`writeConditionAddr` or `readConditionAddr`)
-2. Calls the condition contract with the caller's address, the condition data stored at allocation time, and the `accessAuxData` provided by the caller
+2. Calls the condition contract with the vault `uuid`, the `accessAuxData` provided by the caller, the condition data stored at allocation time, and the caller's address
 3. If the condition contract returns false (or reverts), the operation is rejected
 
 This happens at the protocol level — the SDK does not enforce conditions locally. Your transaction will revert on-chain if conditions aren't met.
+
+### Bypassing Validation for EOA / Wallet-Address Conditions
+
+The CDR contract supports a short-circuit when `msg.sender == conditionAddr` — in that case, the on-chain `write()` / `read()` skips the condition `staticcall` entirely. This lets you use a plain wallet (EOA) address as the condition address for the simplest "only this wallet" access pattern, with no condition contract to deploy.
+
+Because the SDK validates the condition contract interface at allocation time (it simulates `checkWriteCondition` / `checkReadCondition`), an EOA address would fail that check. Pass `skipConditionValidation: true` to bypass it. `allocate()`, `uploadCDR()`, and `uploadFile()` all accept this flag:
+
+```typescript
+await client.uploader.uploadCDR({
+  // ...
+  writeConditionAddr: walletAddress,
+  readConditionAddr: walletAddress,
+  writeConditionData: "0x",
+  readConditionData: "0x",
+  skipConditionValidation: true,
+});
+```
 
 ## Expected Interface
 
@@ -83,16 +100,18 @@ Condition contracts must implement these functions:
 ```solidity
 // For write conditions
 function checkWriteCondition(
-    address caller,
+    uint32 uuid,
+    bytes calldata accessAuxData,
     bytes calldata conditionData,
-    bytes calldata accessAuxData
+    address caller
 ) external view returns (bool);
 
 // For read conditions
 function checkReadCondition(
-    address caller,
+    uint32 uuid,
+    bytes calldata accessAuxData,
     bytes calldata conditionData,
-    bytes calldata accessAuxData
+    address caller
 ) external view returns (bool);
 ```
 
@@ -100,9 +119,10 @@ function checkReadCondition(
 
 | Parameter | Source | Description |
 |-----------|--------|-------------|
-| `caller` | `msg.sender` of the CDR write/read call | The address attempting the operation |
-| `conditionData` | Stored at vault allocation time | Static config set by the vault creator (e.g., an allowlist root, a token address, a role identifier) |
+| `uuid` | Vault being accessed | The CDR vault UUID the write/read targets |
 | `accessAuxData` | Passed by the caller at write/read time | Dynamic data the caller provides to satisfy the condition (e.g., a Merkle proof, a signature) |
+| `conditionData` | Stored at vault allocation time | Static config set by the vault creator (e.g., an allowlist root, a token address, a role identifier) |
+| `caller` | `msg.sender` of the CDR write/read call | The address attempting the operation |
 
 ## How to Set Conditions
 
@@ -150,17 +170,19 @@ pragma solidity ^0.8.0;
 
 contract OpenCondition {
     function checkWriteCondition(
-        address,
+        uint32,
         bytes calldata,
-        bytes calldata
+        bytes calldata,
+        address
     ) external pure returns (bool) {
         return true;
     }
 
     function checkReadCondition(
-        address,
+        uint32,
         bytes calldata,
-        bytes calldata
+        bytes calldata,
+        address
     ) external pure returns (bool) {
         return true;
     }
@@ -177,18 +199,20 @@ pragma solidity ^0.8.0;
 
 contract OwnerCondition {
     function checkWriteCondition(
-        address caller,
+        uint32,
+        bytes calldata,
         bytes calldata conditionData,
-        bytes calldata
+        address caller
     ) external pure returns (bool) {
         address owner = abi.decode(conditionData, (address));
         return caller == owner;
     }
 
     function checkReadCondition(
-        address caller,
+        uint32,
+        bytes calldata,
         bytes calldata conditionData,
-        bytes calldata
+        address caller
     ) external pure returns (bool) {
         address owner = abi.decode(conditionData, (address));
         return caller == owner;
@@ -227,18 +251,20 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract TokenGateCondition {
     function checkReadCondition(
-        address caller,
+        uint32,
+        bytes calldata,
         bytes calldata conditionData,
-        bytes calldata
+        address caller
     ) external view returns (bool) {
         (address token, uint256 minBalance) = abi.decode(conditionData, (address, uint256));
         return IERC20(token).balanceOf(caller) >= minBalance;
     }
 
     function checkWriteCondition(
-        address caller,
+        uint32,
+        bytes calldata,
         bytes calldata conditionData,
-        bytes calldata
+        address caller
     ) external view returns (bool) {
         (address token, uint256 minBalance) = abi.decode(conditionData, (address, uint256));
         return IERC20(token).balanceOf(caller) >= minBalance;
@@ -258,9 +284,10 @@ import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 
 contract MerkleCondition {
     function checkReadCondition(
-        address caller,
+        uint32,
+        bytes calldata accessAuxData,
         bytes calldata conditionData,
-        bytes calldata accessAuxData
+        address caller
     ) external pure returns (bool) {
         bytes32 root = abi.decode(conditionData, (bytes32));
         bytes32[] memory proof = abi.decode(accessAuxData, (bytes32[]));
@@ -269,9 +296,10 @@ contract MerkleCondition {
     }
 
     function checkWriteCondition(
-        address caller,
+        uint32,
+        bytes calldata accessAuxData,
         bytes calldata conditionData,
-        bytes calldata accessAuxData
+        address caller
     ) external pure returns (bool) {
         bytes32 root = abi.decode(conditionData, (bytes32));
         bytes32[] memory proof = abi.decode(accessAuxData, (bytes32[]));

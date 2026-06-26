@@ -40,11 +40,14 @@ import {
   EmptyVaultError,
   InvalidPartialError,
   InsufficientBalanceError,
+  ReadTransactionRevertedError,
 } from "../src/errors.js";
 import type { CDRLogger } from "../src/logger.js";
 import { toHex } from "viem";
 import type { Observer } from "../src/observer.js";
 import type { DKGPartialDecryptionSubmission } from "../src/story-api/types.js";
+import { cdrAbi } from "@piplabs/cdr-contracts";
+import { makeWalletMock, decodeWriteCalls } from "./_write-contract-mock.js";
 
 const API_URL = "http://test:1317";
 const VALIDATOR_A = "0x0000000000000000000000000000000000000001" as const;
@@ -147,12 +150,15 @@ function mockClients(opts: { vaultEncryptedData?: `0x${string}` } = {}) {
   const publicClient = {
     readContract,
     getBlockNumber: vi.fn().mockResolvedValue(1000n),
+    waitForTransactionReceipt: vi.fn().mockResolvedValue({ status: "success" }),
+    simulateContract: vi.fn().mockResolvedValue({ result: undefined }),
   };
   const walletClient = {
-    writeContract: vi.fn().mockResolvedValue("0xtxhash" as `0x${string}`),
-    account: { address: "0xfeed" },
+    ...makeWalletMock(),
+    account: { address: "0xfeed", type: "local" },
     chain: { id: 1 },
   };
+  walletClient.sendRawTransaction.mockResolvedValue("0xtxhash" as `0x${string}`);
   return { publicClient: publicClient as any, walletClient: walletClient as any };
 }
 
@@ -204,13 +210,12 @@ describe("Consumer", () => {
       expect(publicClient.readContract).toHaveBeenCalledWith(
         expect.objectContaining({ functionName: "readFee" }),
       );
-      expect(walletClient.writeContract).toHaveBeenCalledWith(
-        expect.objectContaining({
-          functionName: "read",
-          args: [42, "0x", "0x04abcd"],
-          value: 5n,
-        }),
-      );
+      const [call] = decodeWriteCalls(walletClient, cdrAbi);
+      expect(call).toMatchObject({
+        functionName: "read",
+        args: [42, "0x", "0x04abcd"],
+        value: 5n,
+      });
       expect(result.txHash).toBe("0xtxhash");
     });
 
@@ -223,9 +228,163 @@ describe("Consumer", () => {
         feeOverride: 99n,
       });
       expect(publicClient.readContract).not.toHaveBeenCalled();
-      expect(walletClient.writeContract).toHaveBeenCalledWith(
-        expect.objectContaining({ value: 99n }),
+      const [call] = decodeWriteCalls(walletClient, cdrAbi);
+      expect(call.value).toBe(99n);
+    });
+
+    it("read awaits the tx receipt with the submitted tx hash", async () => {
+      const { consumer, publicClient } = makeConsumer();
+      await consumer.read({
+        uuid: 42,
+        accessAuxData: "0x",
+        requesterPubKey: "0x04" as `0x${string}`,
+        feeOverride: 1n,
+      });
+      expect(publicClient.waitForTransactionReceipt).toHaveBeenCalledWith(
+        expect.objectContaining({ hash: "0xtxhash" }),
       );
+    });
+
+    it("read returns txHash when receipt status is success", async () => {
+      const { consumer, publicClient } = makeConsumer();
+      publicClient.waitForTransactionReceipt.mockResolvedValueOnce({ status: "success" });
+      const result = await consumer.read({
+        uuid: 42,
+        accessAuxData: "0x",
+        requesterPubKey: "0x04" as `0x${string}`,
+        feeOverride: 1n,
+      });
+      expect(result.txHash).toBe("0xtxhash");
+    });
+
+    it("read throws ReadTransactionRevertedError with txHash when receipt status is reverted", async () => {
+      const { consumer, publicClient } = makeConsumer();
+      publicClient.waitForTransactionReceipt.mockResolvedValueOnce({ status: "reverted" });
+      try {
+        await consumer.read({
+          uuid: 42,
+          accessAuxData: "0x",
+          requesterPubKey: "0x04" as `0x${string}`,
+          feeOverride: 1n,
+        });
+        expect.fail("expected ReadTransactionRevertedError");
+      } catch (err) {
+        expect(err).toBeInstanceOf(ReadTransactionRevertedError);
+        expect((err as ReadTransactionRevertedError).txHash).toBe("0xtxhash");
+        expect((err as ReadTransactionRevertedError).code).toBe("READ_TX_REVERTED");
+      }
+    });
+
+    it("read populates reason from viem revert error when simulate fails", async () => {
+      const { consumer, publicClient } = makeConsumer();
+      publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
+        status: "reverted",
+        blockNumber: 123n,
+      });
+      const simulateErr: any = new Error("execution reverted");
+      simulateErr.shortMessage = "execution reverted";
+      simulateErr.cause = { reason: "Invalid fee amount" };
+      publicClient.simulateContract.mockRejectedValueOnce(simulateErr);
+
+      try {
+        await consumer.read({
+          uuid: 42,
+          accessAuxData: "0x",
+          requesterPubKey: "0x04" as `0x${string}`,
+          feeOverride: 1n,
+        });
+        expect.fail("expected ReadTransactionRevertedError");
+      } catch (err) {
+        expect(err).toBeInstanceOf(ReadTransactionRevertedError);
+        expect((err as ReadTransactionRevertedError).reason).toBe("Invalid fee amount");
+        expect((err as ReadTransactionRevertedError).message).toContain("Invalid fee amount");
+      }
+      expect(publicClient.simulateContract).toHaveBeenCalledWith(
+        expect.objectContaining({
+          functionName: "read",
+          args: [42, "0x", "0x04"],
+          value: 1n,
+          blockNumber: 123n,
+        }),
+      );
+    });
+
+    it("read still throws ReadTransactionRevertedError when reason decoding fails", async () => {
+      const { consumer, publicClient } = makeConsumer();
+      publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
+        status: "reverted",
+        blockNumber: 123n,
+      });
+      // Opaque error from simulate — no recognizable viem fields.
+      publicClient.simulateContract.mockRejectedValueOnce(new Error("network is hard"));
+
+      try {
+        await consumer.read({
+          uuid: 42,
+          accessAuxData: "0x",
+          requesterPubKey: "0x04" as `0x${string}`,
+          feeOverride: 1n,
+        });
+        expect.fail("expected ReadTransactionRevertedError");
+      } catch (err) {
+        expect(err).toBeInstanceOf(ReadTransactionRevertedError);
+        expect((err as ReadTransactionRevertedError).reason).toBeUndefined();
+      }
+    });
+
+    it("read ignores shortMessage from non-contract errors (transport/RPC)", async () => {
+      const { consumer, publicClient } = makeConsumer();
+      publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
+        status: "reverted",
+        blockNumber: 123n,
+      });
+      // Simulate throws a transport-shaped error — has shortMessage/details
+      // but is NOT a ContractFunction(Execution|Reverted)Error. The decoder
+      // must not surface "HTTP request failed" as a contract revert reason.
+      const transportErr: any = new Error("transport");
+      transportErr.name = "HttpRequestError";
+      transportErr.shortMessage = "HTTP request failed";
+      transportErr.details = "fetch failed: ECONNREFUSED";
+      publicClient.simulateContract.mockRejectedValueOnce(transportErr);
+
+      try {
+        await consumer.read({
+          uuid: 42,
+          accessAuxData: "0x",
+          requesterPubKey: "0x04" as `0x${string}`,
+          feeOverride: 1n,
+        });
+        expect.fail("expected ReadTransactionRevertedError");
+      } catch (err) {
+        expect(err).toBeInstanceOf(ReadTransactionRevertedError);
+        expect((err as ReadTransactionRevertedError).reason).toBeUndefined();
+      }
+    });
+
+    it("read uses top-level shortMessage when chain contains a contract error but no decoded fields", async () => {
+      const { consumer, publicClient } = makeConsumer();
+      publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
+        status: "reverted",
+        blockNumber: 123n,
+      });
+      const cfeErr: any = new Error("execution reverted");
+      cfeErr.name = "ContractFunctionExecutionError";
+      cfeErr.shortMessage = "The contract function \"read\" reverted.";
+      publicClient.simulateContract.mockRejectedValueOnce(cfeErr);
+
+      try {
+        await consumer.read({
+          uuid: 42,
+          accessAuxData: "0x",
+          requesterPubKey: "0x04" as `0x${string}`,
+          feeOverride: 1n,
+        });
+        expect.fail("expected ReadTransactionRevertedError");
+      } catch (err) {
+        expect((err as ReadTransactionRevertedError).reason).toBe(
+          "The contract function \"read\" reverted.",
+        );
+      }
     });
   });
 
@@ -345,21 +504,52 @@ describe("Consumer", () => {
     });
 
     it("times out when threshold never reached", async () => {
-      const { consumer } = makeConsumer(makeFakeObserver({ threshold: 5 }));
+      const { consumer } = makeConsumer(
+        makeFakeObserver({ threshold: 5, thresholdAt: 5 }),
+      );
       vi.mocked(queryCDRPartials).mockResolvedValue([
         makeGroup({
           submissions: [makeSubmission({ validator: VALIDATOR_A, pid: 1 })],
           thresholdMet: false,
         }),
       ]);
-      await expect(
-        consumer.collectPartials({
+      try {
+        await consumer.collectPartials({
           uuid: 1,
           requesterPubKey: "0x04" as `0x${string}`,
           timeoutMs: 50,
           pollIntervalMs: 5,
-        }),
-      ).rejects.toThrow(PartialCollectionTimeoutError);
+        });
+        expect.fail("expected PartialCollectionTimeoutError");
+      } catch (err) {
+        expect(err).toBeInstanceOf(PartialCollectionTimeoutError);
+        const e = err as PartialCollectionTimeoutError;
+        expect(e.collected).toBe(1);
+        expect(e.needed).toBe(5);
+        expect(e.timeoutMs).toBe(50);
+        expect(e.code).toBe("PARTIAL_COLLECTION_TIMEOUT");
+      }
+    });
+
+    it("timeout fields reflect active-round threshold when no matching bucket ever appears", async () => {
+      const { consumer } = makeConsumer(makeFakeObserver({ threshold: 3 }));
+      // No groups returned across all polls — bucket-aware getThresholdAt
+      // never runs; `needed` should come from the seeded getThreshold().
+      vi.mocked(queryCDRPartials).mockResolvedValue([]);
+      try {
+        await consumer.collectPartials({
+          uuid: 1,
+          requesterPubKey: "0x04" as `0x${string}`,
+          timeoutMs: 30,
+          pollIntervalMs: 5,
+        });
+        expect.fail("expected PartialCollectionTimeoutError");
+      } catch (err) {
+        const e = err as PartialCollectionTimeoutError;
+        expect(e.collected).toBe(0);
+        expect(e.needed).toBe(3);
+        expect(e.timeoutMs).toBe(30);
+      }
     });
 
     it("treats empty groups as 'wait, may arrive later'", async () => {
@@ -435,20 +625,43 @@ describe("Consumer", () => {
       ]);
 
       const onInvalidPartial = vi.fn();
-      await expect(
-        consumer.collectPartials({
+      let timeoutErr: PartialCollectionTimeoutError | undefined;
+      try {
+        await consumer.collectPartials({
           uuid: 1,
           requesterPubKey: "0x04" as `0x${string}`,
           timeoutMs: 50,
           pollIntervalMs: 5,
           attestationConfig: { minSecurityVersion: 1 },
           onInvalidPartial,
-        }),
-      ).rejects.toThrow(PartialCollectionTimeoutError);
+        });
+        expect.fail("expected PartialCollectionTimeoutError");
+      } catch (err) {
+        expect(err).toBeInstanceOf(PartialCollectionTimeoutError);
+        timeoutErr = err as PartialCollectionTimeoutError;
+      }
+
+      // `collected` reflects the trusted/accepted count (1: only A), NOT
+      // the raw bucket size (3). Critical when the typed field is consumed
+      // for telemetry / UX.
+      expect(timeoutErr!.collected).toBe(1);
+      expect(timeoutErr!.needed).toBe(2);
 
       // Both un-trusted validators reported.
       const reported = onInvalidPartial.mock.calls.map((c) => c[0].validator);
       expect(new Set(reported)).toEqual(new Set([VALIDATOR_B, VALIDATOR_C]));
+
+      // Each call passes a typed `attestation-rejected` reason as the 2nd
+      // argument, with stable fields callers can switch on without parsing
+      // text. The legacy Error is still passed as the 3rd argument.
+      for (const call of onInvalidPartial.mock.calls) {
+        const [event, reason, error] = call;
+        expect(reason.kind).toBe("attestation-rejected");
+        expect(reason.validator).toBe(event.validator);
+        expect(reason.pid).toBe(event.pid);
+        expect(reason.round).toBe(event.round);
+        expect(error).toBeInstanceOf(Error);
+      }
     });
 
     it("attestation cache: verifyAttestation called once per validator per round", async () => {
@@ -653,9 +866,8 @@ describe("Consumer", () => {
 
     it("uses provided globalPubKey: skips observer.getGlobalPubKey", async () => {
       // observer.getThresholdAt is called once from collectPartials (it
-      // derives the bucket-round threshold). observer.getThreshold (the
-      // active-round variant) must NOT be called from collectPartials —
-      // those are now distinct methods.
+      // derives the bucket-round threshold). observer.getThreshold is
+      // called once at loop start to seed `needed` on the timeout error.
       vi.mocked(generateEphemeralKeyPair).mockReturnValue({
         privateKey: new Uint8Array(32).fill(1),
         publicKey: new Uint8Array(65).fill(2),
@@ -683,7 +895,7 @@ describe("Consumer", () => {
       expect(observer.getGlobalPubKey).not.toHaveBeenCalled();
       expect(observer.getThresholdAt).toHaveBeenCalledTimes(1);
       expect(observer.getThresholdAt).toHaveBeenCalledWith(4);
-      expect(observer.getThreshold).not.toHaveBeenCalled();
+      expect(observer.getThreshold).toHaveBeenCalledTimes(1);
     });
 
     it("throws EmptyVaultError BEFORE submitting any tx — no fee paid for empty vault (#78)", async () => {
@@ -703,7 +915,7 @@ describe("Consumer", () => {
       // Critical regression assertion: the preflight must run BEFORE any
       // fee-bearing read tx is submitted. If `read()` is called before the
       // empty check, the user pays for a request that can never succeed.
-      expect(walletClient.writeContract).not.toHaveBeenCalled();
+      expect(walletClient.sendRawTransaction).not.toHaveBeenCalled();
       // Also: the partial poll must never start.
       expect(queryCDRPartials).not.toHaveBeenCalled();
     });
@@ -778,6 +990,23 @@ describe("Consumer", () => {
       // reads would mean accessCDR + collectPartials each loaded the
       // vault separately, and the filter would pin C2 instead of C1.
       expect(vaultReadCount).toBe(1);
+    });
+
+    it("does not enter collectPartials when read tx reverts", async () => {
+      const { consumer, publicClient } = makeConsumer(
+        makeFakeObserver({ globalPubKey: new Uint8Array(34).fill(0xaa) }),
+      );
+      vi.mocked(generateEphemeralKeyPair).mockReturnValue({
+        privateKey: new Uint8Array(32).fill(1),
+        publicKey: new Uint8Array(65).fill(2),
+      });
+      publicClient.waitForTransactionReceipt.mockResolvedValueOnce({ status: "reverted" });
+
+      await expect(
+        consumer.accessCDR({ uuid: 42, accessAuxData: "0x", timeoutMs: 1000 }),
+      ).rejects.toBeInstanceOf(ReadTransactionRevertedError);
+
+      expect(queryCDRPartials).not.toHaveBeenCalled();
     });
   });
 
@@ -983,8 +1212,9 @@ describe("Consumer", () => {
 
       expect(result).toHaveLength(2);
       expect(observer.getThresholdAt).toHaveBeenCalledWith(10);
-      // getThreshold (active-round) must not be called from collectPartials.
-      expect(observer.getThreshold).not.toHaveBeenCalled();
+      // getThresholdAt drives the bucket-aware threshold; getThreshold is
+      // only called once to seed `needed` on the timeout error.
+      expect(observer.getThresholdAt).toHaveBeenCalledTimes(1);
     });
 
     it("throws EmptyVaultError when vault has no encryptedData", async () => {
@@ -1052,7 +1282,7 @@ describe("Consumer", () => {
         accessAuxData: "0x",
         requesterPubKey: "0x04abcd" as `0x${string}`,
       });
-      expect(walletClient.writeContract).toHaveBeenCalledOnce();
+      expect(walletClient.sendRawTransaction).toHaveBeenCalledOnce();
     });
 
     it("throws InsufficientBalanceError when balance < fee and tx is NOT sent", async () => {
@@ -1068,7 +1298,7 @@ describe("Consumer", () => {
         }),
       ).rejects.toThrow(InsufficientBalanceError);
 
-      expect(walletClient.writeContract).not.toHaveBeenCalled();
+      expect(walletClient.sendRawTransaction).not.toHaveBeenCalled();
     });
 
     it("passes preflight when balance >= fee and proceeds to send the tx", async () => {
@@ -1085,7 +1315,7 @@ describe("Consumer", () => {
       expect(publicClient.getBalance).toHaveBeenCalledWith({
         address: walletClient.account.address,
       });
-      expect(walletClient.writeContract).toHaveBeenCalledOnce();
+      expect(walletClient.sendRawTransaction).toHaveBeenCalledOnce();
       expect(result.txHash).toBe("0xtxhash");
     });
 
@@ -1102,7 +1332,7 @@ describe("Consumer", () => {
         }),
       ).rejects.toThrow("rpc down");
 
-      expect(walletClient.writeContract).not.toHaveBeenCalled();
+      expect(walletClient.sendRawTransaction).not.toHaveBeenCalled();
     });
   });
 
@@ -1267,7 +1497,7 @@ describe("Consumer", () => {
         timeoutMs: 200,
         pollIntervalMs: 5,
         attestationConfig: { minSecurityVersion: 1 },
-        onInvalidPartial: (_event, err) => reported.push(err),
+        onInvalidPartial: (_event, _reason, err) => err && reported.push(err),
       });
 
       expect(result).toHaveLength(2);

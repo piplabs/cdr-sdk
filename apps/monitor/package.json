@@ -1,0 +1,31 @@
+{
+  "name": "@piplabs/cdr-monitor",
+  "version": "0.2.1",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc",
+    "partials-threshold": "tsx src/partials-threshold/index.ts",
+    "clean": "rm -rf dist",
+    "lint": "tsc --noEmit",
+    "test": "vitest run --exclude '**/node_modules/**' --exclude '**/dist/**'",
+    "test:coverage": "vitest run --coverage --exclude '**/node_modules/**' --exclude '**/dist/**'"
+  },
+  "dependencies": {
+    "@piplabs/cdr-sdk": "workspace:*",
+    "viem": "^2.47.6"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@vitest/coverage-v8": "^2",
+    "tsx": "^4",
+    "typescript": "^5.5",
+    "vitest": "^2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/piplabs/cdr-sdk.git",
+    "directory": "apps/monitor"
+  }
+}
