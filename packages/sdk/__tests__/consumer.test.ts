@@ -237,9 +237,9 @@ describe("Consumer", () => {
         requesterPubKey: "0x04" as `0x${string}`,
         feeOverride: 1n,
       });
-      expect(publicClient.waitForTransactionReceipt).toHaveBeenCalledWith({
-        hash: "0xtxhash",
-      });
+      expect(publicClient.waitForTransactionReceipt).toHaveBeenCalledWith(
+        expect.objectContaining({ hash: "0xtxhash" }),
+      );
     });
 
     it("read returns txHash when receipt status is success", async () => {

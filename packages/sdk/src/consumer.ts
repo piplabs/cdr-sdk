@@ -23,6 +23,7 @@ import { verifyAttestation, type AttestationConfig } from "./attestation.js";
 import { queryCDRPartials } from "./story-api/client.js";
 import type { DKGPartialDecryptionSubmission } from "./story-api/types.js";
 import { safeWriteContract } from "./_tx-submit.js";
+import { waitForReceiptResilient } from "./_rpc-resilience.js";
 
 /**
  * Consumer reads encrypted vault data from the CDR contract and recovers the
@@ -146,7 +147,7 @@ export class Consumer {
       value: fee,
     });
 
-    const receipt = await this.publicClient.waitForTransactionReceipt({ hash: txHash });
+    const receipt = await waitForReceiptResilient(this.publicClient, txHash);
 
     if (receipt.status === "reverted") {
       const reason = await this.decodeReadRevertReason({
