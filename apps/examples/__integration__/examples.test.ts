@@ -49,6 +49,10 @@ const BASE_ENV = {
   CDR_TEST_PRIVATE_KEY: PRIVATE_KEY!,
 };
 
+// Accepts the deployed CDR condition selectors and cleanly rejects unknown selectors.
+const OPEN_CONDITION_BYTECODE =
+  "0x602a600c600039602a6000f360003560e01c80635645dbbf14601f5780638db3eb1714601f5760006000fd5b600160005260206000f3" as `0x${string}`;
+
 /**
  * Per-case diagnostic logger; mirrors the SDK / CLI suites.
  */
@@ -87,13 +91,10 @@ beforeAll(async () => {
   const publicClient = createPublicClient({ transport: http(RPC_URL) }) as PublicClient;
   const walletClient = createWalletClient({ account, transport: http(RPC_URL) }) as WalletClient;
 
-  // Deploy the open-condition contract (same 10-byte runtime as
-  // packages/sdk/__integration__).
-  const bytecode = "0x600a600c600039600a6000f3600160005260206000f3" as `0x${string}`;
   const deployTx = await walletClient.sendTransaction({
     chain: walletClient.chain ?? null,
     account: walletClient.account ?? null,
-    data: bytecode,
+    data: OPEN_CONDITION_BYTECODE,
   });
   const deployReceipt = await publicClient.waitForTransactionReceipt({ hash: deployTx });
   if (!deployReceipt.contractAddress) {

@@ -85,6 +85,7 @@ import {
   refundWallets,
 } from "./_ephemeral-wallets.js";
 import {
+  OPEN_CONDITION_BYTECODE,
   sizeFundAndReport,
   statsOf,
   writePerfStats,
@@ -181,12 +182,10 @@ async function deployOpenCondition(
   publicClient: PublicClient,
   walletClient: WalletClient,
 ): Promise<`0x${string}`> {
-  const bytecode =
-    "0x600a600c600039600a6000f3600160005260206000f3" as `0x${string}`;
   const tx = await walletClient.sendTransaction({
     chain: walletClient.chain ?? null,
     account: walletClient.account ?? null,
-    data: bytecode,
+    data: OPEN_CONDITION_BYTECODE,
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash: tx });
   if (!receipt.contractAddress) {
