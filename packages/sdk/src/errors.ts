@@ -14,11 +14,17 @@ export class WalletClientRequiredError extends CDRError {
 }
 
 export class PartialCollectionTimeoutError extends CDRError {
+  collected: number;
+  needed: number;
+  timeoutMs: number;
   constructor(collected: number, needed: number, timeoutMs: number) {
     super(
       `Timed out collecting partials after ${timeoutMs}ms: got ${collected}/${needed}`,
       "PARTIAL_COLLECTION_TIMEOUT",
     );
+    this.collected = collected;
+    this.needed = needed;
+    this.timeoutMs = timeoutMs;
   }
 }
 
@@ -113,5 +119,20 @@ export class EmptyVaultError extends CDRError {
       "EMPTY_VAULT",
     );
     this.uuid = uuid;
+  }
+}
+
+export class ReadTransactionRevertedError extends CDRError {
+  txHash: `0x${string}`;
+  reason?: string;
+  constructor(txHash: `0x${string}`, reason?: string) {
+    super(
+      reason
+        ? `Read transaction ${txHash} reverted: ${reason}`
+        : `Read transaction ${txHash} reverted`,
+      "READ_TX_REVERTED",
+    );
+    this.txHash = txHash;
+    this.reason = reason;
   }
 }

@@ -13,8 +13,9 @@ import {
   InvalidParamsError,
   CidIntegrityError,
   EmptyVaultError,
+  ReadTransactionRevertedError,
 } from "./errors.js";
-import type { PartialDecryptionEvent } from "./types.js";
+import type { PartialDecryptionEvent, InvalidPartialReason } from "./types.js";
 import { uuidToLabel } from "./label.js";
 import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
@@ -22,6 +23,7 @@ import { verifyAttestation, type AttestationConfig } from "./attestation.js";
 import { queryCDRPartials } from "./story-api/client.js";
 import type { DKGPartialDecryptionSubmission } from "./story-api/types.js";
 import { safeWriteContract } from "./_tx-submit.js";
+import { waitForReceiptResilient } from "./_rpc-resilience.js";
 
 /**
  * Consumer reads encrypted vault data from the CDR contract and recovers the
@@ -145,7 +147,43 @@ export class Consumer {
       value: fee,
     });
 
+    const receipt = await waitForReceiptResilient(this.publicClient, txHash);
+
+    if (receipt.status === "reverted") {
+      const reason = await this.decodeReadRevertReason({
+        uuid: params.uuid,
+        accessAuxData: params.accessAuxData,
+        requesterPubKey: params.requesterPubKey,
+        fee,
+        blockNumber: receipt.blockNumber,
+      });
+      throw new ReadTransactionRevertedError(txHash, reason);
+    }
+
     return { txHash };
+  }
+
+  private async decodeReadRevertReason(params: {
+    uuid: number;
+    accessAuxData: `0x${string}`;
+    requesterPubKey: `0x${string}`;
+    fee: bigint;
+    blockNumber?: bigint;
+  }): Promise<string | undefined> {
+    try {
+      await this.publicClient.simulateContract({
+        account: this.walletClient.account ?? undefined,
+        address: contractAddresses[this.network].cdr,
+        abi: cdrAbi,
+        functionName: "read",
+        args: [params.uuid, params.accessAuxData, params.requesterPubKey],
+        value: params.fee,
+        blockNumber: params.blockNumber,
+      });
+    } catch (err) {
+      return extractViemRevertReason(err);
+    }
+    return undefined;
   }
 
   /**
@@ -205,7 +243,11 @@ export class Consumer {
     requesterPubKey: `0x${string}`;
     timeoutMs?: number;
     pollIntervalMs?: number;
-    onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
+    onInvalidPartial?: (
+      event: PartialDecryptionEvent,
+      reason: InvalidPartialReason,
+      error?: Error,
+    ) => void;
     attestationConfig?: AttestationConfig;
     /**
      * @internal Pre-loaded vault ciphertext from a containing call (e.g.
@@ -252,8 +294,14 @@ export class Consumer {
     const reported = new Set<string>();
     /** Last-known submission count (within the matching bucket), for the timeout error. */
     let lastSeen = 0;
-    /** Last-known round threshold, for the timeout error. */
-    let lastNeeded = 0;
+    /**
+     * Last-known round threshold, for the timeout error. Seeded from the
+     * active-round threshold so a complete no-show timeout still surfaces a
+     * meaningful `needed` value (e.g. `got 0/3`) rather than `got 0/0`.
+     * Overridden by `getThresholdAt(group.round)` once a matching bucket
+     * appears.
+     */
+    let lastNeeded = await this.observer.getThreshold().catch(() => 0);
 
     while (Date.now() < deadline) {
       let groups: Awaited<ReturnType<typeof queryCDRPartials>> = [];
@@ -300,6 +348,12 @@ export class Consumer {
                 reported.add(dedupeKey);
                 onInvalidPartial?.(
                   event,
+                  {
+                    kind: "attestation-rejected",
+                    validator: sub.validator,
+                    pid: sub.pid,
+                    round: group.round,
+                  },
                   new Error(`attestation rejected for validator ${sub.validator}`),
                 );
               }
@@ -311,6 +365,10 @@ export class Consumer {
           if (accepted.length >= sdkThreshold) {
             return accepted.slice(0, sdkThreshold);
           }
+          // Below threshold after trust filtering: surface the
+          // trusted/accepted count (not the raw bucket size) on a future
+          // timeout, so callers see what was actually usable.
+          lastSeen = accepted.length;
           // Not enough trusted partials this poll — keep waiting; more
           // validators may still submit, and the trust set is fixed for
           // this round so newly-arrived partials reuse the same checks.
@@ -451,7 +509,11 @@ export class Consumer {
     timeoutMs?: number;
     /** See {@link read}'s `feeOverride` — same strict-equality semantics. */
     feeOverride?: bigint;
-    onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
+    onInvalidPartial?: (
+      event: PartialDecryptionEvent,
+      reason: InvalidPartialReason,
+      error?: Error,
+    ) => void;
     attestationConfig?: AttestationConfig;
   }): Promise<{ dataKey: Uint8Array; txHash: `0x${string}` }> {
     if (
@@ -541,7 +603,11 @@ export class Consumer {
     timeoutMs?: number;
     /** See {@link read}'s `feeOverride` — same strict-equality semantics. */
     feeOverride?: bigint;
-    onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
+    onInvalidPartial?: (
+      event: PartialDecryptionEvent,
+      reason: InvalidPartialReason,
+      error?: Error,
+    ) => void;
     attestationConfig?: AttestationConfig;
     /** Skip CID integrity verification of downloaded file (default: false). */
     skipCidVerification?: boolean;
@@ -621,4 +687,56 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Best-effort revert-reason extractor for viem errors. Walks the `cause`
+ * chain looking for stable fields — `reason` (Solidity `revert("msg")`),
+ * decoded custom error name, or signature. Falls back to top-level
+ * `shortMessage` / `details` ONLY when the chain contains a
+ * `ContractFunctionExecutionError` / `ContractFunctionRevertedError` —
+ * otherwise transport/RPC errors (e.g. `HttpRequestError`) would surface
+ * misleading reasons like "HTTP request failed". Returns undefined for
+ * unrecognized shapes.
+ */
+function extractViemRevertReason(err: unknown): string | undefined {
+  if (!err || typeof err !== "object") return undefined;
+
+  let current: any = err;
+  let sawContractError = false;
+  for (let i = 0; i < 5 && current; i++) {
+    if (
+      current.name === "ContractFunctionExecutionError" ||
+      current.name === "ContractFunctionRevertedError"
+    ) {
+      sawContractError = true;
+    }
+    if (typeof current.reason === "string" && current.reason.length > 0) {
+      return current.reason;
+    }
+    const decoded = current.data;
+    if (
+      decoded &&
+      typeof decoded === "object" &&
+      typeof decoded.errorName === "string" &&
+      decoded.errorName.length > 0
+    ) {
+      return decoded.errorName;
+    }
+    if (typeof current.signature === "string" && current.signature.length > 0) {
+      return current.signature;
+    }
+    current = current.cause;
+  }
+
+  if (!sawContractError) return undefined;
+
+  const top: any = err;
+  if (typeof top.shortMessage === "string" && top.shortMessage.length > 0) {
+    return top.shortMessage;
+  }
+  if (typeof top.details === "string" && top.details.length > 0) {
+    return top.details;
+  }
+  return undefined;
 }
