@@ -48,6 +48,11 @@ See the full [repository README](https://github.com/piplabs/cdr-sdk#readme) for 
 - `Consumer` — request a vault read and combine partial decryptions
 - `Observer` — query CDR contract state and DKG round info
 - `conditions` — helpers for write/read condition contracts (`open`, `ownerOnly`, `tokenGate`, `merkle`, `custom`)
+- `CDRPublicClient` / `CDRWalletClient` — structural client interfaces accepted by `CDRClient`. Any viem version (or wagmi wrapper / custom client) that implements the subset works, so dual-viem monorepos don't need `pnpm.overrides` or `as any` casts
+- `CDRLogger`, `noopLogger` — optional structured logger passed to `new CDRClient({ logger })`. SDK emits stable events such as `registry.prefetch.ready`, `read.tx.sent`, `read.preflight.insufficient_balance`, `partial.accepted`, and `partial.dropped` with non-sensitive contexts. Amounts are logged as decimal strings. Defaults to a no-op
+- `Consumer.registryStatus` — synchronous getter (`"unbuilt" | "building" | "ready" | "failed"`) reflecting the most recent `prefetchRegistry()` call, for UIs that want to show a "preparing verifier" chip
+- Typed errors — `CDRError` is the common base, and SDK errors expose stable `code` fields. Branch on `err.code` rather than matching message text
+- `Consumer.read()` runs a balance pre-flight before submitting the fee-bearing read tx (skipped when the client surface omits `getBalance` or the wallet has no resolvable address) and throws `InsufficientBalanceError` if the wallet is short on IP
 - Re-exported from `@piplabs/cdr-crypto`: `tdh2Encrypt`, `tdh2Combine`, `verifyPartialSignature`, `encryptFile`, `decryptFile`, `initWasm`, ...
 - Re-exported from `@piplabs/cdr-contracts`: `cdrAbi`, `dkgAbi`, `contractAddresses`, `Network`, ...
 

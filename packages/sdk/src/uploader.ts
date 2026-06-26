@@ -1,20 +1,29 @@
-import { parseEventLogs, toHex, toBytes, type PublicClient, type WalletClient } from "viem";
+import { parseEventLogs, toHex, toBytes, type Log, type PublicClient, type WalletClient } from "viem";
 import { cdrAbi, contractAddresses, type Network } from "@piplabs/cdr-contracts";
 import { tdh2Encrypt, encryptFile, getWasm, type TDH2Ciphertext } from "@piplabs/cdr-crypto";
 import { uuidToLabel } from "./label.js";
-import { ContentSizeExceededError, LabelMismatchError, InvalidConditionContractError } from "./errors.js";
+import {
+  ContentSizeExceededError,
+  LabelMismatchError,
+  InvalidConditionContractError,
+  InvalidParamsError,
+  VaultAllocatedEventNotFoundError,
+} from "./errors.js";
 import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
+import type { CDRPublicClient, CDRWalletClient } from "./client-types.js";
+import { type CDRLogger, noopLogger } from "./logger.js";
 import { safeWriteContract } from "./_tx-submit.js";
 import { waitForReceiptResilient } from "./_rpc-resilience.js";
 
 const SENTINEL_CONDITION_FUNCTION = "__cdrSentinelProbeNoImpl__";
 
 export class Uploader {
-  private publicClient: PublicClient;
-  private walletClient: WalletClient;
+  private publicClient: CDRPublicClient;
+  private walletClient: CDRWalletClient;
   private network: Network;
   private observer: Observer;
+  private logger: CDRLogger;
 
   /** Alias for {@link uploadCDR} */
   createVault: Uploader["uploadCDR"];
@@ -23,15 +32,18 @@ export class Uploader {
 
   constructor(params: {
     network: Network;
-    publicClient: PublicClient;
-    walletClient: WalletClient;
+    publicClient: CDRPublicClient;
+    walletClient: CDRWalletClient;
     /** Observer instance — required. Used by `write` to look up `maxEncryptedDataSize` (cached for the Observer's lifetime). */
     observer: Observer;
+    /** Optional structured logger; defaults to a no-op. */
+    logger?: CDRLogger;
   }) {
     this.publicClient = params.publicClient;
     this.walletClient = params.walletClient;
     this.network = params.network;
     this.observer = params.observer;
+    this.logger = params.logger ?? noopLogger;
     this.createVault = this.uploadCDR.bind(this);
     this.createFileVault = this.uploadFile.bind(this);
   }
@@ -104,13 +116,15 @@ export class Uploader {
 
     const cdrAddress = contractAddresses[this.network].cdr;
 
-    const fee = params.feeOverride ?? await this.publicClient.readContract({
-      address: cdrAddress,
-      abi: cdrAbi,
-      functionName: "allocateFee",
-    });
+    const fee =
+      params.feeOverride ??
+      ((await this.publicClient.readContract({
+        address: cdrAddress,
+        abi: cdrAbi,
+        functionName: "allocateFee",
+      })) as bigint);
 
-    const txHash = await safeWriteContract(this.walletClient, this.publicClient, {
+    const txHash = await safeWriteContract(this.walletClient as unknown as WalletClient, this.publicClient as unknown as PublicClient, {
       address: cdrAddress,
       abi: cdrAbi,
       functionName: "allocate",
@@ -124,9 +138,10 @@ export class Uploader {
       value: fee,
     });
 
-    const receipt = await waitForReceiptResilient(this.publicClient, txHash);
+    const receipt = await waitForReceiptResilient(this.publicClient as unknown as PublicClient, txHash);
     const uuid = this.parseVaultAllocatedUuid(receipt.logs);
 
+    this.logger.debug("allocate.tx.mined", { txHash, uuid });
     return { txHash, uuid };
   }
 
@@ -184,13 +199,15 @@ export class Uploader {
 
     const cdrAddress = contractAddresses[this.network].cdr;
 
-    const fee = params.feeOverride ?? await this.publicClient.readContract({
-      address: cdrAddress,
-      abi: cdrAbi,
-      functionName: "writeFee",
-    });
+    const fee =
+      params.feeOverride ??
+      ((await this.publicClient.readContract({
+        address: cdrAddress,
+        abi: cdrAbi,
+        functionName: "writeFee",
+      })) as bigint);
 
-    const txHash = await safeWriteContract(this.walletClient, this.publicClient, {
+    const txHash = await safeWriteContract(this.walletClient as unknown as WalletClient, this.publicClient as unknown as PublicClient, {
       address: cdrAddress,
       abi: cdrAbi,
       functionName: "write",
@@ -198,8 +215,9 @@ export class Uploader {
       value: fee,
     });
 
-    await waitForReceiptResilient(this.publicClient, txHash);
+    await waitForReceiptResilient(this.publicClient as unknown as PublicClient, txHash);
 
+    this.logger.debug("write.tx.mined", { uuid: params.uuid, txHash });
     return { txHash };
   }
 
@@ -384,12 +402,18 @@ export class Uploader {
       stateMutability: "view" as const,
     }];
 
+    if (!this.publicClient.simulateContract) {
+      throw new InvalidParamsError(
+        "publicClient.simulateContract is required for condition validation",
+      );
+    }
+
     // Keep dummy bytes ABI-decodable so empty reverts remain a selector-miss signal.
     const dummyBytes = `0x${"00".repeat(256)}` as `0x${string}`;
     const zeroAddr = "0x0000000000000000000000000000000000000000" as `0x${string}`;
 
     try {
-      await this.publicClient.simulateContract({
+      await this.publicClient.simulateContract!({
         address,
         abi: conditionAbi,
         functionName,
@@ -440,7 +464,7 @@ export class Uploader {
       },
     ];
     try {
-      await this.publicClient.simulateContract({
+      await this.publicClient.simulateContract!({
         address,
         abi: sentinelAbi,
         functionName: SENTINEL_CONDITION_FUNCTION,
@@ -467,14 +491,14 @@ export class Uploader {
     }
   }
 
-  private parseVaultAllocatedUuid(logs: any[]): number {
+  private parseVaultAllocatedUuid(logs: unknown[]): number {
     const parsed = parseEventLogs({
       abi: cdrAbi,
-      logs,
+      logs: logs as Log[],
       eventName: "VaultAllocated",
     });
     if (parsed.length === 0) {
-      throw new Error("VaultAllocated event not found in transaction logs");
+      throw new VaultAllocatedEventNotFoundError();
     }
     return parsed[0].args.uuid;
   }

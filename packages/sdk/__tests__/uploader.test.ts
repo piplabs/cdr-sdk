@@ -9,7 +9,11 @@ vi.mock("@piplabs/cdr-crypto", () => ({
 
 import { Uploader } from "../src/uploader.js";
 import { tdh2Encrypt } from "@piplabs/cdr-crypto";
-import { ContentSizeExceededError, InvalidConditionContractError } from "../src/errors.js";
+import {
+  ContentSizeExceededError,
+  InvalidConditionContractError,
+  InvalidParamsError,
+} from "../src/errors.js";
 import type { Observer } from "../src/observer.js";
 import { cdrAbi } from "@piplabs/cdr-contracts";
 import { makeWalletMock, decodeWriteCalls } from "./_write-contract-mock.js";
@@ -475,6 +479,31 @@ describe("Uploader", () => {
       expect(args).toHaveLength(4);
     }
     expect(sentinelCalls).toHaveLength(2);
+  });
+
+  it("requires simulateContract for condition validation", async () => {
+    const { publicClient, walletClient } = mockClients();
+    delete publicClient.simulateContract;
+
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer: fakeObserver(),
+    });
+
+    await expect(
+      uploader.allocate({
+        updatable: false,
+        writeConditionAddr: "0x1111111111111111111111111111111111111111",
+        readConditionAddr: "0x2222222222222222222222222222222222222222",
+        writeConditionData: "0x",
+        readConditionData: "0x",
+        feeOverride: 0n,
+      }),
+    ).rejects.toThrow(InvalidParamsError);
+
+    expect(walletClient.sendRawTransaction).not.toHaveBeenCalled();
   });
 
   it("write sends tx with correct fee", async () => {

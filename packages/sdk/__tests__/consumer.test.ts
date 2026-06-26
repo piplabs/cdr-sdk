@@ -38,8 +38,11 @@ import {
   PartialCollectionTimeoutError,
   InvalidParamsError,
   EmptyVaultError,
+  InvalidPartialError,
+  InsufficientBalanceError,
   ReadTransactionRevertedError,
 } from "../src/errors.js";
+import type { CDRLogger } from "../src/logger.js";
 import { toHex } from "viem";
 import type { Observer } from "../src/observer.js";
 import type { DKGPartialDecryptionSubmission } from "../src/story-api/types.js";
@@ -1228,6 +1231,283 @@ describe("Consumer", () => {
       ).rejects.toThrow(EmptyVaultError);
       // Should not even poll the REST endpoint — fail fast.
       expect(queryCDRPartials).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // registryStatus state machine (#56 2.5)
+  // -------------------------------------------------------------------------
+  describe("registryStatus", () => {
+    it("starts in 'unbuilt'", () => {
+      const { consumer } = makeConsumer();
+      expect(consumer.registryStatus).toBe("unbuilt");
+    });
+
+    it("moves to 'ready' after a successful prefetchRegistry", async () => {
+      const observer = makeFakeObserver();
+      const { consumer } = makeConsumer(observer);
+      await consumer.prefetchRegistry();
+      expect(consumer.registryStatus).toBe("ready");
+    });
+
+    it("moves to 'failed' when prefetchRegistry rejects, and back to 'building' on retry", async () => {
+      const observer = makeFakeObserver();
+      vi.mocked(observer.getRegisteredValidators)
+        .mockRejectedValueOnce(new Error("network down"))
+        .mockResolvedValueOnce(new Map());
+      const { consumer } = makeConsumer(observer);
+
+      await expect(consumer.prefetchRegistry()).rejects.toThrow("network down");
+      expect(consumer.registryStatus).toBe("failed");
+
+      // Retry: the immediate transition is 'building' (we observe it via the
+      // in-flight Promise), and the resolved state is 'ready'.
+      const retry = consumer.prefetchRegistry();
+      expect(consumer.registryStatus).toBe("building");
+      await retry;
+      expect(consumer.registryStatus).toBe("ready");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // read() balance preflight (#56 2.6)
+  // -------------------------------------------------------------------------
+  describe("read balance preflight", () => {
+    it("skips preflight when publicClient has no getBalance method", async () => {
+      const { consumer, publicClient, walletClient } = makeConsumer();
+      // Default mock has no getBalance — read should succeed.
+      publicClient.readContract.mockResolvedValueOnce(5n);
+      await consumer.read({
+        uuid: 42,
+        accessAuxData: "0x",
+        requesterPubKey: "0x04abcd" as `0x${string}`,
+      });
+      expect(walletClient.sendRawTransaction).toHaveBeenCalledOnce();
+    });
+
+    it("throws InsufficientBalanceError when balance < fee and tx is NOT sent", async () => {
+      const { consumer, publicClient, walletClient } = makeConsumer();
+      publicClient.readContract.mockResolvedValueOnce(100n); // fee = 100
+      publicClient.getBalance = vi.fn().mockResolvedValue(50n); // wallet has 50
+
+      await expect(
+        consumer.read({
+          uuid: 1,
+          accessAuxData: "0x",
+          requesterPubKey: "0x04" as `0x${string}`,
+        }),
+      ).rejects.toThrow(InsufficientBalanceError);
+
+      expect(walletClient.sendRawTransaction).not.toHaveBeenCalled();
+    });
+
+    it("passes preflight when balance >= fee and proceeds to send the tx", async () => {
+      const { consumer, publicClient, walletClient } = makeConsumer();
+      publicClient.readContract.mockResolvedValueOnce(100n);
+      publicClient.getBalance = vi.fn().mockResolvedValue(100n); // exact
+
+      const result = await consumer.read({
+        uuid: 1,
+        accessAuxData: "0x",
+        requesterPubKey: "0x04" as `0x${string}`,
+      });
+
+      expect(publicClient.getBalance).toHaveBeenCalledWith({
+        address: walletClient.account.address,
+      });
+      expect(walletClient.sendRawTransaction).toHaveBeenCalledOnce();
+      expect(result.txHash).toBe("0xtxhash");
+    });
+
+    it("propagates getBalance failures and does not send the tx", async () => {
+      const { consumer, publicClient, walletClient } = makeConsumer();
+      publicClient.readContract.mockResolvedValueOnce(100n);
+      publicClient.getBalance = vi.fn().mockRejectedValue(new Error("rpc down"));
+
+      await expect(
+        consumer.read({
+          uuid: 1,
+          accessAuxData: "0x",
+          requesterPubKey: "0x04" as `0x${string}`,
+        }),
+      ).rejects.toThrow("rpc down");
+
+      expect(walletClient.sendRawTransaction).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Logger plumbing (#56 2.3)
+  // -------------------------------------------------------------------------
+  describe("logger", () => {
+    function makeLogger(): CDRLogger & { calls: Array<[string, string, unknown?]> } {
+      const calls: Array<[string, string, unknown?]> = [];
+      return {
+        calls,
+        debug: (msg, ctx) => { calls.push(["debug", msg, ctx]); },
+        info:  (msg, ctx) => { calls.push(["info",  msg, ctx]); },
+        warn:  (msg, ctx) => { calls.push(["warn",  msg, ctx]); },
+        error: (msg, ctx) => { calls.push(["error", msg, ctx]); },
+      };
+    }
+
+    it("emits registry.prefetch.start + ready around a successful prefetch", async () => {
+      const observer = makeFakeObserver();
+      const { publicClient, walletClient } = mockClients();
+      const logger = makeLogger();
+      const consumer = new Consumer({
+        network: "testnet",
+        publicClient,
+        walletClient,
+        observer,
+        apiUrl: API_URL,
+        logger,
+      });
+      await consumer.prefetchRegistry();
+      const events = logger.calls.map(([, msg]) => msg);
+      expect(events).toContain("registry.prefetch.start");
+      expect(events).toContain("registry.prefetch.ready");
+    });
+
+    it("emits read.tx.sent on success", async () => {
+      const observer = makeFakeObserver();
+      const { publicClient, walletClient } = mockClients();
+      publicClient.readContract.mockResolvedValueOnce(5n);
+      const logger = makeLogger();
+      const consumer = new Consumer({
+        network: "testnet",
+        publicClient,
+        walletClient,
+        observer,
+        apiUrl: API_URL,
+        logger,
+      });
+      await consumer.read({
+        uuid: 42,
+        accessAuxData: "0x",
+        requesterPubKey: "0x04" as `0x${string}`,
+      });
+      const events = logger.calls.map(([, msg]) => msg);
+      expect(events).toContain("read.tx.sent");
+      const sent = logger.calls.find(([, msg]) => msg === "read.tx.sent");
+      expect(sent?.[2]).toMatchObject({ fee: "5" });
+    });
+
+    it("emits read.preflight.insufficient_balance when balance < fee", async () => {
+      const observer = makeFakeObserver();
+      const { publicClient, walletClient } = mockClients();
+      publicClient.readContract.mockResolvedValueOnce(100n);
+      publicClient.getBalance = vi.fn().mockResolvedValue(0n);
+      const logger = makeLogger();
+      const consumer = new Consumer({
+        network: "testnet",
+        publicClient,
+        walletClient,
+        observer,
+        apiUrl: API_URL,
+        logger,
+      });
+      await expect(
+        consumer.read({
+          uuid: 1,
+          accessAuxData: "0x",
+          requesterPubKey: "0x04" as `0x${string}`,
+        }),
+      ).rejects.toThrow(InsufficientBalanceError);
+      const events = logger.calls.map(([, msg]) => msg);
+      expect(events).toContain("read.preflight.insufficient_balance");
+      const insufficient = logger.calls.find(([, msg]) => (
+        msg === "read.preflight.insufficient_balance"
+      ));
+      expect(insufficient?.[2]).toMatchObject({ balance: "0", required: "100" });
+    });
+
+    it("emits read.preflight.failed when getBalance rejects", async () => {
+      const observer = makeFakeObserver();
+      const { publicClient, walletClient } = mockClients();
+      publicClient.readContract.mockResolvedValueOnce(100n);
+      publicClient.getBalance = vi.fn().mockRejectedValue(new Error("rpc down"));
+      const logger = makeLogger();
+      const consumer = new Consumer({
+        network: "testnet",
+        publicClient,
+        walletClient,
+        observer,
+        apiUrl: API_URL,
+        logger,
+      });
+
+      await expect(
+        consumer.read({
+          uuid: 1,
+          accessAuxData: "0x",
+          requesterPubKey: "0x04" as `0x${string}`,
+        }),
+      ).rejects.toThrow("rpc down");
+
+      const events = logger.calls.map(([, msg]) => msg);
+      expect(events).toContain("read.preflight.failed");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // InvalidPartialError surfaces to onInvalidPartial (#56 2.2)
+  // -------------------------------------------------------------------------
+  describe("onInvalidPartial receives typed InvalidPartialError", () => {
+    it("reports rejected partials with .code === 'INVALID_PARTIAL'", async () => {
+      const VAULT_CIPHERTEXT = new Uint8Array([0xc1, 0xc2]);
+      const observer = makeFakeObserver({ threshold: 2 });
+      const { consumer } = makeConsumer(observer, {
+        vaultEncryptedData: toHex(VAULT_CIPHERTEXT),
+      });
+
+      // VALIDATOR_A's attestation passes; VALIDATOR_B's fails. We use a
+      // 3-of-3 group so the trust set has to filter B out before the
+      // bucket can clear threshold.
+      vi.mocked(verifyAttestation).mockImplementation(async (report: Uint8Array) => {
+        const isA = report[0] === 0xaa;
+        return { valid: isA };
+      });
+
+      vi.mocked(observer.getValidatorAttestations).mockResolvedValue(
+        new Map<string, Uint8Array>([
+          [VALIDATOR_A, new Uint8Array([0xaa])],
+          [VALIDATOR_B, new Uint8Array([0xbb])],
+          [VALIDATOR_C, new Uint8Array([0xaa])],
+        ]),
+      );
+
+      vi.mocked(queryCDRPartials).mockResolvedValueOnce([
+        makeGroup({
+          round: 4,
+          ciphertext: VAULT_CIPHERTEXT,
+          submissions: [
+            makeSubmission({ validator: VALIDATOR_A, pid: 1, ciphertext: VAULT_CIPHERTEXT }),
+            makeSubmission({ validator: VALIDATOR_B, pid: 2, ciphertext: VAULT_CIPHERTEXT }),
+            makeSubmission({ validator: VALIDATOR_C, pid: 3, ciphertext: VAULT_CIPHERTEXT }),
+          ],
+          thresholdMet: true,
+        }),
+      ]);
+
+      const reported: Error[] = [];
+      const result = await consumer.collectPartials({
+        uuid: 7,
+        requesterPubKey: "0x04ab" as `0x${string}`,
+        timeoutMs: 200,
+        pollIntervalMs: 5,
+        attestationConfig: { minSecurityVersion: 1 },
+        onInvalidPartial: (_event, _reason, err) => err && reported.push(err),
+      });
+
+      expect(result).toHaveLength(2);
+      expect(reported).toHaveLength(1);
+      const err = reported[0] as InvalidPartialError;
+      expect(err).toBeInstanceOf(InvalidPartialError);
+      expect(err.code).toBe("INVALID_PARTIAL");
+      expect(err.validator).toBe(VALIDATOR_B);
+      expect(err.pid).toBe(2);
+      expect(err.reason).toBe("attestation rejected");
     });
   });
 });

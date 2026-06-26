@@ -1,4 +1,6 @@
 export * from "./client.js";
+export * from "./client-types.js";
+export * from "./logger.js";
 export * from "./uploader.js";
 export * from "./consumer.js";
 export * from "./observer.js";
