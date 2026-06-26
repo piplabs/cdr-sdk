@@ -233,6 +233,8 @@ export class Uploader {
     allocateFeeOverride?: bigint;
     /** See {@link write}'s `feeOverride` — same strict-equality semantics. */
     writeFeeOverride?: bigint;
+    /** Skip condition contract interface validation (default: false). */
+    skipConditionValidation?: boolean;
   }): Promise<{
     uuid: number;
     ciphertext: TDH2Ciphertext;
@@ -246,6 +248,7 @@ export class Uploader {
       writeConditionData: params.writeConditionData,
       readConditionData: params.readConditionData,
       feeOverride: params.allocateFeeOverride,
+      skipConditionValidation: params.skipConditionValidation,
     });
 
     // Step 2: Encrypt using UUID-derived label (matches validator's uuidToLabel)
@@ -305,6 +308,8 @@ export class Uploader {
     allocateFeeOverride?: bigint;
     /** See {@link write}'s `feeOverride` — same strict-equality semantics. */
     writeFeeOverride?: bigint;
+    /** Skip condition contract interface validation (default: false). */
+    skipConditionValidation?: boolean;
   }): Promise<{
     uuid: number;
     cid: string;
@@ -331,6 +336,7 @@ export class Uploader {
       writeConditionData: params.writeConditionData,
       readConditionData: params.readConditionData,
       feeOverride: params.allocateFeeOverride,
+      skipConditionValidation: params.skipConditionValidation,
     });
 
     // Step 5: TDH2-encrypt the payload with UUID-derived label
