@@ -181,7 +181,7 @@ describe("Uploader", () => {
       }),
     ).rejects.toThrow(InvalidConditionContractError);
 
-    expect(walletClient.writeContract).not.toHaveBeenCalled();
+    expect(walletClient.sendRawTransaction).not.toHaveBeenCalled();
   });
 
   it("allocate rejects condition revert whose cause has no raw field (#95)", async () => {
@@ -209,7 +209,7 @@ describe("Uploader", () => {
       code: "INVALID_CONDITION_CONTRACT",
       reason: "selector-miss",
     });
-    expect(walletClient.writeContract).not.toHaveBeenCalled();
+    expect(walletClient.sendRawTransaction).not.toHaveBeenCalled();
   });
 
   it("allocate rejects when condition call surfaces ContractFunctionZeroDataError (EOA / no code)", async () => {
@@ -237,7 +237,7 @@ describe("Uploader", () => {
       code: "INVALID_CONDITION_CONTRACT",
       reason: "selector-miss",
     });
-    expect(walletClient.writeContract).not.toHaveBeenCalled();
+    expect(walletClient.sendRawTransaction).not.toHaveBeenCalled();
   });
 
   it("allocate accepts when condition function body reverts with non-empty data", async () => {
@@ -260,7 +260,7 @@ describe("Uploader", () => {
         ),
     );
     publicClient.readContract.mockResolvedValueOnce(1000n);
-    walletClient.writeContract.mockResolvedValueOnce("0xtxhash" as `0x${string}`);
+    walletClient.sendRawTransaction.mockResolvedValueOnce("0xtxhash" as `0x${string}`);
     publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
       logs: [makeVaultAllocatedLog(99)],
     });
@@ -313,7 +313,7 @@ describe("Uploader", () => {
       reason: "ambiguous-fallback",
     });
 
-    expect(walletClient.writeContract).not.toHaveBeenCalled();
+    expect(walletClient.sendRawTransaction).not.toHaveBeenCalled();
   });
 
   it("allocate rejects when sentinel probe returns OK (swallow-all fallback)", async () => {
@@ -350,7 +350,7 @@ describe("Uploader", () => {
       code: "INVALID_CONDITION_CONTRACT",
       reason: "ambiguous-fallback",
     });
-    expect(walletClient.writeContract).not.toHaveBeenCalled();
+    expect(walletClient.sendRawTransaction).not.toHaveBeenCalled();
   });
 
   it("allocate rejects when the real selector itself returns OK via a swallow-all fallback", async () => {
@@ -376,7 +376,7 @@ describe("Uploader", () => {
       code: "INVALID_CONDITION_CONTRACT",
       reason: "ambiguous-fallback",
     });
-    expect(walletClient.writeContract).not.toHaveBeenCalled();
+    expect(walletClient.sendRawTransaction).not.toHaveBeenCalled();
   });
 
   it("allocate surfaces a transport error from the sentinel probe instead of masking it as ambiguous", async () => {
@@ -404,7 +404,7 @@ describe("Uploader", () => {
         readConditionData: "0x",
       }),
     ).rejects.toThrow("HTTP request failed");
-    expect(walletClient.writeContract).not.toHaveBeenCalled();
+    expect(walletClient.sendRawTransaction).not.toHaveBeenCalled();
   });
 
   it("allocate surfaces a transport error from the real probe instead of masking it as invalid", async () => {
@@ -427,13 +427,13 @@ describe("Uploader", () => {
         readConditionData: "0x",
       }),
     ).rejects.toThrow("RPC timeout");
-    expect(walletClient.writeContract).not.toHaveBeenCalled();
+    expect(walletClient.sendRawTransaction).not.toHaveBeenCalled();
   });
 
   it("allocate preflight probes condition contracts with the 4-arg signature", async () => {
     const { publicClient, walletClient } = mockClients();
     publicClient.readContract.mockResolvedValueOnce(1000n);
-    walletClient.writeContract.mockResolvedValueOnce("0xtxhash" as `0x${string}`);
+    walletClient.sendRawTransaction.mockResolvedValueOnce("0xtxhash" as `0x${string}`);
     publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
       logs: [makeVaultAllocatedLog(1)],
     });
