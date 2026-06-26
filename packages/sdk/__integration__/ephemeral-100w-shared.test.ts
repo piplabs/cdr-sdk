@@ -43,7 +43,6 @@ import {
   createPublicClient,
   createWalletClient,
   http,
-  parseEther,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { CDRClient, initWasm } from "../src/index.js";
@@ -54,10 +53,20 @@ import {
   generateEphemeralWallets,
   refundWallets,
 } from "./_ephemeral-wallets.js";
-import { formatMs, logCase, mean, p50, p95, statsOf, writePerfStats } from "./_helpers.js";
+import {
+  formatMs,
+  logCase,
+  mean,
+  OPEN_CONDITION_BYTECODE,
+  p50,
+  p95,
+  sizeFundAndReport,
+  statsOf,
+  writePerfStats,
+} from "./_helpers.js";
 
 const WALLET_COUNT = 100;
-const PER_WALLET_FUND = parseEther("0.05");
+const CYCLES_PER_WALLET = 1; // 1 accessCDR per wallet, no upload
 const ACCESS_TIMEOUT_MS = 180_000;
 
 const API_URL = process.env.CDR_API_URL;
@@ -118,12 +127,10 @@ async function deployOpenCondition(
   publicClient: PublicClient,
   walletClient: WalletClient,
 ): Promise<`0x${string}`> {
-  const bytecode =
-    "0x600a600c600039600a6000f3600160005260206000f3" as `0x${string}`;
   const tx = await walletClient.sendTransaction({
     chain: walletClient.chain ?? null,
     account: walletClient.account ?? null,
-    data: bytecode,
+    data: OPEN_CONDITION_BYTECODE,
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash: tx });
   if (!receipt.contractAddress) {
@@ -143,6 +150,7 @@ describe.skipIf(skipUnlessSuite("default"))(
     let sharedVaultUuid: number;
     let sharedDataKey: Uint8Array;
     let wallets: EphemeralWallet[];
+    let perWalletFund = 0n;
     let totalFundedWei = 0n;
     // Captured by `it`, written to /tmp/perf-stats-100w-shared.json by
     // `afterAll` (so the workflow can render a perf table). null until
@@ -154,6 +162,7 @@ describe.skipIf(skipUnlessSuite("default"))(
       failed: number;
       wallClockMs: number;
       accessLats: number[];
+      failedReasons: Array<{ idx: number; reason: string }>;
     } | null = null;
 
     beforeAll(async () => {
@@ -163,6 +172,16 @@ describe.skipIf(skipUnlessSuite("default"))(
       funderWallet = f.walletClient;
       funderClient = f.client;
       funderAddress = privateKeyToAccount(FUNDER_KEY!).address;
+
+      // Flat per-wallet fund = 1 IP + 3 × (writeFee + allocateFee + readFee).
+      // Read-only suite over-funds by writeFee+allocateFee × 3 at current
+      // chain fees, which is fine — 1 IP base dominates anyway, and the
+      // uniform formula keeps the test surface predictable.
+      perWalletFund = await sizeFundAndReport({
+        label: "100w-shared",
+        network: NETWORK,
+        publicClient: funderPublic,
+      });
 
       openCondition = await deployOpenCondition(funderPublic, funderWallet);
       logCase("openCondition", openCondition);
@@ -187,13 +206,13 @@ describe.skipIf(skipUnlessSuite("default"))(
         funderPublic,
         funderWallet,
         wallets,
-        PER_WALLET_FUND,
+        perWalletFund,
       );
       totalFundedWei = fund.totalFundedWei;
       logCase("multicall3 batch fund", {
         multicall3: fund.multicall3Address,
         wallets: wallets.length,
-        perWallet: PER_WALLET_FUND.toString(),
+        perWallet: perWalletFund.toString(),
         totalWei: fund.totalFundedWei.toString(),
         txHash: fund.txHash,
       });
@@ -221,6 +240,8 @@ describe.skipIf(skipUnlessSuite("default"))(
           wall_clock_ms: perfBuffer.wallClockMs,
           accessMs: statsOf(perfBuffer.accessLats),
           uploadMs: null,
+          accessSharedMs: null,
+          accessFreshMs: null,
           tickMs: null,
           refund: {
             funded_wei: totalFundedWei.toString(),
@@ -229,6 +250,7 @@ describe.skipIf(skipUnlessSuite("default"))(
             failed_sweeps: refund.failedRefunds,
           },
           extra: null,
+          failedReasons: perfBuffer.failedReasons,
         });
       }
     }, 5 * 60 * 1000);
@@ -287,6 +309,7 @@ describe.skipIf(skipUnlessSuite("default"))(
           failed: failed.length,
           wallClockMs: totalMs,
           accessLats: lats,
+          failedReasons: failed.slice(0, 10),
         };
 
         expect(failed.length, `${failed.length} wallets failed accessCDR`).toBe(0);

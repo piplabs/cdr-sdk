@@ -114,6 +114,23 @@ describe("errors", () => {
       expect(err.message).toContain("read");
       expect(err.message).toContain(addr);
     });
+
+    it("exposes reason field, defaulting to selector-miss", () => {
+      const addr = "0x1234567890abcdef1234567890abcdef12345678";
+      const defaultErr = new InvalidConditionContractError(addr, "write");
+      expect(defaultErr.reason).toBe("selector-miss");
+
+      const ambiguousErr = new InvalidConditionContractError(
+        addr,
+        "read",
+        "ambiguous-fallback",
+      );
+      expect(ambiguousErr.reason).toBe("ambiguous-fallback");
+      // Message routes users to the escape hatch so they can self-diagnose
+      // the false-negative branch (Diamond proxies, deliberate payload-
+      // reverting fallbacks) without having to read the SDK source.
+      expect(ambiguousErr.message).toContain("skipConditionValidation");
+    });
   });
 
   describe("LabelMismatchError", () => {

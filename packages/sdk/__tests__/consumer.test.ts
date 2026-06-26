@@ -43,6 +43,8 @@ import {
 import { toHex } from "viem";
 import type { Observer } from "../src/observer.js";
 import type { DKGPartialDecryptionSubmission } from "../src/story-api/types.js";
+import { cdrAbi } from "@piplabs/cdr-contracts";
+import { makeWalletMock, decodeWriteCalls } from "./_write-contract-mock.js";
 
 const API_URL = "http://test:1317";
 const VALIDATOR_A = "0x0000000000000000000000000000000000000001" as const;
@@ -149,10 +151,11 @@ function mockClients(opts: { vaultEncryptedData?: `0x${string}` } = {}) {
     simulateContract: vi.fn().mockResolvedValue({ result: undefined }),
   };
   const walletClient = {
-    writeContract: vi.fn().mockResolvedValue("0xtxhash" as `0x${string}`),
-    account: { address: "0xfeed" },
+    ...makeWalletMock(),
+    account: { address: "0xfeed", type: "local" },
     chain: { id: 1 },
   };
+  walletClient.sendRawTransaction.mockResolvedValue("0xtxhash" as `0x${string}`);
   return { publicClient: publicClient as any, walletClient: walletClient as any };
 }
 
@@ -204,13 +207,12 @@ describe("Consumer", () => {
       expect(publicClient.readContract).toHaveBeenCalledWith(
         expect.objectContaining({ functionName: "readFee" }),
       );
-      expect(walletClient.writeContract).toHaveBeenCalledWith(
-        expect.objectContaining({
-          functionName: "read",
-          args: [42, "0x", "0x04abcd"],
-          value: 5n,
-        }),
-      );
+      const [call] = decodeWriteCalls(walletClient, cdrAbi);
+      expect(call).toMatchObject({
+        functionName: "read",
+        args: [42, "0x", "0x04abcd"],
+        value: 5n,
+      });
       expect(result.txHash).toBe("0xtxhash");
     });
 
@@ -223,9 +225,8 @@ describe("Consumer", () => {
         feeOverride: 99n,
       });
       expect(publicClient.readContract).not.toHaveBeenCalled();
-      expect(walletClient.writeContract).toHaveBeenCalledWith(
-        expect.objectContaining({ value: 99n }),
-      );
+      const [call] = decodeWriteCalls(walletClient, cdrAbi);
+      expect(call.value).toBe(99n);
     });
 
     it("read awaits the tx receipt with the submitted tx hash", async () => {
@@ -911,7 +912,7 @@ describe("Consumer", () => {
       // Critical regression assertion: the preflight must run BEFORE any
       // fee-bearing read tx is submitted. If `read()` is called before the
       // empty check, the user pays for a request that can never succeed.
-      expect(walletClient.writeContract).not.toHaveBeenCalled();
+      expect(walletClient.sendRawTransaction).not.toHaveBeenCalled();
       // Also: the partial poll must never start.
       expect(queryCDRPartials).not.toHaveBeenCalled();
     });

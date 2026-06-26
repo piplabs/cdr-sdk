@@ -28,6 +28,20 @@ on:
           - 1000-wallet-performance-devnet-only
           - 1H-stress-devnet-only
         default: default
+  # Reusable-workflow entrypoint for cdr-monitor-per-round.yml. Strings (not
+  # `choice`) because `workflow_call` doesn't support choice — callers MUST
+  # pass values from the same set as workflow_dispatch's options or the
+  # downstream `case "$SUITE"` in `prepare` will exit 1. The caller reads
+  # this workflow's outcome via `needs.<job>.result` (automatic), so no
+  # explicit `outputs:` block is needed here.
+  workflow_call:
+    inputs:
+      network:
+        type: string
+        required: true
+      test_suite:
+        type: string
+        required: true
   pull_request:
     branches: [main]
     paths:
@@ -61,7 +75,21 @@ jobs:
       - id: resolve
         name: Resolve effective inputs
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          # Key off the presence of `inputs.network`, NOT `github.event_name`.
+          #
+          # In a reusable workflow `github.event_name` reflects the CALLER's
+          # top-level trigger, not "workflow_call". cdr-monitor-per-round.yml
+          # is `schedule`-triggered, so when it invokes this workflow via
+          # `workflow_call` the event_name here is "schedule" — the old
+          # `event_name == workflow_call` check never matched and silently
+          # fell through to the devnet default, running the aeneid monitor's
+          # suite against devnet (run 26495210233: monitor fired on aeneid
+          # round 12→13 but tested devnet).
+          #
+          # `inputs.network` is populated for BOTH workflow_dispatch (has a
+          # `default`) and workflow_call (`required: true`), and is empty for
+          # pull_request (no inputs). So presence is the reliable signal.
+          if [ -n "${{ inputs.network }}" ]; then
             NETWORK="${{ inputs.network }}"
             SUITE="${{ inputs.test_suite }}"
           else
@@ -443,17 +471,72 @@ jobs:
           }
 
           # ─── Aggregate failures across ALL JSON files (top-of-summary block) ──
+          # Cross-references vitest's assertion failures with the matching
+          # /tmp/perf-stats-{label}.json so an ephemeral-suite failure prints
+          # the per-wallet failure reasons inline (e.g. "99/100 succeeded,
+          # 1 failed: receipt-not-found on tx 0x914c... mined in block
+          # 0x11d2547" from run 26379164817; or the 2-row dual-cause
+          # break-down rendered for run 26380050980 wallets idx=31/36)
+          # rather than only the cryptic `AssertionError: 1 wallets
+          # failed: expected 1 to be +0` + vitest stack a reviewer has
+          # to click into the run log to decipher. Mapping: strip the
+          # `ephemeral-` prefix and `.test.ts` suffix from the test file
+          # basename to derive the perf-stats label. Falls back gracefully
+          # to vitest-stack-only when the perf-stats file is missing or
+          # unreadable (also see the `|| echo "{}"` JSON guard).
           aggregate_failures() {
+            # Build a {label -> perf-stats} map once so the inner jq can
+            # look up the matching per-wallet failure rows for each
+            # assertion failure. Defensive: `jq -s` over multiple files
+            # exits non-zero on the FIRST malformed input, which would
+            # silently drop the entire enriched-failure block — even the
+            # downstream `--argjson perf "$perf_json"` call would fail
+            # to parse, falling back to vitest-stack-only for ALL suites
+            # (not just the one with bad output). Iterate per file so
+            # one truncated / unparseable JSON only loses ITS own
+            # enrichment; the other suites still render the per-wallet
+            # failure tables.
+            shopt -s nullglob
+            local perf_files=(/tmp/perf-stats-*.json)
+            shopt -u nullglob
+            local perf_json="{}"
+            for f in "${perf_files[@]}"; do
+              # `-e` exits non-zero on `select(...)` filtering everything
+              # out (no `.label`), and on outright parse failures.
+              local entry
+              entry=$(jq -ec 'select(type == "object" and (.label | type) == "string")' "$f" 2>/dev/null) || continue
+              perf_json=$(jq -n --argjson acc "$perf_json" --argjson item "$entry" '$acc + {($item.label): $item}')
+            done
+
             for json in /tmp/results-sdk.json /tmp/results-cli.json /tmp/results-examples.json /tmp/results-stress.json; do
               [ -f "$json" ] || continue
-              jq -r --arg scope "$(basename "$json" .json | sed 's/^results-//')" '
+              jq -r \
+                --arg scope "$(basename "$json" .json | sed 's/^results-//')" \
+                --argjson perf "$perf_json" '
+                def truncReason:
+                  gsub("\n"; " ")
+                  | gsub("\\|"; "\\|")
+                  | (if (. | length) > 200 then .[:200] + " …" else . end);
                 .testResults[] as $f
                 | ($f.name | split("/") | last) as $file
+                | ($file | sub("\\.test\\.ts$"; "") | sub("^ephemeral-"; "")) as $label
                 | $f.assertionResults[]
                 | select(.status == "failed")
-                | "**❌ [" + $scope + "] `" + $file + "` → " + .title + "**\n\n```\n"
+                | (($perf[$label]) // null) as $p
+                | "### ❌ [" + $scope + "] `" + $file + "` → " + .title + "\n"
+                  + (if $p != null and $p.failedReasons != null and ($p.failedReasons | length) > 0
+                     then "\n**" + ($p.fulfilled | tostring) + "/"
+                            + (($p.fulfilled + $p.failed) | tostring)
+                            + " wallets succeeded, " + ($p.failed | tostring) + " failed.**\n\n"
+                          + "| idx | failure reason (truncated to 200 chars) |\n"
+                          + "|---|---|\n"
+                          + ($p.failedReasons | map("| " + (.idx | tostring) + " | " + (.reason | truncReason) + " |") | join("\n"))
+                          + "\n"
+                     else "" end)
+                  + "\n<details><summary>Raw assertion / vitest stack</summary>\n\n"
+                  + "```\n"
                   + ((.failureMessages // [])[0] // "(no failureMessage)")
-                  + "\n```\n"
+                  + "\n```\n\n</details>\n"
               ' "$json"
             done
           }
@@ -559,6 +642,67 @@ jobs:
             done
           }
 
+          # ─── Fee table: glob /tmp/fee-stats-*.json ────────────────────────────
+          # Each ephemeral suite queries baseFee / writeFee / readFee /
+          # allocateFee off the live CDR contract + live gas price at setup
+          # time and writes them to /tmp/fee-stats-{label}.json alongside
+          # the computed per-wallet fund. We render that here so any
+          # "100 wallets failed with insufficient funds" failure mode is one
+          # table-row away from being diagnosed — you can see at a glance
+          # whether the chain raised a fee or a gas spike pushed gas budget
+          # past the funded buffer.
+          #
+          # Per-wallet fund formula (all suites): 1 IP base + 3 × (writeFee +
+          # allocateFee + readFee). baseFee is validator-paid (not in the
+          # funding sum) but is shown for ops visibility — baseFee=0 silently
+          # disables CDR partials in the chain's evmengine handler.
+          render_fee_table() {
+            shopt -s nullglob
+            local files=(/tmp/fee-stats-*.json)
+            shopt -u nullglob
+            [ "${#files[@]}" -gt 0 ] || { echo "_(no fee-stats output produced — no ephemeral suite ran)_"; echo ""; return; }
+            echo "**One row per ephemeral suite.** Fees + gas price queried live off the chain at suite setup."
+            echo ""
+            echo "Formula-funded suites: \`per-wallet fund = base_gas_budget + safety_multiplier × (writeFee + allocateFee + readFee)\`."
+            echo "Override-funded suites (e.g. 60-min stress): per-wallet fund is a caller-set flat value; \`Safety×\` + \`Base gas budget\` show \`—\`."
+            echo "\`baseFee\` is validator-paid (not in funding) — shown for visibility."
+            echo ""
+            echo "| Suite | Source | baseFee (validator) | writeFee | allocateFee | readFee | Gas price | User per-cycle fee | Safety× | + Base gas budget | Per-wallet fund |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|"
+            for f in "${files[@]}"; do
+              jq -r '
+                def fmtIp:
+                  ((. | tonumber) / 1e18) as $ip |
+                  ($ip * 10000 | floor) as $n |
+                  ($n / 10000 | floor | tostring) as $whole |
+                  ($n % 10000 | tostring) as $fracraw |
+                  ("0000" + $fracraw)[-4:] as $frac |
+                  $whole + "." + $frac + " IP";
+                def fmtGwei:
+                  ((. | tonumber) / 1e9) as $g |
+                  ($g * 100 | floor) as $n |
+                  ($n / 100 | floor | tostring) as $whole |
+                  ($n % 100 | tostring) as $fracraw |
+                  ("00" + $fracraw)[-2:] as $frac |
+                  $whole + "." + $frac + " gwei";
+                (.fund_source // "formula") as $src |
+                "| " + .label
+                + " | " + $src
+                + " | " + (.base_fee_wei            | fmtIp)
+                + " | " + (.write_fee_wei           | fmtIp)
+                + " | " + (.allocate_fee_wei        | fmtIp)
+                + " | " + (.read_fee_wei            | fmtIp)
+                + " | " + (.gas_price_wei           | fmtGwei)
+                + " | " + (.user_per_cycle_fee_wei  | fmtIp)
+                + " | " + (if $src == "override" then "—" else "× " + (.safety_multiplier | tostring) end)
+                + " | " + (if $src == "override" then "—" else (.base_gas_budget_wei | fmtIp) end)
+                + " | " + (.per_wallet_fund_wei    | fmtIp)
+                + " |"
+              ' "$f"
+            done
+            echo ""
+          }
+
           # ─── Now write everything to GITHUB_STEP_SUMMARY in the new order ─────
           {
             echo "## ${HEADLINE_EMOJI} Overall — ${TOTAL_PASSED} passed | ${TOTAL_FAILED} failed | ${TOTAL_SKIPPED} skipped — wall ${ELAPSED_S}s"
@@ -598,6 +742,10 @@ jobs:
             echo ""
             echo "_DKG stage codes: 1 = Registration, 2 = Dealing, 3 = Finalization, 4 = Active._"
             echo ""
+
+            echo "### Live CDR fees + ephemeral fund sizing"
+            echo ""
+            render_fee_table
 
             echo "### Performance metrics"
             echo ""
