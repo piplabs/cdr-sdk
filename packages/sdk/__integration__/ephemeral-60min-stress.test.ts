@@ -84,11 +84,33 @@ import {
   generateEphemeralWallets,
   refundWallets,
 } from "./_ephemeral-wallets.js";
-import { statsOf, writePerfStats } from "./_helpers.js";
+import {
+  OPEN_CONDITION_BYTECODE,
+  sizeFundAndReport,
+  statsOf,
+  writePerfStats,
+} from "./_helpers.js";
 
 const DURATION_MS = 60 * 60 * 1000; // 1 hour
 const CONCURRENCY = 10;
-const PER_WALLET_FUND = parseEther("1000");
+// Documentary constant — real run on devnet does ~120-200 cycles in 1 hour.
+const ESTIMATED_CYCLES_PER_WALLET = 1000;
+// Fixed per-wallet fund for the 1-hour stress run on devnet. Each cycle
+// pays `writeFee + allocateFee + 2 × readFee` (upload + 2 × accessCDR),
+// so at ~150 cycles × 0.04 IP/cycle (devnet) + gas overhead we need
+// ~7-10 IP per wallet. 100 IP gives ~10× safety on devnet (anvil-0
+// funder has effectively unlimited IP, and `refundWallets` sweeps any
+// unused balance back at teardown — over-funding is cheap, exhausting
+// mid-run is not). Stress is `skipUnlessDevnet`-gated, so aeneid /
+// mainnet never hit this code path.
+//
+// History: PR #109 inlined this into the dynamic-fee formula with
+// `cyclesPerWallet=1000` + `safetyMultiplier=3`, producing ~155 IP/wallet
+// on devnet. PR #113 flattened that formula but accidentally dropped the
+// cycle-count factor — the resulting ~1.09 IP/wallet exhausted after
+// ~25 cycles. Reverted to a fixed value here, queried-fee path lives in
+// `sizeFundAndReport`'s formula branch and is reserved for short suites.
+const STRESS_PER_WALLET_FUND = parseEther("100");
 // Generous reserve absorbs any pending-tx mempool cost when refund runs
 // right after the last cycle. Loses ~10 IP across 10 wallets — DevNet
 // anvil-0 has unlimited dev IP, so trading a little waste for refund
@@ -160,12 +182,10 @@ async function deployOpenCondition(
   publicClient: PublicClient,
   walletClient: WalletClient,
 ): Promise<`0x${string}`> {
-  const bytecode =
-    "0x600a600c600039600a6000f3600160005260206000f3" as `0x${string}`;
   const tx = await walletClient.sendTransaction({
     chain: walletClient.chain ?? null,
     account: walletClient.account ?? null,
-    data: bytecode,
+    data: OPEN_CONDITION_BYTECODE,
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash: tx });
   if (!receipt.contractAddress) {
@@ -206,6 +226,7 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
     let sharedVaultUuid: number;
     let sharedDataKey: Uint8Array;
     let stressWallets: StressWallet[] = [];
+    let perWalletFund = 0n;
     let totalFundedWei = 0n;
     // Populated by `it`, consumed by `afterAll` to emit the perf-stats
     // JSON. `null` until the workload completes; afterAll skips the write
@@ -232,6 +253,19 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
       funderClient = f.client;
       funderAddress = privateKeyToAccount(FUNDER_KEY!).address;
 
+      // Stress uses a fixed override (100 IP/wallet) — the flat formula
+      // branch is for short suites and can't cover ~150 cycles' worth
+      // of fees over 1h. We still call `sizeFundAndReport` (not a bespoke
+      // path) so the workflow summary table has a row with live fees +
+      // gas price for this suite, same shape as every other suite. See
+      // STRESS_PER_WALLET_FUND comment above for the sizing rationale.
+      perWalletFund = await sizeFundAndReport({
+        label: "60min-stress",
+        network: NETWORK,
+        publicClient: funderPublic,
+        overrideFundWei: STRESS_PER_WALLET_FUND,
+      });
+
       openCondition = await deployOpenCondition(funderPublic, funderWallet);
       logLine(`[suite-setup] openCondition deployed at ${openCondition}`);
 
@@ -257,13 +291,13 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
         funderPublic,
         funderWallet,
         ephs,
-        PER_WALLET_FUND,
+        perWalletFund,
       );
       totalFundedWei = fund.totalFundedWei;
       stressWallets = ephs.map(makeStressWallet);
       logLine(
         `[suite-setup] funded ${stressWallets.length} wallets via Multicall3 ` +
-          `${fund.multicall3Address} (tx ${fund.txHash}); ${formatEther(PER_WALLET_FUND)} IP each`,
+          `${fund.multicall3Address} (tx ${fund.txHash}); ${formatEther(perWalletFund)} IP each`,
       );
     }, 10 * 60 * 1000);
 
@@ -340,6 +374,9 @@ describe.skipIf(skipUnlessSuite("1H-stress-devnet-only") || skipUnlessDevnet())(
               100
             ).toFixed(2),
           },
+          // Stress reports failures per-cycle in `extra.failed_cycles`,
+          // not per-wallet; there's no per-failure reason to surface.
+          failedReasons: null,
         });
       }
     }, 10 * 60 * 1000);

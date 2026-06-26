@@ -5,9 +5,24 @@
  * **Scope of use**: ONLY the `*-aeneid.test.ts` files. The DevNet-targeted
  * suites import `http` directly from viem and run at full concurrency —
  * adding retry / throttling there would mask real validator-side issues.
+ *
+ * Helpers are ordered along the chain of resilience layers a public-RPC
+ * test composes from the outside in:
+ *
+ *   1. `resilientHttp`         — viem transport with bumped HTTP retry budget
+ *   2. `pLimit`                — caps concurrent in-flight RPC calls
+ *   3. `waitForReceiptResilient` — bumps viem's per-call receipt timeout
+ *   4. `withAeneidFlakeRetry`  — retries a whole upload→access cycle on the
+ *                                 two known public-pool consistency bugs
  */
 
-import { http } from "viem";
+import {
+  http,
+  TransactionReceiptNotFoundError,
+  WaitForTransactionReceiptTimeoutError,
+  type Hash,
+  type PublicClient,
+} from "viem";
 
 /**
  * `http()` with retry budget tuned for public-RPC throttling.
@@ -73,4 +88,124 @@ export function pLimit(maxConcurrency: number) {
       if (next) next();
     }
   };
+}
+
+/**
+ * `publicClient.waitForTransactionReceipt` hardened for public-RPC endpoints
+ * whose `eth_getTransactionReceipt` lags block production by tens of seconds.
+ *
+ * viem's `timeout` / `retryCount` do NOT cover the case where the tx is
+ * observed in a block but the receipt is momentarily null on the pool node
+ * serving that call — viem throws `TransactionReceiptNotFoundError` straight
+ * out of its block-watcher callback (e.g. cdr-sdk run 26379164817 wallet
+ * idx=29 allocate 0x914c3c... block 0x11d2547 status=1; run 26501253421
+ * uploadCDR write 0x8d1ae... block 0x11eb8d2 status=1 — both threw despite
+ * landing). So we re-poll the whole wait on that error (and on the overall
+ * timeout), bounded by a 5 min deadline. A reverted tx returns a
+ * `status: "reverted"` receipt rather than throwing, so this never masks a
+ * real revert.
+ *
+ * Mirrors the SDK-internal helper in `packages/sdk/src/uploader.ts`; the
+ * duplication is intentional — the SDK shouldn't take a dependency on
+ * test-only files.
+ */
+export async function waitForReceiptResilient(
+  publicClient: PublicClient,
+  hash: Hash,
+) {
+  const deadlineMs = Date.now() + 5 * 60 * 1000;
+  let lastError: unknown;
+  while (Date.now() < deadlineMs) {
+    try {
+      return await publicClient.waitForTransactionReceipt({
+        hash,
+        timeout: 30_000,
+        pollingInterval: 2000,
+        retryCount: 10,
+      });
+    } catch (err) {
+      if (
+        !(err instanceof TransactionReceiptNotFoundError) &&
+        !(err instanceof WaitForTransactionReceiptTimeoutError)
+      ) {
+        throw err;
+      }
+      lastError = err;
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  }
+  // The loop always runs at least once (deadlineMs is now + 5 min), so
+  // lastError is always set here — the fallback is for the type-checker and
+  // to avoid a stackless `throw undefined` if the deadline logic ever changes.
+  throw lastError ?? new Error("waitForReceiptResilient: receipt wait deadline exceeded");
+}
+
+/**
+ * Retries `fn` on the two known aeneid public-RPC pool consistency bugs
+ * (both observed in cdr-sdk run 26380050980 on the same `default` suite
+ * within the same minute — neither is an SDK or contract bug):
+ *
+ *   1. **receipt-not-found** — `eth_getTransactionReceipt` is served by a
+ *      pool node that lags the one which served `eth_sendRawTransaction`.
+ *      Viem throws `TransactionReceiptNotFoundError` /
+ *      `WaitForTransactionReceiptTimeoutError` even though the tx is
+ *      mined. Empirical case: wallet idx=31, tx 0x13cdcd... actually
+ *      committed in block 0x11d2980 status=1 but the receipt-pool node
+ *      still returned null after viem's 5 min timeout window. Sleep then
+ *      re-poll — the lagging node usually catches up.
+ *   2. **write-state-race** — an SDK `uploadCDR` allocate→write sequence
+ *      gets its `write()` simulation served by a node that hasn't yet
+ *      applied the allocate's state, so the contract's
+ *      `require(writeConditionAddr != address(0))` reverts with `CDR:
+ *      Write condition address not set` even though chain state *does*
+ *      have the address set. Empirical case: wallet idx=36 allocated
+ *      uuid=2655 with writeConditionAddr=0xa3a45... (confirmed by
+ *      post-run eth_call) but its write() simulate hit a stale node
+ *      seeing vaults[2655]=zero. Retrying the whole cycle re-runs
+ *      allocate against a (different / caught-up) pool node and the
+ *      write simulation passes.
+ *
+ * Both rethrow unrelated errors immediately so genuine bugs still fail
+ * the test on the first attempt. Default budget: 3 attempts, 5s between.
+ * For an idempotent upload→access cycle the retry burns at most ~2× the
+ * cycle fee (typically ~0.24 IP / cycle on aeneid), well under the
+ * `safetyMultiplier: 3` headroom in `_helpers.computePerWalletFund`.
+ */
+export async function withAeneidFlakeRetry<T>(
+  fn: () => Promise<T>,
+  opts?: { attempts?: number; delayMs?: number },
+): Promise<T> {
+  const attempts = opts?.attempts ?? 3;
+  const delayMs = opts?.delayMs ?? 5000;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (!isAeneidPoolFlake(err)) throw err;
+      if (attempt + 1 < attempts) {
+        await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+  throw lastError;
+}
+
+function isAeneidPoolFlake(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  // Viem tags receipt-related errors via `.name` even when wrapped.
+  if (
+    err.name === "TransactionReceiptNotFoundError" ||
+    err.name === "WaitForTransactionReceiptTimeoutError"
+  ) {
+    return true;
+  }
+  // Contract reverts from CDR.sol when a stale read pool serves the
+  // simulation before the preceding tx propagated.
+  const msg = err.message;
+  return (
+    msg.includes("CDR: Write condition address not set") ||
+    msg.includes("CDR: Read condition address not set")
+  );
 }

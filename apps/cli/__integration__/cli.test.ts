@@ -13,7 +13,7 @@
  * Cost model: 1 open-condition deploy in beforeAll + 1 uploadCDR + 1
  * accessCDR end-to-end → ~0.06 IP per run on DevNet.
  *
- * Test harness: `tsc → dist/index.js`, then each case spawns the binary
+ * Test harness: `tshy → dist/esm/index.js`, then each case spawns the binary
  * via `execaNode` with an explicitly controlled env (no inheritance) to
  * isolate flag-vs-env precedence behavior.
  */
@@ -51,7 +51,8 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CLI_PATH = path.resolve(__dirname, "../dist/index.js");
+// Matches `bin.cdr-cli` in package.json — the same entry consumers invoke.
+const CLI_PATH = path.resolve(__dirname, "../dist/esm/index.js");
 
 const API_URL = process.env.CDR_API_URL;
 const RPC_URL = process.env.CDR_RPC_URL;
@@ -73,6 +74,10 @@ const READ_ONLY_ENV = {
   CDR_API_URL: API_URL!,
   CDR_RPC_URL: RPC_URL!,
 };
+
+// Accepts the deployed CDR condition selectors and cleanly rejects unknown selectors.
+const OPEN_CONDITION_BYTECODE =
+  "0x602a600c600039602a6000f360003560e01c80635645dbbf14601f5780638db3eb1714601f5760006000fd5b600160005260206000f3" as `0x${string}`;
 
 /**
  * Spawn the built CLI binary with an explicit env (no parent inheritance,
@@ -106,13 +111,10 @@ beforeAll(async () => {
   const publicClient = createPublicClient({ transport: http(RPC_URL) }) as PublicClient;
   const walletClient = createWalletClient({ account, transport: http(RPC_URL) }) as WalletClient;
 
-  // Same 10-byte runtime as packages/sdk/__integration__: returns 32-byte
-  // 0x...01 for any call → CDR contract reads as "condition met".
-  const bytecode = "0x600a600c600039600a6000f3600160005260206000f3" as `0x${string}`;
   const txHash = await walletClient.sendTransaction({
     chain: walletClient.chain ?? null,
     account: walletClient.account ?? null,
-    data: bytecode,
+    data: OPEN_CONDITION_BYTECODE,
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
   if (!receipt.contractAddress) {

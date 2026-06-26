@@ -30,6 +30,22 @@ export interface PartialDecryptionEvent {
   ciphertext: `0x${string}`;
 }
 
+/**
+ * Tagged reason passed to `onInvalidPartial` callbacks when `collectPartials`
+ * drops a validator's submission. Discriminate on `kind` for telemetry /
+ * UI / fallback logic instead of regex-matching error messages.
+ *
+ * Currently only `attestation-rejected` is emitted; the union is open to
+ * extension as future failure paths (e.g. stale registry, signature
+ * mismatch) are surfaced from the SDK.
+ */
+export type InvalidPartialReason = {
+  kind: "attestation-rejected";
+  validator: `0x${string}`;
+  pid: number;
+  round: number;
+};
+
 /** CDR Vault as stored on-chain */
 export interface Vault {
   uuid: number;
