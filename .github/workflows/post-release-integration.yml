@@ -1,0 +1,654 @@
+name: Post-Release Integration
+
+# Smoke-tests the actually-published npm tarballs (NOT the workspace source
+# tree that integration.yml exercises). Catches consumer-only defects like
+# missing exports/engines fields, version-stamp drift, and partial / non-
+# lockstep releases. See issue #102 for motivation.
+#
+# Triggers: workflow_run after every Release completion (gated to the
+# publish commit marker), or workflow_dispatch with optional version input.
+
+run-name: post-release-${{ inputs.version || github.event.workflow_run.head_sha || 'latest' }}
+
+permissions:
+  contents: read
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to verify (empty = resolve from npm latest)'
+        required: false
+        default: ''
+
+# Coalesce concurrent runs that target the same version. We don't
+# cancel-in-progress — a manual rerun while the auto-run is still going
+# should queue, not kill, so we still get the auto-trigger's signal.
+concurrency:
+  group: post-release-${{ inputs.version || 'auto-latest' }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    # workflow_dispatch is always allowed. workflow_run fires for every
+    # Release completion (including main pushes that didn't publish — the
+    # publish job in release.yml is gated on the commit-message marker and
+    # skips quietly otherwise), so we additionally require both upstream
+    # success and the publish marker to be present.
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (github.event.workflow_run.conclusion == 'success' &&
+         contains(github.event.workflow_run.head_commit.message, 'chore: release packages'))
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve canonical version
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            VERSION="$INPUT_VERSION"
+            SOURCE="workflow_dispatch input"
+          else
+            # Canonical source of truth — any non-zero exit or empty
+            # stdout below means the registry is in a state we don't
+            # understand and we fail closed.
+            VERSION="$(npm view @piplabs/cdr-sdk version)"
+            SOURCE="npm view @piplabs/cdr-sdk (latest)"
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "::error::failed to resolve canonical version"
+            exit 1
+          fi
+          echo "Resolved version: $VERSION (source: $SOURCE)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "source=$SOURCE"   >> "$GITHUB_OUTPUT"
+
+      - name: Verify lockstep release across all four packages
+        id: lockstep
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -uo pipefail
+          PACKAGES=(@piplabs/cdr-contracts @piplabs/cdr-crypto @piplabs/cdr-sdk @piplabs/cdr-cli)
+          FAILED=()
+          ROWS=()
+          for pkg in "${PACKAGES[@]}"; do
+            # Belt-and-braces: assert stdout equals the requested version,
+            # not just that npm view exited 0 — guards against a mirror
+            # quirk returning a different value under the same query.
+            ACTUAL="$(npm view "${pkg}@${VERSION}" version 2>/dev/null || true)"
+            if [ "$ACTUAL" = "$VERSION" ]; then
+              ROWS+=("| \`${pkg}\` | \`${VERSION}\` | ✅ |")
+            else
+              ROWS+=("| \`${pkg}\` | \`${ACTUAL:-(not found)}\` | ❌ |")
+              FAILED+=("$pkg")
+            fi
+          done
+          {
+            echo "rows<<ROWS_EOF"
+            printf '%s\n' "${ROWS[@]}"
+            echo "ROWS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          if [ "${#FAILED[@]}" -gt 0 ]; then
+            echo "::error::Lockstep verification failed — these packages are not published at ${VERSION}: ${FAILED[*]}"
+            exit 1
+          fi
+          echo "Lockstep verified: all four packages published at ${VERSION}"
+
+      - name: Write run summary
+        if: always()
+        env:
+          GH_EVENT_NAME: ${{ github.event_name }}
+          GH_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          SOURCE: ${{ steps.resolve.outputs.source }}
+          LOCKSTEP_OUTCOME: ${{ steps.lockstep.outcome }}
+          ROWS: ${{ steps.lockstep.outputs.rows }}
+        run: |
+          set -u
+          icon() {
+            case "$1" in
+              success) echo "✅" ;;
+              failure) echo "❌" ;;
+              skipped) echo "⏭️" ;;
+              *)       echo "❔" ;;
+            esac
+          }
+          {
+            echo "## Post-release integration — \`${VERSION:-(unresolved)}\`"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Trigger | \`${GH_EVENT_NAME}\` |"
+            echo "| Commit | \`${GH_SHA}\` |"
+            echo "| Version | \`${VERSION:-(unresolved)}\` |"
+            echo "| Version source | ${SOURCE:-(n/a)} |"
+            echo "| Lockstep | $(icon "${LOCKSTEP_OUTCOME:-skipped}") \`${LOCKSTEP_OUTCOME:-skipped}\` |"
+            echo ""
+            echo "### Lockstep verification"
+            echo ""
+            if [ -n "${ROWS:-}" ]; then
+              echo "| Package | Found | Status |"
+              echo "|---|---|---|"
+              echo "${ROWS}"
+            else
+              echo "_(lockstep step did not run — version resolution likely failed)_"
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      # Pin Node 20 LTS — the runner's default version drifts and changes
+      # the CJS-bridge behavior the smoke step below depends on.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install packages in clean temp dir
+        id: install
+        run: |
+          set -euo pipefail
+          INSTALL_DIR="$(mktemp -d -t cdr-release-XXXXXX)"
+          echo "INSTALL_DIR=$INSTALL_DIR" >> "$GITHUB_ENV"
+          cd "$INSTALL_DIR"
+          npm init -y > /dev/null
+          npm install --no-package-lock \
+            "@piplabs/cdr-contracts@${VERSION}" \
+            "@piplabs/cdr-crypto@${VERSION}" \
+            "@piplabs/cdr-sdk@${VERSION}" \
+            "@piplabs/cdr-cli@${VERSION}"
+          echo "Installed in: $INSTALL_DIR"
+          ls -la node_modules/@piplabs/
+
+      - name: Audit package.json fields
+        id: audit
+        run: |
+          set -uo pipefail
+          FAILED=()
+          ROWS=()
+
+          # Empty objects and empty strings count as missing — the field
+          # was declared but left blank, consumer-visibly identical to
+          # omission.
+          check_field() {
+            local pkg="$1"
+            local field="$2"
+            local pkgjson="${INSTALL_DIR}/node_modules/${pkg}/package.json"
+            if [ ! -f "$pkgjson" ]; then echo "MISSING_FILE"; return; fi
+            local val
+            val=$(jq -c --arg f "$field" '.[$f] // empty' "$pkgjson")
+            if [ -z "$val" ] || [ "$val" = "null" ] || [ "$val" = "{}" ] || [ "$val" = "\"\"" ]; then
+              echo "FAIL"
+            else
+              echo "OK"
+            fi
+          }
+
+          # Libraries
+          for pkg in @piplabs/cdr-contracts @piplabs/cdr-crypto @piplabs/cdr-sdk; do
+            for field in engines exports main types; do
+              status=$(check_field "$pkg" "$field")
+              if [ "$status" = "OK" ]; then
+                ROWS+=("| \`${pkg}\` | \`${field}\` | required | ✅ |")
+              else
+                ROWS+=("| \`${pkg}\` | \`${field}\` | required | ❌ |")
+                FAILED+=("${pkg}#${field}")
+              fi
+            done
+            # module: report only, don't fail
+            mod_status=$(check_field "$pkg" "module")
+            if [ "$mod_status" = "OK" ]; then
+              ROWS+=("| \`${pkg}\` | \`module\` | informational | ✅ |")
+            else
+              ROWS+=("| \`${pkg}\` | \`module\` | informational | ⚠️ missing |")
+            fi
+          done
+
+          # CLI
+          for field in engines bin; do
+            status=$(check_field "@piplabs/cdr-cli" "$field")
+            if [ "$status" = "OK" ]; then
+              ROWS+=("| \`@piplabs/cdr-cli\` | \`${field}\` | required | ✅ |")
+            else
+              ROWS+=("| \`@piplabs/cdr-cli\` | \`${field}\` | required | ❌ |")
+              FAILED+=("@piplabs/cdr-cli#${field}")
+            fi
+          done
+
+          {
+            echo "rows<<ROWS_EOF"
+            printf '%s\n' "${ROWS[@]}"
+            echo "ROWS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "${#FAILED[@]}" -gt 0 ]; then
+            echo "::error::Field audit failed for: ${FAILED[*]}"
+            exit 1
+          fi
+          echo "Field audit passed"
+
+      - name: 'Smoke: ESM imports'
+        id: esm_smoke
+        if: always() && steps.install.outcome == 'success'
+        run: |
+          set -uo pipefail
+          cd "$INSTALL_DIR"
+          cat > smoke.mjs <<'JSEOF'
+          const pkgName = process.argv[2];
+          try {
+            const pkg = await import(pkgName);
+            const keys = Object.keys(pkg);
+            if (keys.length === 0) {
+              throw new Error(`empty namespace from ${pkgName}`);
+            }
+            console.log(`OK ${pkgName}: ${keys.length} export(s) — ${keys.slice(0, 4).join(", ")}${keys.length > 4 ? ", ..." : ""}`);
+          } catch (err) {
+            console.error(`FAIL ${pkgName}: ${err && err.message ? err.message : err}`);
+            process.exit(1);
+          }
+          JSEOF
+          FAILED=()
+          ROWS=()
+          for pkg in @piplabs/cdr-contracts @piplabs/cdr-crypto @piplabs/cdr-sdk; do
+            if OUTPUT=$(node smoke.mjs "$pkg" 2>&1); then
+              SHORT=$(echo "$OUTPUT" | head -1 | tr -d '`' | tr '|' '/')
+              ROWS+=("| \`${pkg}\` | ✅ | ${SHORT:0:140} |")
+            else
+              SHORT=$(echo "$OUTPUT" | head -1 | tr -d '`' | tr '|' '/')
+              ROWS+=("| \`${pkg}\` | ❌ | ${SHORT:0:140} |")
+              FAILED+=("$pkg")
+            fi
+          done
+          {
+            echo "rows<<ROWS_EOF"
+            printf '%s\n' "${ROWS[@]}"
+            echo "ROWS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          if [ "${#FAILED[@]}" -gt 0 ]; then
+            echo "::error::ESM smoke failed for: ${FAILED[*]}"
+            exit 1
+          fi
+          echo "ESM smoke passed for all libraries"
+
+      - name: 'Smoke: CJS imports'
+        id: cjs_smoke
+        # NODE_OPTIONS=--no-experimental-require-module disables Node's
+        # implicit ESM-bridge for require(). Without it, Node 20.19+ and
+        # 22.12+ silently bridge `require("@piplabs/cdr-sdk")` even when
+        # the package is ESM-only with no exports.require — defeating the
+        # gate. With the flag, require() returns the original
+        # ERR_REQUIRE_ESM, catching the missing CJS entry that consumers
+        # on Node <20.19 (still LTS-supported) actually hit.
+        if: always() && steps.install.outcome == 'success'
+        env:
+          NODE_OPTIONS: --no-experimental-require-module
+        run: |
+          set -uo pipefail
+          cd "$INSTALL_DIR"
+          cat > smoke.cjs <<'JSEOF'
+          const pkgName = process.argv[2];
+          try {
+            const pkg = require(pkgName);
+            if (!pkg || (typeof pkg === "object" && Object.keys(pkg).length === 0)) {
+              throw new Error(`empty exports from ${pkgName}`);
+            }
+            const keys = typeof pkg === "object" ? Object.keys(pkg) : [typeof pkg];
+            console.log(`OK ${pkgName}: ${keys.length} export(s) — ${keys.slice(0, 4).join(", ")}${keys.length > 4 ? ", ..." : ""}`);
+          } catch (err) {
+            console.error(`FAIL ${pkgName}: ${err && err.code ? err.code + ": " : ""}${err && err.message ? err.message : err}`);
+            process.exit(1);
+          }
+          JSEOF
+          FAILED=()
+          ROWS=()
+          for pkg in @piplabs/cdr-contracts @piplabs/cdr-crypto @piplabs/cdr-sdk; do
+            if OUTPUT=$(node smoke.cjs "$pkg" 2>&1); then
+              SHORT=$(echo "$OUTPUT" | head -1 | tr -d '`' | tr '|' '/')
+              ROWS+=("| \`${pkg}\` | ✅ | ${SHORT:0:140} |")
+            else
+              SHORT=$(echo "$OUTPUT" | head -1 | tr -d '`' | tr '|' '/')
+              ROWS+=("| \`${pkg}\` | ❌ | ${SHORT:0:140} |")
+              FAILED+=("$pkg")
+            fi
+          done
+          {
+            echo "rows<<ROWS_EOF"
+            printf '%s\n' "${ROWS[@]}"
+            echo "ROWS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          if [ "${#FAILED[@]}" -gt 0 ]; then
+            echo "::error::CJS smoke failed for: ${FAILED[*]}"
+            exit 1
+          fi
+          echo "CJS smoke passed for all libraries"
+
+      - name: 'Verify cdr-cli --version'
+        id: cli_version
+        if: always() && steps.install.outcome == 'success'
+        run: |
+          set -uo pipefail
+          cd "$INSTALL_DIR"
+          # Invoke the binary directly from node_modules/.bin 
+          ACTUAL_RAW=$(./node_modules/.bin/cdr-cli --version 2>&1 || true)
+          # Strict equality catches the #96 class of drift (0.1.2 stamped
+          # into a 0.2.1 binary).
+          TRIMMED=$(printf '%s' "$ACTUAL_RAW" | tr -d '[:space:]')
+          {
+            echo "actual<<ACTUAL_EOF"
+            printf '%s\n' "$ACTUAL_RAW"
+            echo "ACTUAL_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "trimmed=${TRIMMED}" >> "$GITHUB_OUTPUT"
+          if [ "$TRIMMED" = "$VERSION" ]; then
+            echo "result=match" >> "$GITHUB_OUTPUT"
+            echo "cdr-cli --version matches: ${TRIMMED}"
+          else
+            echo "result=mismatch" >> "$GITHUB_OUTPUT"
+            echo "::error::cdr-cli --version mismatch — expected '${VERSION}', got '${ACTUAL_RAW}'"
+            exit 1
+          fi
+
+      - name: Upload verify diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-release-verify-${{ github.run_id }}
+          path: |
+            ${{ env.INSTALL_DIR }}/node_modules/@piplabs/*/package.json
+            ${{ env.INSTALL_DIR }}/smoke.mjs
+            ${{ env.INSTALL_DIR }}/smoke.cjs
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Write verify summary
+        if: always()
+        env:
+          AUDIT_OUTCOME: ${{ steps.audit.outcome }}
+          AUDIT_ROWS: ${{ steps.audit.outputs.rows }}
+          ESM_OUTCOME: ${{ steps.esm_smoke.outcome }}
+          ESM_ROWS: ${{ steps.esm_smoke.outputs.rows }}
+          CJS_OUTCOME: ${{ steps.cjs_smoke.outcome }}
+          CJS_ROWS: ${{ steps.cjs_smoke.outputs.rows }}
+          CLI_OUTCOME: ${{ steps.cli_version.outcome }}
+          CLI_ACTUAL: ${{ steps.cli_version.outputs.actual }}
+          CLI_RESULT: ${{ steps.cli_version.outputs.result }}
+        run: |
+          set -u
+          icon() {
+            case "$1" in
+              success) echo "✅" ;;
+              failure) echo "❌" ;;
+              skipped) echo "⏭️" ;;
+              *)       echo "❔" ;;
+            esac
+          }
+          {
+            echo "## Clean-room verification — \`${VERSION:-(unresolved)}\`"
+            echo ""
+            echo "| Gate | Status |"
+            echo "|---|---|"
+            echo "| Field audit | $(icon "${AUDIT_OUTCOME:-skipped}") \`${AUDIT_OUTCOME:-skipped}\` |"
+            echo "| ESM import smoke | $(icon "${ESM_OUTCOME:-skipped}") \`${ESM_OUTCOME:-skipped}\` |"
+            echo "| CJS import smoke | $(icon "${CJS_OUTCOME:-skipped}") \`${CJS_OUTCOME:-skipped}\` |"
+            echo "| \`cdr-cli --version\` | $(icon "${CLI_OUTCOME:-skipped}") \`${CLI_OUTCOME:-skipped}\` |"
+            echo ""
+
+            echo "### Field audit"
+            echo ""
+            if [ -n "${AUDIT_ROWS:-}" ]; then
+              echo "| Package | Field | Tier | Status |"
+              echo "|---|---|---|---|"
+              echo "${AUDIT_ROWS}"
+            else
+              echo "_(field audit did not run — install likely failed)_"
+            fi
+            echo ""
+
+            echo "### ESM import smoke"
+            echo ""
+            if [ -n "${ESM_ROWS:-}" ]; then
+              echo "| Package | Status | Output |"
+              echo "|---|---|---|"
+              echo "${ESM_ROWS}"
+            else
+              echo "_(ESM smoke did not run)_"
+            fi
+            echo ""
+
+            echo "### CJS import smoke"
+            echo ""
+            if [ -n "${CJS_ROWS:-}" ]; then
+              echo "| Package | Status | Output |"
+              echo "|---|---|---|"
+              echo "${CJS_ROWS}"
+            else
+              echo "_(CJS smoke did not run)_"
+            fi
+            echo ""
+
+            echo "### CLI version check"
+            echo ""
+            echo "| Expected | Got | Result |"
+            echo "|---|---|---|"
+            echo "| \`${VERSION:-?}\` | \`${CLI_ACTUAL:-(no output)}\` | $(icon "${CLI_OUTCOME:-skipped}") ${CLI_RESULT:-skipped} |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  e2e-aeneid:
+    # Sequential after `verify` (not parallel): if the install / audit /
+    # smoke gates already failed, the artifact is known-broken and we
+    # don't want to burn Aeneid test IP confirming the obvious.
+    needs: [prepare, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      # Aeneid endpoint constants — copied from integration.yml.
+      CDR_API_URL: http://172.192.41.96:1317
+      CDR_RPC_URL: https://aeneid.storyrpc.io
+      # CDR_AENEID_TEST_PRIVATE_KEY is scoped to the `Run e2e` step
+      # below so the raw secret isn't materialized in checkout /
+      # setup-node / install step environments.
+    steps:
+      # Pin checkout to the release revision so the harness file is
+      # always the one that shipped with the tarball under test. 
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || format('v{0}', needs.prepare.outputs.version) }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Verify Aeneid secret populated
+        env:
+          SECRET_PRESENT: ${{ secrets.CDR_AENEID_TEST_PRIVATE_KEY != '' }}
+        run: |
+          if [ "$SECRET_PRESENT" != "true" ]; then
+            echo "::error::CDR_AENEID_TEST_PRIVATE_KEY is empty (missing repo secret)"
+            exit 1
+          fi
+
+      - name: Install SDK in clean temp dir
+        id: install
+        run: |
+          set -euo pipefail
+          INSTALL_DIR="$(mktemp -d -t cdr-release-e2e-XXXXXX)"
+          echo "INSTALL_DIR=$INSTALL_DIR" >> "$GITHUB_ENV"
+          cd "$INSTALL_DIR"
+          npm init -y > /dev/null
+          # viem is pinned explicitly — it's a peerDependency of cdr-sdk,
+          # so let-npm-pick can land on an unintended minor.
+          npm install --no-package-lock \
+            "@piplabs/cdr-sdk@${VERSION}" \
+            "viem@^2.47"
+          cp "$GITHUB_WORKSPACE/.github/scripts/post-release-aeneid-e2e.mjs" .
+
+      - name: Run e2e — upload + access via subwallet
+        id: e2e
+        env:
+          CDR_AENEID_TEST_PRIVATE_KEY: ${{ secrets.CDR_AENEID_TEST_PRIVATE_KEY }}
+        run: |
+          set -uo pipefail
+          cd "$INSTALL_DIR"
+          node post-release-aeneid-e2e.mjs
+
+      - name: Upload e2e diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-release-e2e-${{ github.run_id }}
+          path: |
+            ${{ env.INSTALL_DIR }}/status.json
+            ${{ env.INSTALL_DIR }}/post-release-aeneid-e2e.mjs
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Write e2e summary
+        if: always()
+        env:
+          E2E_OUTCOME: ${{ steps.e2e.outcome }}
+        run: |
+          set -u
+          icon() {
+            case "$1" in
+              success) echo "✅" ;;
+              failure) echo "❌" ;;
+              skipped) echo "⏭️" ;;
+              *)       echo "❔" ;;
+            esac
+          }
+          STATUS_FILE="${INSTALL_DIR:-}/status.json"
+          {
+            echo "## End-to-end Aeneid — \`${VERSION}\`"
+            echo ""
+            echo "| Gate | Status |"
+            echo "|---|---|"
+            echo "| Aeneid e2e | $(icon "${E2E_OUTCOME:-skipped}") \`${E2E_OUTCOME:-skipped}\` |"
+            echo ""
+            if [ -n "${INSTALL_DIR:-}" ] && [ -f "$STATUS_FILE" ]; then
+              echo "### Run details"
+              echo ""
+              echo "| Field | Value |"
+              echo "|---|---|"
+              echo "| Outcome | \`$(jq -r '.outcome' "$STATUS_FILE")\` |"
+              echo "| Wall time | $(jq -r '.totalWallClockMs // "—"' "$STATUS_FILE") ms |"
+              echo "| Subwallet | \`$(jq -r '.subwalletAddress // "—"' "$STATUS_FILE")\` |"
+              echo "| Funder | \`$(jq -r '.funder.address // "—"' "$STATUS_FILE")\` |"
+              echo "| Fund tx | \`$(jq -r '.funder.fundTx // "—"' "$STATUS_FILE")\` |"
+              echo "| Open-condition | \`$(jq -r '.deploy.openCondition // "—"' "$STATUS_FILE")\` |"
+              echo "| Vault UUID | \`$(jq -r '.upload.uuid // "—"' "$STATUS_FILE")\` |"
+              echo "| Upload — allocate tx | \`$(jq -r '.upload.txAllocate // "—"' "$STATUS_FILE")\` |"
+              echo "| Upload — write tx | \`$(jq -r '.upload.txWrite // "—"' "$STATUS_FILE")\` |"
+              echo "| Upload latency | $(jq -r '.upload.latencyMs // "—"' "$STATUS_FILE") ms |"
+              echo "| Access — read tx | \`$(jq -r '.access.txRead // "—"' "$STATUS_FILE")\` |"
+              echo "| Access latency | $(jq -r '.access.latencyMs // "—"' "$STATUS_FILE") ms |"
+              echo "| DataKey recovered | $(jq -r 'if .access.recovered then "✅" else "❌" end' "$STATUS_FILE") |"
+              echo "| Refund tx | \`$(jq -r '.refund.tx // "—"' "$STATUS_FILE")\` |"
+              echo "| Refund amount | $(jq -r '.refund.refundedWei // "—"' "$STATUS_FILE") wei |"
+              echo ""
+              ERR=$(jq -r '.error // ""' "$STATUS_FILE")
+              if [ -n "$ERR" ] && [ "$ERR" != "null" ]; then
+                echo "### Error"
+                echo ""
+                echo '```'
+                echo "$ERR"
+                echo '```'
+                echo ""
+              fi
+              REFUND_ERR=$(jq -r '.refund.error // ""' "$STATUS_FILE")
+              if [ -n "$REFUND_ERR" ] && [ "$REFUND_ERR" != "null" ]; then
+                echo "### Refund error (non-fatal)"
+                echo ""
+                echo '```'
+                echo "$REFUND_ERR"
+                echo '```'
+                echo ""
+              fi
+            else
+              echo "_(no status.json — script exited before writing diagnostics)_"
+              echo ""
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  summary:
+    # Appends a top-level pass/fail block at the bottom of the rendered
+    # run summary (multi-job workflows can't put it at the top — GHA
+    # orders per-job summaries by completion time).
+    needs: [prepare, verify, e2e-aeneid]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Write overall summary
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          E2E_RESULT: ${{ needs.e2e-aeneid.result }}
+        run: |
+          set -u
+          icon() {
+            case "$1" in
+              success)   echo "✅" ;;
+              failure)   echo "❌" ;;
+              cancelled) echo "🛑" ;;
+              skipped)   echo "⏭️" ;;
+              *)         echo "❔" ;;
+            esac
+          }
+          PASS=0; FAIL=0; SKIP=0
+          for r in "$PREPARE_RESULT" "$VERIFY_RESULT" "$E2E_RESULT"; do
+            case "$r" in
+              success)            PASS=$((PASS+1)) ;;
+              failure|cancelled)  FAIL=$((FAIL+1)) ;;
+              *)                  SKIP=$((SKIP+1)) ;;
+            esac
+          done
+          # Non-publish workflow_run triggers cause `prepare` to skip
+          # via its job-level if-guard; verify + e2e then skip via
+          # needs-chain. All three skipped = workflow legitimately
+          # bailed at the gate, not a failure.
+          if [ "$PREPARE_RESULT" = "skipped" ] && [ "$VERIFY_RESULT" = "skipped" ] && [ "$E2E_RESULT" = "skipped" ]; then
+            {
+              echo "## ⏭️ Workflow gated out — non-release trigger"
+              echo ""
+              echo "The \`prepare\` job's if-guard rejected this trigger (e.g. a main push without the \`chore: release packages\` marker). No gates ran. This is the expected outcome for non-publish commits."
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$FAIL" -gt 0 ]; then HEADLINE="❌"; else HEADLINE="✅"; fi
+          {
+            echo "---"
+            echo ""
+            echo "## ${HEADLINE} Overall — post-release verification — \`${VERSION:-(unresolved)}\`"
+            echo ""
+            echo "**${PASS} passed | ${FAIL} failed | ${SKIP} skipped** (3 gates total)"
+            echo ""
+            echo "| Gate | Result |"
+            echo "|---|---|"
+            echo "| Version + lockstep | $(icon "$PREPARE_RESULT") \`$PREPARE_RESULT\` |"
+            echo "| Clean-room install + audit + smoke | $(icon "$VERIFY_RESULT") \`$VERIFY_RESULT\` |"
+            echo "| End-to-end Aeneid | $(icon "$E2E_RESULT") \`$E2E_RESULT\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$FAIL" -gt 0 ]; then
+            echo "::error::post-release verification failed — ${FAIL} of 3 gates"
+            exit 1
+          fi
