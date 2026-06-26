@@ -3,8 +3,9 @@
   "version": "0.2.1",
   "type": "module",
   "license": "MIT",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "publishConfig": {
     "access": "public"
   },
@@ -14,13 +15,19 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tshy",
     "test": "vitest run --exclude '**/__integration__/**' --exclude '**/node_modules/**' --exclude '**/dist/**'",
     "test:integration": "vitest run --no-file-parallelism --exclude '**/__tests__/**' --exclude '**/__integration__/ephemeral-60min-stress.test.ts' --exclude '**/node_modules/**' --exclude '**/dist/**'",
     "test:stress": "vitest run __integration__/ephemeral-60min-stress.test.ts",
     "test:coverage": "vitest run --exclude '**/__integration__/**' --coverage",
-    "clean": "rm -rf dist",
+    "clean": "rm -rf dist .tshy-build",
     "lint": "tsc --noEmit"
+  },
+  "tshy": {
+    "exports": {
+      "./package.json": "./package.json",
+      ".": "./src/index.ts"
+    }
   },
   "dependencies": {
     "@piplabs/cdr-contracts": "workspace:*",
@@ -53,6 +60,7 @@
   },
   "devDependencies": {
     "@vitest/coverage-v8": "^2",
+    "tshy": "^4.1.2",
     "typescript": "^5.5",
     "viem": "^2.47.6",
     "vitest": "^2"
@@ -61,5 +69,21 @@
     "type": "git",
     "url": "https://github.com/piplabs/cdr-sdk.git",
     "directory": "packages/sdk"
-  }
+  },
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/commonjs/index.d.ts",
+        "default": "./dist/commonjs/index.js"
+      }
+    }
+  },
+  "main": "./dist/commonjs/index.js",
+  "types": "./dist/commonjs/index.d.ts",
+  "module": "./dist/esm/index.js"
 }
