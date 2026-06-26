@@ -13,14 +13,23 @@ import {
   InvalidParamsError,
   CidIntegrityError,
   EmptyVaultError,
+  InvalidPartialError,
+  InsufficientBalanceError,
+  ReadTransactionRevertedError,
 } from "./errors.js";
-import type { PartialDecryptionEvent } from "./types.js";
+import { type CDRPublicClient, type CDRWalletClient, getWalletAddress } from "./client-types.js";
+import { type CDRLogger, noopLogger, errorMessage } from "./logger.js";
+import type { PartialDecryptionEvent, InvalidPartialReason } from "./types.js";
 import { uuidToLabel } from "./label.js";
 import type { StorageProvider } from "./storage/types.js";
 import { Observer } from "./observer.js";
 import { verifyAttestation, type AttestationConfig } from "./attestation.js";
 import { queryCDRPartials } from "./story-api/client.js";
 import type { DKGPartialDecryptionSubmission } from "./story-api/types.js";
+import { safeWriteContract } from "./_tx-submit.js";
+import { waitForReceiptResilient } from "./_rpc-resilience.js";
+
+export type RegistryStatus = "unbuilt" | "building" | "ready" | "failed";
 
 /**
  * Consumer reads encrypted vault data from the CDR contract and recovers the
@@ -53,11 +62,13 @@ import type { DKGPartialDecryptionSubmission } from "./story-api/types.js";
  * un-trusted validator's partial is reported via `onInvalidPartial`.
  */
 export class Consumer {
-  private publicClient: PublicClient;
-  private walletClient: WalletClient;
+  private publicClient: CDRPublicClient;
+  private walletClient: CDRWalletClient;
   private network: Network;
   private observer: Observer;
   private apiUrl: string;
+  private logger: CDRLogger;
+  private _registryStatus: RegistryStatus = "unbuilt";
 
   /** Alias for {@link accessCDR} */
   readVault: Consumer["accessCDR"];
@@ -66,20 +77,38 @@ export class Consumer {
 
   constructor(params: {
     network: Network;
-    publicClient: PublicClient;
-    walletClient: WalletClient;
+    publicClient: CDRPublicClient;
+    walletClient: CDRWalletClient;
     /** Observer instance — required. Provides round-keyed registrations / attestations cache. */
     observer: Observer;
     /** Story-API REST base URL, e.g. `"http://node:1317"`. */
     apiUrl: string;
+    /** Optional structured logger; defaults to a no-op. */
+    logger?: CDRLogger;
   }) {
     this.publicClient = params.publicClient;
     this.walletClient = params.walletClient;
     this.network = params.network;
     this.observer = params.observer;
     this.apiUrl = params.apiUrl;
+    this.logger = params.logger ?? noopLogger;
     this.readVault = this.accessCDR.bind(this);
     this.readFileVault = this.downloadFile.bind(this);
+  }
+
+  /**
+   * Current state of {@link prefetchRegistry}:
+   *   - `"unbuilt"`: never called.
+   *   - `"building"`: a prefetch is in flight.
+   *   - `"ready"`: the most recent prefetch resolved successfully.
+   *   - `"failed"`: the most recent prefetch rejected. Re-calling
+   *     `prefetchRegistry` moves status back to `"building"`.
+   *
+   * Useful for UIs that want to show a "preparing verifier" chip without
+   * holding on to the Promise.
+   */
+  get registryStatus(): RegistryStatus {
+    return this._registryStatus;
   }
 
   /**
@@ -99,7 +128,17 @@ export class Consumer {
    * ```
    */
   async prefetchRegistry(): Promise<void> {
-    await this.observer.getRegisteredValidators();
+    this._registryStatus = "building";
+    this.logger.debug("registry.prefetch.start");
+    try {
+      await this.observer.getRegisteredValidators();
+      this._registryStatus = "ready";
+      this.logger.debug("registry.prefetch.ready");
+    } catch (err) {
+      this._registryStatus = "failed";
+      this.logger.warn("registry.prefetch.failed", { reason: errorMessage(err) });
+      throw err;
+    }
   }
 
   /**
@@ -130,23 +169,118 @@ export class Consumer {
   }): Promise<{ txHash: `0x${string}` }> {
     const cdrAddress = contractAddresses[this.network].cdr;
 
-    const fee = params.feeOverride ?? await this.publicClient.readContract({
-      address: cdrAddress,
-      abi: cdrAbi,
-      functionName: "readFee",
+    const fee =
+      params.feeOverride ??
+      ((await this.publicClient.readContract({
+        address: cdrAddress,
+        abi: cdrAbi,
+        functionName: "readFee",
+      })) as bigint);
+
+    // Catch the obvious insufficient-fee case before submitting the tx.
+    // Gas cost is intentionally left to the wallet/RPC because not every
+    // structural client exposes reliable gas estimation.
+    await this.preflightBalance(fee);
+
+    let txHash: `0x${string}`;
+    try {
+      txHash = await safeWriteContract(this.walletClient as unknown as WalletClient, this.publicClient as unknown as PublicClient, {
+        address: cdrAddress,
+        abi: cdrAbi,
+        functionName: "read",
+        args: [params.uuid, params.accessAuxData, params.requesterPubKey],
+        value: fee,
+      });
+    } catch (err) {
+      this.logger.warn("read.tx.failed", {
+        uuid: params.uuid,
+        reason: errorMessage(err),
+      });
+      throw err;
+    }
+
+    this.logger.debug("read.tx.sent", {
+      uuid: params.uuid,
+      txHash,
+      fee: fee.toString(),
     });
 
-    const txHash = await this.walletClient.writeContract({
-      chain: this.walletClient.chain ?? null,
-      account: this.walletClient.account ?? null,
-      address: cdrAddress,
-      abi: cdrAbi,
-      functionName: "read",
-      args: [params.uuid, params.accessAuxData, params.requesterPubKey],
-      value: fee,
-    });
+    const receipt = await waitForReceiptResilient(this.publicClient as unknown as PublicClient, txHash);
+
+    if (receipt.status === "reverted") {
+      const reason = await this.decodeReadRevertReason({
+        uuid: params.uuid,
+        accessAuxData: params.accessAuxData,
+        requesterPubKey: params.requesterPubKey,
+        fee,
+        blockNumber: receipt.blockNumber,
+      });
+      throw new ReadTransactionRevertedError(txHash, reason);
+    }
 
     return { txHash };
+  }
+
+  /** Compare wallet balance against the read fee when the client can do so. */
+  private async preflightBalance(fee: bigint): Promise<void> {
+    const address = getWalletAddress(this.walletClient.account);
+    if (!address || !this.publicClient.getBalance) {
+      this.logger.debug("read.preflight.skipped", {
+        hasAddress: Boolean(address),
+        hasGetBalance: Boolean(this.publicClient.getBalance),
+      });
+      return;
+    }
+    this.logger.debug("read.preflight.start", {
+      address,
+      fee: fee.toString(),
+    });
+    let balance: bigint;
+    try {
+      balance = await this.publicClient.getBalance({ address });
+    } catch (err) {
+      this.logger.warn("read.preflight.failed", {
+        address,
+        reason: errorMessage(err),
+      });
+      throw err;
+    }
+    if (balance < fee) {
+      this.logger.warn("read.preflight.insufficient_balance", {
+        address,
+        balance: balance.toString(),
+        required: fee.toString(),
+      });
+      throw new InsufficientBalanceError(balance, fee);
+    }
+    this.logger.debug("read.preflight.ok", {
+      address,
+      balance: balance.toString(),
+      fee: fee.toString(),
+    });
+  }
+
+  private async decodeReadRevertReason(params: {
+    uuid: number;
+    accessAuxData: `0x${string}`;
+    requesterPubKey: `0x${string}`;
+    fee: bigint;
+    blockNumber?: bigint;
+  }): Promise<string | undefined> {
+    try {
+      await this.publicClient.simulateContract!({
+        account: this.walletClient.account ?? undefined,
+        address: contractAddresses[this.network].cdr,
+        abi: cdrAbi,
+        functionName: "read",
+        args: [params.uuid, params.accessAuxData, params.requesterPubKey],
+        value: params.fee,
+        blockNumber: params.blockNumber,
+      });
+    } catch (err) {
+      return extractViemRevertReason(err);
+    }
+    return undefined;
   }
 
   /**
@@ -206,7 +340,11 @@ export class Consumer {
     requesterPubKey: `0x${string}`;
     timeoutMs?: number;
     pollIntervalMs?: number;
-    onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
+    onInvalidPartial?: (
+      event: PartialDecryptionEvent,
+      reason: InvalidPartialReason,
+      error?: Error,
+    ) => void;
     attestationConfig?: AttestationConfig;
     /**
      * @internal Pre-loaded vault ciphertext from a containing call (e.g.
@@ -253,8 +391,14 @@ export class Consumer {
     const reported = new Set<string>();
     /** Last-known submission count (within the matching bucket), for the timeout error. */
     let lastSeen = 0;
-    /** Last-known round threshold, for the timeout error. */
-    let lastNeeded = 0;
+    /**
+     * Last-known round threshold, for the timeout error. Seeded from the
+     * active-round threshold so a complete no-show timeout still surfaces a
+     * meaningful `needed` value (e.g. `got 0/3`) rather than `got 0/0`.
+     * Overridden by `getThresholdAt(group.round)` once a matching bucket
+     * appears.
+     */
+    let lastNeeded = await this.observer.getThreshold().catch(() => 0);
 
     while (Date.now() < deadline) {
       let groups: Awaited<ReturnType<typeof queryCDRPartials>> = [];
@@ -264,7 +408,11 @@ export class Consumer {
           uuid,
           requesterPubKeyHex,
         });
-      } catch {
+      } catch (err) {
+        this.logger.debug("partial.poll.retry", {
+          uuid,
+          reason: errorMessage(err),
+        });
         // Transient REST error — retry on next poll tick.
       }
 
@@ -301,17 +449,40 @@ export class Consumer {
                 reported.add(dedupeKey);
                 onInvalidPartial?.(
                   event,
-                  new Error(`attestation rejected for validator ${sub.validator}`),
+                  {
+                    kind: "attestation-rejected",
+                    validator: sub.validator,
+                    pid: sub.pid,
+                    round: group.round,
+                  },
+                  new InvalidPartialError(sub.validator, sub.pid, "attestation rejected"),
                 );
+                this.logger.debug("partial.dropped", {
+                  validator: sub.validator,
+                  pid: sub.pid,
+                  uuid,
+                  round: group.round,
+                  reason: "attestation_rejected",
+                });
               }
               continue;
             }
+            this.logger.debug("partial.accepted", {
+              validator: sub.validator,
+              pid: sub.pid,
+              uuid,
+              round: group.round,
+            });
             accepted.push(event);
           }
 
           if (accepted.length >= sdkThreshold) {
             return accepted.slice(0, sdkThreshold);
           }
+          // Below threshold after trust filtering: surface the
+          // trusted/accepted count (not the raw bucket size) on a future
+          // timeout, so callers see what was actually usable.
+          lastSeen = accepted.length;
           // Not enough trusted partials this poll — keep waiting; more
           // validators may still submit, and the trust set is fixed for
           // this round so newly-arrived partials reuse the same checks.
@@ -321,6 +492,12 @@ export class Consumer {
       await sleep(pollIntervalMs);
     }
 
+    this.logger.warn("partial.collection.timeout", {
+      uuid,
+      seen: lastSeen,
+      needed: lastNeeded,
+      timeoutMs,
+    });
     throw new PartialCollectionTimeoutError(lastSeen, lastNeeded, timeoutMs);
   }
 
@@ -452,7 +629,11 @@ export class Consumer {
     timeoutMs?: number;
     /** See {@link read}'s `feeOverride` — same strict-equality semantics. */
     feeOverride?: bigint;
-    onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
+    onInvalidPartial?: (
+      event: PartialDecryptionEvent,
+      reason: InvalidPartialReason,
+      error?: Error,
+    ) => void;
     attestationConfig?: AttestationConfig;
   }): Promise<{ dataKey: Uint8Array; txHash: `0x${string}` }> {
     if (
@@ -542,7 +723,11 @@ export class Consumer {
     timeoutMs?: number;
     /** See {@link read}'s `feeOverride` — same strict-equality semantics. */
     feeOverride?: bigint;
-    onInvalidPartial?: (event: PartialDecryptionEvent, error: Error) => void;
+    onInvalidPartial?: (
+      event: PartialDecryptionEvent,
+      reason: InvalidPartialReason,
+      error?: Error,
+    ) => void;
     attestationConfig?: AttestationConfig;
     /** Skip CID integrity verification of downloaded file (default: false). */
     skipCidVerification?: boolean;
@@ -622,4 +807,56 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Best-effort revert-reason extractor for viem errors. Walks the `cause`
+ * chain looking for stable fields — `reason` (Solidity `revert("msg")`),
+ * decoded custom error name, or signature. Falls back to top-level
+ * `shortMessage` / `details` ONLY when the chain contains a
+ * `ContractFunctionExecutionError` / `ContractFunctionRevertedError` —
+ * otherwise transport/RPC errors (e.g. `HttpRequestError`) would surface
+ * misleading reasons like "HTTP request failed". Returns undefined for
+ * unrecognized shapes.
+ */
+function extractViemRevertReason(err: unknown): string | undefined {
+  if (!err || typeof err !== "object") return undefined;
+
+  let current: any = err;
+  let sawContractError = false;
+  for (let i = 0; i < 5 && current; i++) {
+    if (
+      current.name === "ContractFunctionExecutionError" ||
+      current.name === "ContractFunctionRevertedError"
+    ) {
+      sawContractError = true;
+    }
+    if (typeof current.reason === "string" && current.reason.length > 0) {
+      return current.reason;
+    }
+    const decoded = current.data;
+    if (
+      decoded &&
+      typeof decoded === "object" &&
+      typeof decoded.errorName === "string" &&
+      decoded.errorName.length > 0
+    ) {
+      return decoded.errorName;
+    }
+    if (typeof current.signature === "string" && current.signature.length > 0) {
+      return current.signature;
+    }
+    current = current.cause;
+  }
+
+  if (!sawContractError) return undefined;
+
+  const top: any = err;
+  if (typeof top.shortMessage === "string" && top.shortMessage.length > 0) {
+    return top.shortMessage;
+  }
+  if (typeof top.details === "string" && top.details.length > 0) {
+    return top.details;
+  }
+  return undefined;
 }

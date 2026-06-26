@@ -11,6 +11,12 @@ import {
   InvalidConditionContractError,
   LabelMismatchError,
   ContentSizeExceededError,
+  VaultAllocatedEventNotFoundError,
+  InvalidHexError,
+  AttestationQuoteError,
+  InvalidPartialError,
+  InsufficientBalanceError,
+  EmptyVaultError,
 } from "../src/errors.js";
 
 describe("errors", () => {
@@ -41,6 +47,13 @@ describe("errors", () => {
       expect(err.message).toContain("3");
       expect(err.message).toContain("5");
       expect(err).toBeInstanceOf(CDRError);
+    });
+
+    it("exposes collected, needed, and timeoutMs as public fields", () => {
+      const err = new PartialCollectionTimeoutError(3, 5, 30000);
+      expect(err.collected).toBe(3);
+      expect(err.needed).toBe(5);
+      expect(err.timeoutMs).toBe(30000);
     });
   });
 
@@ -107,6 +120,23 @@ describe("errors", () => {
       expect(err.message).toContain("read");
       expect(err.message).toContain(addr);
     });
+
+    it("exposes reason field, defaulting to selector-miss", () => {
+      const addr = "0x1234567890abcdef1234567890abcdef12345678";
+      const defaultErr = new InvalidConditionContractError(addr, "write");
+      expect(defaultErr.reason).toBe("selector-miss");
+
+      const ambiguousErr = new InvalidConditionContractError(
+        addr,
+        "read",
+        "ambiguous-fallback",
+      );
+      expect(ambiguousErr.reason).toBe("ambiguous-fallback");
+      // Message routes users to the escape hatch so they can self-diagnose
+      // the false-negative branch (Diamond proxies, deliberate payload-
+      // reverting fallbacks) without having to read the SDK source.
+      expect(ambiguousErr.message).toContain("skipConditionValidation");
+    });
   });
 
   describe("LabelMismatchError", () => {
@@ -133,6 +163,95 @@ describe("errors", () => {
     });
   });
 
+  describe("VaultAllocatedEventNotFoundError", () => {
+    it('has code "VAULT_ALLOCATED_EVENT_NOT_FOUND"', () => {
+      const err = new VaultAllocatedEventNotFoundError();
+      expect(err.code).toBe("VAULT_ALLOCATED_EVENT_NOT_FOUND");
+      expect(err.message).toContain("VaultAllocated event not found");
+      expect(err).toBeInstanceOf(CDRError);
+    });
+  });
+
+  describe("InvalidHexError", () => {
+    it('ODD_LENGTH carries length and code "INVALID_HEX"', () => {
+      const err = new InvalidHexError("ODD_LENGTH", { length: 13 });
+      expect(err.code).toBe("INVALID_HEX");
+      expect(err.reason).toBe("ODD_LENGTH");
+      expect(err.length).toBe(13);
+      expect(err.offset).toBeUndefined();
+      expect(err.message).toContain("odd-length");
+      expect(err.message).toContain("13");
+      expect(err).toBeInstanceOf(CDRError);
+    });
+
+    it("INVALID_CHAR carries offset", () => {
+      const err = new InvalidHexError("INVALID_CHAR", { offset: 4 });
+      expect(err.reason).toBe("INVALID_CHAR");
+      expect(err.offset).toBe(4);
+      expect(err.length).toBeUndefined();
+      expect(err.message).toContain("invalid hex character");
+      expect(err.message).toContain("4");
+    });
+  });
+
+  describe("AttestationQuoteError", () => {
+    it("TOO_SHORT carries actualLength and minLength, message preserves prior format", () => {
+      const err = new AttestationQuoteError("TOO_SHORT", {
+        actualLength: 431,
+        minLength: 432,
+      });
+      expect(err.code).toBe("ATTESTATION_QUOTE");
+      expect(err.reason).toBe("TOO_SHORT");
+      expect(err.actualLength).toBe(431);
+      expect(err.minLength).toBe(432);
+      expect(err.message).toBe(
+        "Invalid SGX quote: 431 bytes, minimum 432 required",
+      );
+      expect(err).toBeInstanceOf(CDRError);
+    });
+
+    it("UNSUPPORTED_VERSION carries version and expectedVersion", () => {
+      const err = new AttestationQuoteError("UNSUPPORTED_VERSION", {
+        version: 4,
+        expectedVersion: 3,
+      });
+      expect(err.reason).toBe("UNSUPPORTED_VERSION");
+      expect(err.version).toBe(4);
+      expect(err.expectedVersion).toBe(3);
+      expect(err.message).toContain("Unsupported SGX quote version: 4");
+      expect(err.message).toContain("expected 3");
+    });
+  });
+
+  describe("InvalidPartialError", () => {
+    it("carries validator, pid, reason and uses code INVALID_PARTIAL", () => {
+      const err = new InvalidPartialError(
+        "0x0000000000000000000000000000000000000001",
+        7,
+        "attestation rejected",
+      );
+      expect(err.code).toBe("INVALID_PARTIAL");
+      expect(err.validator).toBe("0x0000000000000000000000000000000000000001");
+      expect(err.pid).toBe(7);
+      expect(err.reason).toBe("attestation rejected");
+      expect(err.message).toContain("pid 7");
+      expect(err.message).toContain("attestation rejected");
+      expect(err).toBeInstanceOf(CDRError);
+    });
+  });
+
+  describe("InsufficientBalanceError", () => {
+    it("carries balance and required (bigint)", () => {
+      const err = new InsufficientBalanceError(10n, 100n);
+      expect(err.code).toBe("INSUFFICIENT_BALANCE");
+      expect(err.balance).toBe(10n);
+      expect(err.required).toBe(100n);
+      expect(err.message).toContain("10");
+      expect(err.message).toContain("100");
+      expect(err).toBeInstanceOf(CDRError);
+    });
+  });
+
   describe("all errors extend CDRError", () => {
     it("every error class is an instance of CDRError and Error", () => {
       const errors = [
@@ -146,6 +265,14 @@ describe("errors", () => {
         new InvalidConditionContractError("0x00", "write"),
         new LabelMismatchError("0x11", "0x22"),
         new ContentSizeExceededError(100, 50n),
+        new EmptyVaultError(42),
+        new VaultAllocatedEventNotFoundError(),
+        new InvalidHexError("ODD_LENGTH", { length: 3 }),
+        new InvalidHexError("INVALID_CHAR", { offset: 0 }),
+        new AttestationQuoteError("TOO_SHORT", { actualLength: 1, minLength: 2 }),
+        new AttestationQuoteError("UNSUPPORTED_VERSION", { version: 4, expectedVersion: 3 }),
+        new InvalidPartialError("0xabc", 1, "reason"),
+        new InsufficientBalanceError(1n, 2n),
       ];
 
       for (const err of errors) {

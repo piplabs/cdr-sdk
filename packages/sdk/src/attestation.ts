@@ -1,4 +1,5 @@
 import { toHex } from "viem";
+import { AttestationQuoteError } from "./errors.js";
 
 /** Configuration for SGX attestation verification. */
 export interface AttestationConfig {
@@ -54,7 +55,8 @@ const ISV_SVN_SIZE = 2;
  *
  * @param report - Raw SGX quote bytes (from DKG Registered event `enclaveReport`)
  * @returns Parsed fields: mrEnclave, mrSigner, securityVersion
- * @throws {Error} If the report is too short to be a valid SGX quote
+ * @throws {AttestationQuoteError} If the report is too short or has an
+ *   unsupported quote version. Inspect `.reason` to distinguish.
  *
  * @example
  * ```ts
@@ -68,9 +70,10 @@ export function parseSgxQuote(report: Uint8Array): {
   securityVersion: number;
 } {
   if (report.length < SGX_MIN_QUOTE_SIZE) {
-    throw new Error(
-      `Invalid SGX quote: ${report.length} bytes, minimum ${SGX_MIN_QUOTE_SIZE} required`,
-    );
+    throw new AttestationQuoteError("TOO_SHORT", {
+      actualLength: report.length,
+      minLength: SGX_MIN_QUOTE_SIZE,
+    });
   }
 
   // Validate quote version (bytes 0-1, little-endian). DCAP v3 = 0x0003.
@@ -78,9 +81,10 @@ export function parseSgxQuote(report: Uint8Array): {
   // produce incorrect MRENCLAVE/MRSIGNER if parsed with v3 offsets.
   const quoteVersion = report[0] | (report[1] << 8);
   if (quoteVersion !== SGX_DCAP_V3_VERSION) {
-    throw new Error(
-      `Unsupported SGX quote version: ${quoteVersion} (expected ${SGX_DCAP_V3_VERSION} for DCAP v3)`,
-    );
+    throw new AttestationQuoteError("UNSUPPORTED_VERSION", {
+      version: quoteVersion,
+      expectedVersion: SGX_DCAP_V3_VERSION,
+    });
   }
 
   const mrEnclave = toHex(report.slice(MRENCLAVE_OFFSET, MRENCLAVE_OFFSET + MRENCLAVE_SIZE));

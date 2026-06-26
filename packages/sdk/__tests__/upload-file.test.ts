@@ -9,9 +9,12 @@ vi.mock("@piplabs/cdr-crypto", () => ({
 
 import { Uploader } from "../src/uploader.js";
 import { tdh2Encrypt, encryptFile } from "@piplabs/cdr-crypto";
-import { ContentSizeExceededError } from "../src/errors.js";
+import { ContentSizeExceededError, InvalidConditionContractError } from "../src/errors.js";
+import { makeWalletMock } from "./_write-contract-mock.js";
 import type { StorageProvider } from "../src/storage/types.js";
 import type { Observer } from "../src/observer.js";
+
+const SENTINEL_CONDITION_FUNCTION = "__cdrSentinelProbeNoImpl__";
 
 function fakeObserver(opts: { maxSize?: bigint } = {}): Observer {
   return {
@@ -58,12 +61,18 @@ function mockClients() {
   const publicClient = {
     readContract: vi.fn(),
     waitForTransactionReceipt: vi.fn(),
-    simulateContract: vi.fn().mockRejectedValue({ cause: { name: "ContractFunctionRevertedError" } }),
+    // Default validation path: real selector returns, sentinel selector misses.
+    simulateContract: vi
+      .fn()
+      .mockImplementation(({ functionName }: { functionName: string }) =>
+        functionName === SENTINEL_CONDITION_FUNCTION
+          ? Promise.reject({
+              cause: { name: "ContractFunctionRevertedError", raw: "0x" },
+            })
+          : Promise.resolve({ result: true, request: {} }),
+      ),
   } as any;
-  const walletClient = {
-    writeContract: vi.fn(),
-    account: { address: "0xaaaa" },
-  } as any;
+  const walletClient = makeWalletMock() as any;
   return { publicClient, walletClient };
 }
 
@@ -102,14 +111,14 @@ describe("Uploader.uploadFile", () => {
 
     // allocateFee
     publicClient.readContract.mockResolvedValueOnce(1000n);
-    walletClient.writeContract.mockResolvedValueOnce("0xalloctx" as `0x${string}`);
+    walletClient.sendRawTransaction.mockResolvedValueOnce("0xalloctx" as `0x${string}`);
     publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
       logs: [makeVaultAllocatedLog(42)],
     });
     // maxEncryptedDataSize check is now in `write`, served by Observer (mocked).
     // writeFee
     publicClient.readContract.mockResolvedValueOnce(200n);
-    walletClient.writeContract.mockResolvedValueOnce("0xwritetx" as `0x${string}`);
+    walletClient.sendRawTransaction.mockResolvedValueOnce("0xwritetx" as `0x${string}`);
     publicClient.waitForTransactionReceipt.mockResolvedValueOnce({});
 
     const uploader = new Uploader({
@@ -157,7 +166,7 @@ describe("Uploader.uploadFile", () => {
 
     // allocateFee
     publicClient.readContract.mockResolvedValueOnce(1000n);
-    walletClient.writeContract.mockResolvedValueOnce("0xalloctx" as `0x${string}`);
+    walletClient.sendRawTransaction.mockResolvedValueOnce("0xalloctx" as `0x${string}`);
     publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
       logs: [makeVaultAllocatedLog(42)],
     });
@@ -178,6 +187,87 @@ describe("Uploader.uploadFile", () => {
     ).rejects.toThrow(ContentSizeExceededError);
 
     // Allocate happened (size check is in `write`, after allocate); write was NOT.
-    expect(walletClient.writeContract).toHaveBeenCalledOnce(); // allocate only
+    expect(walletClient.sendRawTransaction).toHaveBeenCalledOnce(); // allocate only
+  });
+
+  it("uploadFile with skipConditionValidation does not call simulateContract and completes", async () => {
+    const { publicClient, walletClient } = mockClients();
+    const storageProvider = mockStorageProvider();
+
+    const fakeKey = new Uint8Array(32).fill(0xaa);
+    const fakeFileCt = new Uint8Array([1, 2, 3]);
+    vi.mocked(encryptFile).mockReturnValue({ ciphertext: fakeFileCt, key: fakeKey });
+    vi.mocked(tdh2Encrypt).mockResolvedValue({
+      raw: new Uint8Array([10, 20, 30]),
+      label: new Uint8Array([4, 5]),
+    });
+
+    // allocateFee → allocate tx → allocate receipt → writeFee → write tx → write receipt
+    publicClient.readContract.mockResolvedValueOnce(1000n);
+    walletClient.sendRawTransaction.mockResolvedValueOnce("0xalloctx" as `0x${string}`);
+    publicClient.waitForTransactionReceipt.mockResolvedValueOnce({
+      logs: [makeVaultAllocatedLog(77)],
+    });
+    publicClient.readContract.mockResolvedValueOnce(200n);
+    walletClient.sendRawTransaction.mockResolvedValueOnce("0xwritetx" as `0x${string}`);
+    publicClient.waitForTransactionReceipt.mockResolvedValueOnce({});
+
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer: fakeObserver(),
+    });
+
+    const result = await uploader.uploadFile({
+      ...baseParams,
+      // EOA addresses — would fail interface validation if it ran.
+      writeConditionAddr: "0xeeee000000000000000000000000000000000001",
+      readConditionAddr: "0xeeee000000000000000000000000000000000002",
+      content: new TextEncoder().encode("hello"),
+      storageProvider,
+      skipConditionValidation: true,
+    });
+
+    expect(publicClient.simulateContract).not.toHaveBeenCalled();
+    // Pipeline ran through encrypt → storage upload → allocate → write.
+    expect(encryptFile).toHaveBeenCalledOnce();
+    expect(storageProvider.upload).toHaveBeenCalledOnce();
+    expect(result.uuid).toBe(77);
+    expect(result.txHashes.allocate).toBe("0xalloctx");
+    expect(result.txHashes.write).toBe("0xwritetx");
+  });
+
+  it("uploadFile without skipConditionValidation rejects EOA condition addresses with InvalidConditionContractError", async () => {
+    const { publicClient, walletClient } = mockClients();
+    const storageProvider = mockStorageProvider();
+    // EOA / non-contract address → viem ContractFunctionZeroDataError, which the
+    // preflight maps to InvalidConditionContractError (reason "selector-miss").
+    publicClient.simulateContract.mockReset();
+    publicClient.simulateContract.mockRejectedValue({
+      cause: { name: "ContractFunctionZeroDataError" },
+    });
+
+    const fakeKey = new Uint8Array(32).fill(0xaa);
+    vi.mocked(encryptFile).mockReturnValue({ ciphertext: new Uint8Array([1]), key: fakeKey });
+
+    const uploader = new Uploader({
+      network: "testnet",
+      publicClient,
+      walletClient,
+      observer: fakeObserver(),
+    });
+
+    await expect(
+      uploader.uploadFile({
+        ...baseParams,
+        writeConditionAddr: "0xeeee000000000000000000000000000000000001",
+        readConditionAddr: "0xeeee000000000000000000000000000000000002",
+        content: new TextEncoder().encode("hello"),
+        storageProvider,
+      }),
+    ).rejects.toThrow(InvalidConditionContractError);
+
+    expect(walletClient.sendRawTransaction).not.toHaveBeenCalled();
   });
 });

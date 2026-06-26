@@ -46,9 +46,10 @@ await initWasm();
 const account = privateKeyToAccount("0xYOUR_PRIVATE_KEY");
 const publicClient = createPublicClient({ transport: http("https://aeneid.storyrpc.io") });
 const walletClient = createWalletClient({ account, transport: http("https://aeneid.storyrpc.io") });
+const apiUrl = "http://172.192.41.96:1317"; // Story-API REST endpoint
 
 // 3. Create a CDR client
-const client = new CDRClient({ network: "testnet", publicClient, walletClient });
+const client = new CDRClient({ network: "testnet", publicClient, walletClient, apiUrl });
 
 // 4. Upload encrypted data
 const globalPubKey = await client.observer.getGlobalPubKey();
@@ -98,7 +99,11 @@ Both networks use the same pre-deployed system contract addresses:
 const publicClient = createPublicClient({
   transport: http("https://aeneid.storyrpc.io"),
 });
-const client = new CDRClient({ network: "testnet", publicClient });
+const client = new CDRClient({
+  network: "testnet",
+  publicClient,
+  apiUrl: "http://172.192.41.96:1317",
+});
 ```
 
 **Mainnet:**
@@ -107,12 +112,16 @@ const client = new CDRClient({ network: "testnet", publicClient });
 const publicClient = createPublicClient({
   transport: http("https://rpc.story.foundation"),
 });
-const client = new CDRClient({ network: "mainnet", publicClient });
+const client = new CDRClient({
+  network: "mainnet",
+  publicClient,
+  apiUrl: "https://your-mainnet-story-api.example.com",
+});
 ```
 
 **Custom RPC URL (devnets, local nodes, or third-party providers):**
 
-You can point the SDK to any Story-compatible RPC endpoint by changing the `http()` transport URL. This is useful for:
+You can point the SDK to any Story-compatible EVM RPC endpoint by changing the `http()` transport URL. `apiUrl` must point to the matching Story-API REST endpoint. This is useful for:
 
 - **Devnets / private testnets** run by your team
 - **Local development nodes** (e.g., `http://localhost:8545`)
@@ -127,10 +136,11 @@ const walletClient = createWalletClient({
   account,
   transport: http("https://your-devnet-rpc.example.com"),
 });
+const apiUrl = "https://your-devnet-story-api.example.com";
 
 // Use "testnet" or "mainnet" depending on which contract addresses your devnet uses.
 // If the devnet mirrors testnet contracts, use "testnet".
-const client = new CDRClient({ network: "testnet", publicClient, walletClient });
+const client = new CDRClient({ network: "testnet", publicClient, walletClient, apiUrl });
 ```
 
 > **Note:** The `network` parameter determines which contract addresses the SDK uses. When pointing to a custom RPC, choose the `network` value that matches the contract deployment on that chain. Both `"testnet"` and `"mainnet"` currently use the same contract addresses, but this may change in the future.
@@ -141,21 +151,22 @@ A common pattern is to configure the network via environment variables:
 
 ```typescript
 const RPC_URL = process.env.RPC_URL ?? "https://aeneid.storyrpc.io";
+const API_URL = process.env.API_URL ?? "http://172.192.41.96:1317";
 const NETWORK = (process.env.NETWORK ?? "testnet") as "testnet" | "mainnet";
 
 const publicClient = createPublicClient({ transport: http(RPC_URL) });
-const client = new CDRClient({ network: NETWORK, publicClient });
+const client = new CDRClient({ network: NETWORK, publicClient, apiUrl: API_URL });
 ```
 
 ```bash
 # Testnet (default)
-RPC_URL=https://aeneid.storyrpc.io NETWORK=testnet node app.js
+RPC_URL=https://aeneid.storyrpc.io API_URL=http://172.192.41.96:1317 NETWORK=testnet node app.js
 
 # Mainnet
-RPC_URL=https://rpc.story.foundation NETWORK=mainnet node app.js
+RPC_URL=https://rpc.story.foundation API_URL=https://your-mainnet-story-api.example.com NETWORK=mainnet node app.js
 
 # Custom devnet
-RPC_URL=http://localhost:8545 NETWORK=testnet node app.js
+RPC_URL=http://localhost:8545 API_URL=http://localhost:1317 NETWORK=testnet node app.js
 ```
 
 ---
@@ -196,8 +207,10 @@ The main entry point. Provides access to `observer`, `uploader`, and `consumer` 
 ```typescript
 const client = new CDRClient({
   network: "testnet" | "mainnet",
-  publicClient: PublicClient,     // viem public client
-  walletClient?: WalletClient,    // viem wallet client (optional, needed for write ops)
+  publicClient: CDRPublicClient,  // viem, wagmi, or custom structural public client
+  walletClient?: CDRWalletClient, // optional; required for upload/access operations
+  apiUrl: string,                 // Story-API REST endpoint
+  logger?: CDRLogger,             // optional structured logger
 });
 
 client.observer   // Always available — read-only queries
@@ -215,10 +228,10 @@ Query on-chain state without a wallet.
 | `getAllocateFee()` | `bigint` | Current vault allocation fee (wei) |
 | `getWriteFee()` | `bigint` | Current write fee (wei) |
 | `getReadFee()` | `bigint` | Current read fee (wei) |
-| `getGlobalPubKey(fromBlock?)` | `Uint8Array` | DKG global public key (with Ed25519 curve prefix) |
+| `getGlobalPubKey()` | `Uint8Array` | DKG global public key (with Ed25519 curve prefix) |
 | `getOperationalThreshold()` | `bigint` | Raw operational threshold (parts per 1000) |
-| `getParticipantCount(fromBlock?)` | `number` | Number of DKG participants in latest round |
-| `getThreshold(fromBlock?)` | `number` | Absolute threshold = ceil(participants * operationalThreshold / 1000) |
+| `getParticipantCount()` | `number` | Number of DKG participants in latest round |
+| `getThreshold()` | `number` | Active round partial-decryption threshold |
 
 ### Uploader (Write)
 
@@ -270,8 +283,7 @@ const { dataKey, txHash } = await client.consumer.accessCDR({
   accessAuxData: `0x${string}`,           // auxiliary data for condition check
   requesterPubKey: `0x${string}`,         // your uncompressed secp256k1 public key
   recipientPrivKey: Uint8Array,           // your private key bytes (for ECIES decryption)
-  globalPubKey: Uint8Array,               // from observer.getGlobalPubKey()
-  threshold: number,                      // from observer.getThreshold()
+  globalPubKey?: Uint8Array,              // optional; auto-queried if omitted
   timeoutMs?: number,                     // partial collection timeout (default: 60000)
   feeOverride?: bigint,                   // optional: override auto-queried read fee
 });
@@ -281,9 +293,9 @@ const { dataKey, txHash } = await client.consumer.accessCDR({
 
 | Method | Description |
 |--------|-------------|
-| `read({ uuid, accessAuxData, requesterPubKey })` | Submit a read request on-chain |
-| `collectPartials({ uuid, minPartials, fromBlock, timeoutMs?, pollIntervalMs? })` | Poll for partial decryption events |
-| `decryptDataKey({ ciphertext, partials, recipientPrivKey, globalPubKey, label, threshold })` | Decrypt and combine partials |
+| `read({ uuid, accessAuxData, requesterPubKey, feeOverride? })` | Submit a read request on-chain |
+| `collectPartials({ uuid, requesterPubKey, timeoutMs?, pollIntervalMs?, attestationConfig? })` | Poll Story-API for partial decryptions |
+| `decryptDataKey({ ciphertext, partials, recipientPrivKey, globalPubKey, label })` | Decrypt and combine partials |
 
 ---
 
@@ -298,7 +310,11 @@ import { createPublicClient, http } from "viem";
 import { CDRClient } from "@piplabs/cdr-sdk";
 
 const publicClient = createPublicClient({ transport: http("https://aeneid.storyrpc.io") });
-const client = new CDRClient({ network: "testnet", publicClient });
+const client = new CDRClient({
+  network: "testnet",
+  publicClient,
+  apiUrl: "http://172.192.41.96:1317",
+});
 
 const threshold = await client.observer.getOperationalThreshold();
 console.log("Operational threshold:", threshold);
@@ -327,7 +343,12 @@ await initWasm();
 const account = privateKeyToAccount("0xYOUR_PRIVATE_KEY");
 const publicClient = createPublicClient({ transport: http("https://aeneid.storyrpc.io") });
 const walletClient = createWalletClient({ account, transport: http("https://aeneid.storyrpc.io") });
-const client = new CDRClient({ network: "testnet", publicClient, walletClient });
+const client = new CDRClient({
+  network: "testnet",
+  publicClient,
+  walletClient,
+  apiUrl: "http://172.192.41.96:1317",
+});
 
 // Fetch DKG global public key
 const globalPubKey = await client.observer.getGlobalPubKey();
@@ -367,11 +388,15 @@ const PRIVATE_KEY = "0xYOUR_PRIVATE_KEY";
 const account = privateKeyToAccount(PRIVATE_KEY as `0x${string}`);
 const publicClient = createPublicClient({ transport: http("https://aeneid.storyrpc.io") });
 const walletClient = createWalletClient({ account, transport: http("https://aeneid.storyrpc.io") });
-const client = new CDRClient({ network: "testnet", publicClient, walletClient });
+const client = new CDRClient({
+  network: "testnet",
+  publicClient,
+  walletClient,
+  apiUrl: "http://172.192.41.96:1317",
+});
 
-// Get DKG parameters
+// Optionally prefetch DKG parameters
 const globalPubKey = await client.observer.getGlobalPubKey();
-const threshold = await client.observer.getThreshold();
 
 // Derive secp256k1 public key for ECIES
 const privKeyBytes = Buffer.from(PRIVATE_KEY.slice(2), "hex");
@@ -384,7 +409,6 @@ const { dataKey, txHash } = await client.consumer.accessCDR({
   requesterPubKey: requesterPubKey as `0x${string}`,
   recipientPrivKey: privKeyBytes,
   globalPubKey,
-  threshold,
 });
 
 console.log("Recovered data key:", toHex(dataKey));
@@ -401,6 +425,11 @@ The SDK throws typed errors you can catch and handle:
 | `WalletClientRequiredError` | `WALLET_CLIENT_REQUIRED` | Accessing `uploader` or `consumer` without a `walletClient` |
 | `PartialCollectionTimeoutError` | `PARTIAL_COLLECTION_TIMEOUT` | `collectPartials` or `accessCDR` times out waiting for validator responses |
 | `ContractRevertError` | `CONTRACT_REVERT` | On-chain transaction reverted |
+| `InsufficientBalanceError` | `INSUFFICIENT_BALANCE` | Wallet balance is below the read fee before `read()` submits a tx |
+| `InvalidPartialError` | `INVALID_PARTIAL` | A partial is rejected and reported through `onInvalidPartial` |
+| `InvalidHexError` | `INVALID_HEX` | Story-API hex decoding receives malformed input |
+| `AttestationQuoteError` | `ATTESTATION_QUOTE` | SGX quote bytes are too short or use an unsupported quote version |
+| `VaultAllocatedEventNotFoundError` | `VAULT_ALLOCATED_EVENT_NOT_FOUND` | Allocation receipt does not contain the expected event |
 
 All errors extend `CDRError`, which has a `code` property for programmatic handling:
 

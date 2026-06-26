@@ -1,5 +1,6 @@
 node_modules/
 dist/
+coverage/
 .turbo/
 .tshy/
 .tshy-build/
@@ -9,3 +10,6 @@ dist/
 .DS_Store
 docs/superpowers
 package-lock.json
+
+# cdr-monitor runtime state (carried via actions/cache in CI)
+read_requests.json
