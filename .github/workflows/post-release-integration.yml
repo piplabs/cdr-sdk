@@ -33,16 +33,14 @@ concurrency:
 
 jobs:
   prepare:
-    # workflow_dispatch is always allowed. workflow_run fires for every
-    # Release completion (including main pushes that didn't publish — the
-    # publish job in release.yml is gated on the commit-message marker and
-    # skips quietly otherwise), so we additionally require both upstream
-    # success and the publish marker to be present.
+    # workflow_dispatch is always allowed. The Release workflow only runs on
+    # manual dispatch and only reports success when its gated `publish` job
+    # actually published (a held/cancelled approval yields a non-success
+    # conclusion), so upstream success alone means a real release happened.
     if: >-
       ${{
         github.event_name == 'workflow_dispatch' ||
-        (github.event.workflow_run.conclusion == 'success' &&
-         contains(github.event.workflow_run.head_commit.message, 'chore: release packages'))
+        github.event.workflow_run.conclusion == 'success'
       }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

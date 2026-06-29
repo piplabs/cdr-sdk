@@ -10,8 +10,6 @@
     "clean": "turbo clean"
   },
   "devDependencies": {
-    "@changesets/changelog-github": "^0.6.0",
-    "@changesets/cli": "^2.31.0",
     "turbo": "^2",
     "typescript": "^5.5"
   },
