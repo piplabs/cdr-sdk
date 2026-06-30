@@ -1,20 +1,21 @@
 name: Release
 
-# Manual, version-input release. Click "Run workflow", type the exact version
-# (e.g. 0.2.2), and this publishes all four packages to npm at that version.
+# Two-phase release, one file, two triggers.
 #
-# Flow (single run, no second trigger):
-#   prepare  — validate version + bump all 4 package.json + build + audit +
-#              dry-run publish. NO external effect; the bump lives only on the
-#              throwaway runner. Gives the reviewer a green pre-flight.
-#   publish  — gated by the `npm-publish` environment (required reviewer). On
-#              approval: publish to npm (OIDC + provenance), then push the
-#              version-bump commit + `v<version>` tag to main, then open a
-#              GitHub Release. Holding off approval = nothing goes live.
+# Phase 1 — open the release PR (manual, `workflow_dispatch`):
+#   Validates the version, bumps all four package.json on a `release/vX` branch,
+#   and opens a "chore: release vX" PR. Publishes NOTHING. Squash-merge it to
+#   land the bump on main as a signed, linear commit.
 #
-# Versions move in lockstep: all four packages are set to the input version.
-# Internal `workspace:*` deps are left as-is; pnpm rewrites them to the real
-# version at publish time.
+# Phase 2 — publish on merge (automatic, `push` to main):
+#   `detect` publishes only when BOTH hold: (a) sdk's version is ahead of npm
+#   `latest`, and (b) the head commit is a "chore: release vX" marker. The gated
+#   `publish` job then publishes all four FROM that merged commit, tags it `vX`,
+#   and cuts a GitHub Release. main, the tag, npm, and provenance all reference
+#   the one merged commit — no SHA divergence even with squash merges.
+#
+# All four packages move in lockstep. Internal `workspace:*` deps are rewritten
+# to the real version by pnpm at publish time.
 
 on:
   workflow_dispatch:
@@ -23,6 +24,8 @@ on:
         description: 'Exact version to release all four packages at (e.g. 0.2.2)'
         required: true
         type: string
+  push:
+    branches: [main]
 
 concurrency: release-${{ github.ref }}
 
@@ -30,21 +33,26 @@ env:
   PACKAGES: "packages/contracts packages/crypto packages/sdk apps/cli"
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Pre-flight. Runs immediately, no environment gate, no external side effects.
-  # Proves the requested version is valid and the four packages build + pack
-  # cleanly BEFORE a reviewer is asked to approve the irreversible publish.
-  # ---------------------------------------------------------------------------
-  prepare:
+  # ===========================================================================
+  # Phase 1 — open the release PR. Manual dispatch only (write-access required).
+  # No external side effects: the bump lives on a release branch + PR, nothing
+  # is published.
+  # ===========================================================================
+  open-pr:
+    # Only from main — a dispatch off any other branch would bump that branch's
+    # state into the release PR.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: write       # push the release/vX branch
+      pull-requests: write  # open the release PR
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - uses: pnpm/action-setup@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -54,13 +62,17 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          # Must be plain semver (optionally a -prerelease / +build suffix).
           if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
             echo "::error::'$VERSION' is not a valid semver version (expected e.g. 0.2.2)"
             exit 1
           fi
-          # Must be strictly greater than what's currently on npm `latest`.
-          LATEST="$(npm view @piplabs/cdr-sdk version 2>/dev/null || echo '0.0.0')"
+          # Fail closed: these packages already exist, so an unreadable npm
+          # latest means the registry/auth is in an unknown state — refuse to
+          # open a release PR on a guess.
+          if ! LATEST="$(npm view @piplabs/cdr-sdk version 2>/dev/null)" || [ -z "$LATEST" ]; then
+            echo "::error::Unable to read npm latest for @piplabs/cdr-sdk — failing closed"
+            exit 1
+          fi
           if [ "$VERSION" = "$LATEST" ] || \
              [ "$(printf '%s\n%s\n' "$LATEST" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
             echo "::error::Version $VERSION must be greater than current npm latest ($LATEST)"
@@ -68,7 +80,7 @@ jobs:
           fi
           echo "OK: $VERSION > $LATEST"
 
-      - name: Set version across all four packages
+      - name: Bump all four packages
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -77,66 +89,141 @@ jobs:
             echo "  $dir -> $VERSION"
           done
 
-      - run: pnpm install --no-frozen-lockfile
+      # Frozen lockfile: the version bump doesn't touch the lockfile, so the
+      # install stays reproducible.
+      - run: pnpm install --frozen-lockfile
 
-      # Supply-chain gate: fail on high+ severity vulnerabilities in the deps
-      # that actually ship to consumers (prod deps; devDeps are excluded).
+      # Supply-chain pre-flight: fail on high+ severity vulns in shipped deps.
       - name: Audit production dependencies
         run: |
           pnpm audit --json --prod > /tmp/audit.json || true
           COUNT=$(jq '[.advisories | to_entries[] | select(.value.severity == "high" or .value.severity == "critical")] | length' /tmp/audit.json)
           if [ "${COUNT:-0}" -gt 0 ]; then
             echo "::error::Found $COUNT high+ severity vulnerabilities in production deps"
-            jq '[.advisories | to_entries[] | select(.value.severity == "high" or .value.severity == "critical") | .value | {severity, title, module: .module_name, vulnerable: .vulnerable_versions, patched: .patched_versions}]' /tmp/audit.json
+            jq '[.advisories | to_entries[] | select(.value.severity == "high" or .value.severity == "critical") | .value | {severity, title, module: .module_name}]' /tmp/audit.json
             exit 1
           fi
           echo "No high+ severity vulnerabilities in production deps."
 
       - run: pnpm -r run build
 
-      # Validates tarball contents (file lists, package.json shape, workspace:*
-      # substitution) without contacting the registry. Catches packaging
-      # regressions before the publish job is ever approved.
+      # Validates tarballs (file lists, package.json shape, workspace:*
+      # substitution) without contacting the registry — catches packaging
+      # regressions before the PR is even opened.
       - name: Verify publish tarballs (dry-run)
         run: pnpm -r publish --dry-run --no-git-checks
 
-  # ---------------------------------------------------------------------------
-  # Publish. Gated by the `npm-publish` environment — a required reviewer must
-  # click "Approve and deploy" before ANY step here runs. This is the single
-  # irreversible point. Everything below happens only after approval.
-  # ---------------------------------------------------------------------------
+      - name: Open release PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          BRANCH="release/v$VERSION"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -m "chore: release v$VERSION"
+          # Force-push so a re-dispatch for the same version refreshes the branch.
+          git push --force origin "$BRANCH"
+          if gh pr view "$BRANCH" --json state --jq .state >/dev/null 2>&1; then
+            echo "PR already open for $BRANCH — branch updated."
+          else
+            gh pr create --base main --head "$BRANCH" \
+              --title "chore: release v$VERSION" \
+              --body "Automated release PR — bumps all four packages to **v$VERSION**. Squash-merge to publish: on merge the Release workflow detects the version is ahead of npm and publishes all four from the merged commit, then tags \`v$VERSION\` and cuts a GitHub Release (behind the \`npm-publish\` approval gate). Keep the squash commit title starting with \`chore: release v\` — it is the publish marker."
+          fi
+
+  # ===========================================================================
+  # Phase 2a — detect. Runs on every push to main (cheap, read-only). Marks a
+  # release only when BOTH the version is ahead of npm AND the head commit is a
+  # "chore: release vX" marker, so the gated publish job fires (and requests
+  # approval) only for real releases.
+  # ===========================================================================
+  detect:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_publish: ${{ steps.check.outputs.should_publish }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Decide whether this is a release
+        id: check
+        env:
+          # Via env (not inline) to avoid shell-injection from the message.
+          HEAD_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          VERSION="$(node -p "require('./packages/sdk/package.json').version")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # Fail closed: if npm latest can't be read, don't publish. Skipping
+          # (not erroring) keeps ordinary main pushes green during a registry
+          # hiccup; a real release just re-runs once npm is reachable.
+          if ! LATEST="$(npm view @piplabs/cdr-sdk version 2>/dev/null)" || [ -z "$LATEST" ]; then
+            echo "::warning::Could not read npm latest — skipping publish (fail closed)."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          AHEAD=false
+          if [ "$VERSION" != "$LATEST" ] && \
+             [ "$(printf '%s\n%s\n' "$LATEST" "$VERSION" | sort -V | tail -1)" = "$VERSION" ]; then
+            AHEAD=true
+          fi
+
+          MARKER=false
+          case "$HEAD_MSG" in
+            "chore: release v"*) MARKER=true ;;
+          esac
+
+          if [ "$AHEAD" = true ] && [ "$MARKER" = true ]; then
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "Release detected: $VERSION > npm latest ($LATEST), marker present."
+          else
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "No publish (ahead=$AHEAD marker=$MARKER): version $VERSION, npm latest $LATEST."
+          fi
+
+  # ===========================================================================
+  # Phase 2b — publish. Gated by the `npm-publish` environment (OIDC trusted
+  # publisher + required reviewer). The whole job waits for approval before any
+  # step runs. Publishes FROM the merged commit, then tags it and cuts the
+  # Release. Never pushes to the main branch ref.
+  # ===========================================================================
   publish:
-    needs: prepare
+    needs: detect
+    if: github.event_name == 'push' && needs.detect.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: npm-publish
     permissions:
-      contents: write   # push the version-bump commit + tag, create the Release
+      contents: write   # push the vX tag + create the Release
       id-token: write   # mint OIDC token for npm trusted publishing + provenance
+      actions: write    # dispatch post-release-integration (a Release created by
+                        # GITHUB_TOKEN does not emit a workflow-triggering event)
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - uses: pnpm/action-setup@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: pnpm
-          # No registry-url: that writes an .npmrc with a placeholder auth
-          # token that breaks the OIDC trusted-publisher path. Default registry
-          # is correct; auth is via OIDC, not a stored token.
 
       # npm 11+ is required for the OIDC Trusted Publisher token exchange.
-      # Node 20 ships npm 10.x; `pnpm publish` delegates the actual PUT to npm.
       - name: Upgrade npm to support OIDC Trusted Publisher
-        run: |
-          npm install -g npm@latest
-          npm --version
+        run: npm install -g npm@latest
 
-      # Record the previous release tag now, before we add the new one, so the
-      # GitHub Release notes can list every commit since the last release.
+      # Record the previous release tag before adding the new one, for notes.
       - name: Capture previous release tag
         id: prev
         run: |
@@ -144,51 +231,62 @@ jobs:
           echo "tag=$PREV" >> "$GITHUB_OUTPUT"
           echo "Previous release tag: ${PREV:-<none>}"
 
-      - name: Set version across all four packages
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          for dir in $PACKAGES; do
-            ( cd "$dir" && npm pkg set version="$VERSION" )
-          done
-
-      - run: pnpm install --no-frozen-lockfile
-
+      - run: pnpm install --frozen-lockfile
       - run: pnpm -r run build
 
-      # The irreversible step. Auth is npm Trusted Publishing (OIDC): this repo
-      # + this workflow + the `npm-publish` environment are configured as a
-      # trusted publisher on each package. No NPM_TOKEN — if one were set, npm
-      # would prefer it and bypass the trusted-publisher contract.
+      # Last guard before the irreversible publish: every manifest must agree on
+      # VERSION (lockstep integrity), then re-validate the tarballs.
+      - name: Pre-publish safety checks
+        run: |
+          for dir in $PACKAGES; do
+            V="$(node -p "require('./$dir/package.json').version")"
+            if [ "$V" != "$VERSION" ]; then
+              echo "::error::$dir is at $V but expected $VERSION — packages not in lockstep"
+              exit 1
+            fi
+          done
+          echo "All four manifests at $VERSION."
+          # Surface any of the four already on npm (pnpm will skip those). NOT
+          # fatal — keeps partial-failure re-runs idempotent.
+          for pkg in @piplabs/cdr-contracts @piplabs/cdr-crypto @piplabs/cdr-sdk @piplabs/cdr-cli; do
+            if npm view "$pkg@$VERSION" version >/dev/null 2>&1; then
+              echo "::warning::$pkg@$VERSION already on npm — pnpm will skip it."
+            fi
+          done
+
+      - name: Verify publish tarballs (dry-run)
+        run: pnpm -r publish --dry-run --no-git-checks
+
+      # Irreversible. Publishes the merged commit's package.json (already at the
+      # release version). Auth is OIDC trusted publishing — no NPM_TOKEN.
       - name: Publish to npm
         run: pnpm -r publish --no-git-checks
         env:
           NPM_CONFIG_PROVENANCE: "true"
 
-      # Only after a successful publish do we record the release in git, so main
-      # never advertises a version that didn't actually reach npm.
-      - name: Commit version bump, tag, and push to main
-        env:
-          VERSION: ${{ inputs.version }}
+      # Tag the merged commit (= main HEAD). Tags aren't covered by the main
+      # branch ruleset, so this push is allowed.
+      - name: Tag the released commit
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "chore: release v$VERSION"
           git tag "v$VERSION"
-          git push origin HEAD:main
           git push origin "v$VERSION"
 
-      # Notes = every commit since the previous release tag. Placeholder content
-      # for maintainers to edit afterwards.
+      # Notes = commits since the previous release tag. Edit afterwards.
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ inputs.version }}
           PREV_TAG: ${{ steps.prev.outputs.tag }}
         run: |
           RANGE="${PREV_TAG:+$PREV_TAG..}HEAD"
-          NOTES="$(git log $RANGE --no-merges --pretty=format:'- %s (%h)')"
+          NOTES="$(git log "$RANGE" --no-merges --pretty=format:'- %s (%h)')"
           gh release create "v$VERSION" \
             --title "v$VERSION" \
             --notes "${NOTES:-_No commits found since previous release._}"
+
+      # Kick off the post-release smoke tests explicitly with the exact version
+      - name: Trigger post-release smoke tests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run post-release-integration.yml -f version="$VERSION"

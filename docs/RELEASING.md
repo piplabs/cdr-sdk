@@ -2,48 +2,50 @@
 
 Maintainer-facing guide for cutting a new version of `@piplabs/cdr-contracts`, `@piplabs/cdr-crypto`, `@piplabs/cdr-sdk`, and `@piplabs/cdr-cli` to the npm public registry.
 
-> Releases are cut by **manually running the `Release` workflow** and typing the version. All four packages move in **lockstep** (same version every release). Publishing is gated by a GitHub `npm-publish` environment with required reviewers, and authenticated via npm **Trusted Publishing (OIDC)**. 
+> Releases are **two-phase**: run the `Release` workflow to open a version-bump PR, then squash-merge it to publish. All four packages move in **lockstep** (same version every release). Publishing is gated by a GitHub `npm-publish` environment with a required reviewer, and authenticated via npm **Trusted Publishing (OIDC)** — no long-lived token.
 
 ## How a release works
 
-One workflow, [`.github/workflows/release.yml`](../.github/workflows/release.yml), triggered by hand (`workflow_dispatch`) with a single `version` input (e.g. `0.2.2`). It runs two jobs:
+One workflow, [`.github/workflows/release.yml`](../.github/workflows/release.yml), with two triggers. `main`, the git tag, the npm tarballs, and the provenance all end up referencing the **same merged commit** — no SHA divergence even though we squash-merge.
 
-**`prepare`** — runs immediately, no gate, **no external side effects**:
+**Phase 1 — `open-pr` job** (trigger: `workflow_dispatch` with a `version` input; **no gate, no external side effects**):
 - Validates the input is valid semver and strictly greater than the current npm `latest`.
-- Sets the version in all four `package.json` files (on the runner only).
-- `pnpm install` + audit (high+ severity prod-dep gate) + `pnpm -r run build` + `pnpm -r publish --dry-run`.
-- This is the reviewer's green pre-flight: it proves the release builds and packs before anyone approves the irreversible publish.
+- Bumps all four `package.json` on a `release/v<version>` branch.
+- `pnpm install --frozen-lockfile` + audit (high+ severity prod-dep gate) + `pnpm -r run build` + `pnpm -r publish --dry-run` (packaging pre-flight).
+- Opens a **`chore: release v<version>`** PR. Publishes nothing; the bump isn't on `main` yet.
 
-**`publish`** — `environment: npm-publish`, so a **required reviewer must click "Approve and deploy"** before any step runs. Only after approval:
-- `pnpm -r publish` to npm via OIDC trusted publishing, with provenance.
-- Pushes the version-bump commit **directly to `main`** and a `v<version>` tag.
-- Creates a GitHub Release titled `v<version>`, with notes auto-populated from every commit since the previous `v*` tag (edit afterwards as needed).
+**Phase 2 — `detect` + `publish` jobs** (trigger: `push` to `main`, i.e. the squash-merge of that PR):
+- `detect` (no gate, read-only): marks a release only when **both** the version in `main` is ahead of npm `latest` **and** the head commit starts with `chore: release v`. Ordinary merges fail this and `publish` is skipped — no approval prompt.
+- `publish` (`environment: npm-publish`, **required reviewer must Approve before any step runs**): `pnpm -r publish` via OIDC + provenance **from the merged commit**, then tags that commit `v<version>` and cuts a GitHub Release (notes = commits since the previous `v*` tag, edit afterwards). It never pushes to the `main` ref — the bump already arrived there via the merged PR.
 
-Publish happens **before** the commit/tag/Release are pushed, so `main` never advertises a version that didn't actually reach npm.
+> **`open-pr` is a pre-flight, not a guarantee.** `open-pr` and `publish` run on separate runners, so `publish` re-runs install/build. Both use `--frozen-lockfile`, so a green `open-pr` is a strong signal — but not a hard guarantee `publish` succeeds (e.g. a registry outage). The dry-run exists to catch packaging regressions early, not to make `publish` infallible.
 
-### The approval gate
+### Triggers and gates, in order
 
-The publish job cannot do anything until a reviewer approves in the Actions UI (and "Prevent self-review" stops you approving your own run). If you hold off, **nothing goes live** — no npm publish, no commit to `main`, no tag, no Release. The run waits up to 30 days, or you can cancel it, and the world is unchanged. Approving is the single irreversible moment.
+1. **Trigger — `workflow_dispatch`** (write-access collaborators only; public read access does *not* grant this): opens the PR. Harmless — publishes nothing.
+2. **Gate — branch protection** on the PR merge: required checks + review + signatures, then a human squash-merges.
+3. **Trigger — `push` to `main`**: the merge. `detect` filters it to real releases.
+4. **Gate — `npm-publish` environment**: holds the entire `publish` job in "Waiting" until a required reviewer clicks **Approve and deploy** ("Prevent self-review" stops you approving your own). Hold off and **nothing goes live**; the irreversible publish is the only thing behind this gate.
 
 ## Day-to-day: shipping a code change
 
-Just merge PRs to `main` as normal — there is no per-PR release bookkeeping (no changeset files, no changelog to maintain). When you want to ship what's accumulated:
+Merge PRs to `main` as normal — no per-PR release bookkeeping (no changeset files, no changelog). When you want to ship what's accumulated:
 
-1. Decide the new version (semver, greater than current npm `latest`).
-2. **Actions → Release → Run workflow**, type the version (e.g. `0.2.2`), Run.
-3. Watch the `prepare` job go green (validation + build + dry-run).
-4. A reviewer (not the trigger-er) opens the run, expands the `publish` job, confirms the version is what's intended, and clicks **Approve and deploy**.
-5. The workflow publishes all four packages, pushes the bump + `v0.2.2` tag to `main`, and opens the GitHub Release.
+1. **Actions → Release → Run workflow**, type the version (e.g. `0.2.2`), Run. → a `chore: release v0.2.2` PR appears once `open-pr` is green.
+2. Review the bump PR and **squash-merge** it. (Keep the squash commit title starting with `chore: release v` — it's the publish marker.)
+3. The merge starts the **publish** path; `detect` sees the version is ahead of npm and the `publish` job requests approval.
+4. A reviewer (not the merger, ideally) opens the run, confirms the version, and clicks **Approve and deploy**.
+5. All four packages publish; the merged commit is tagged `v0.2.2` and a GitHub Release is cut.
 6. Edit the auto-generated Release notes if you want them tidied.
 
 `npm install @piplabs/cdr-sdk` resolves to the new version as soon as publish finishes — `pnpm publish` (no `--tag`) moves the `latest` dist-tag automatically.
 
 ## Reviewing the approval
 
-Before clicking Approve:
+Before clicking Approve on the `publish` job:
 
-- [ ] The `version` input matches what you intend to ship.
-- [ ] The `prepare` job passed (build + audit + dry-run all green).
+- [ ] The version being published matches what you intend to ship.
+- [ ] The merged commit is the `chore: release v<version>` bump (not something unexpected that happened to be ahead of npm).
 - [ ] The version is greater than the current npm `latest` (the workflow enforces this, but sanity-check).
 
 This is the irreversible step — once published, a version cannot be reused.
@@ -102,9 +104,10 @@ If a publish fails authentication, check the trusted-publisher config on npm mat
 |---|---|
 | Published a wrong version (within 72 hours) | `npm unpublish @piplabs/<package>@<version>` (org member with publish rights). After 72 hours, npm policy denies unpublish. |
 | Published a wrong version (> 72 hours) | Cannot unpublish. `npm deprecate @piplabs/<package>@<version> "Please use <newer-version> instead"` and ship a corrected version on top. |
-| `pnpm -r publish` failed partway through the four packages | `pnpm -r publish` checks the registry and **skips packages already published**, so it's idempotent — re-running at the **same version** publishes only the stragglers. The version-bump commit/tag is **not** pushed until publish fully succeeds, so on failure `main` is untouched. ⚠️ Edge case: if `@piplabs/cdr-sdk` itself published before the failure, `prepare`'s validation (which compares the input against `cdr-sdk`'s npm `latest`) will reject the same version on re-run — in that case publish the missing package(s) manually at that version, or bump all four to the next version. |
-| Reviewer approved a run that shouldn't publish | If publish hasn't run yet, **Cancel workflow** in the Actions UI. If it has, fall back to unpublish/deprecate above. |
-| Input version rejected by `prepare` | It's not valid semver or not greater than npm `latest`. Re-run with a corrected version. |
+| `pnpm -r publish` failed partway through the four packages | The bump is already on `main` (the PR merged); only the tag/Release are still pending (they happen after a full publish). `pnpm -r publish` **skips packages already on the registry**, so use **Actions → re-run failed jobs** on that run. ⚠️ Edge case: if `@piplabs/cdr-sdk` itself published before the failure, `detect` will now see the version as *not* ahead of npm and skip `publish` on re-run — in that case publish the missing package(s) manually at that version, or open a new release PR at the next version. |
+| Reviewer approved a run that shouldn't publish | If the `publish` job hasn't run yet, **Cancel workflow** in the Actions UI. If it has, fall back to unpublish/deprecate above. |
+| Version rejected by `open-pr` validation | It's not valid semver or not greater than npm `latest`. Re-run the Release workflow with a corrected version. |
+| Squash commit title was edited and lost the `chore: release v` prefix | `detect` won't recognize it, so `publish` is skipped and nothing publishes. The bump is on `main` but unpublished — push an empty/trivial commit titled `chore: release v<version>` to `main` (via a PR), or run the publish manually. Keep release PR titles intact to avoid this. |
 
 ## Verifying provenance
 
