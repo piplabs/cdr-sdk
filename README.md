@@ -168,8 +168,7 @@ For unit + integration test setup and the workspace examples runner, see [`docs/
 - **[Architecture](./docs/ARCHITECTURE.md)** — How CDR works end-to-end: DKG, threshold encryption, on-chain flow
 - **[Condition Contracts](./docs/CONDITIONS.md)** — Write and read access control: interface spec, deployed contracts, debugging
 - **[Development](./docs/DEVELOPMENT.md)** — Workspace setup, running unit + integration tests, executing example scripts
-- **[Releasing](./docs/RELEASING.md)** — Maintainer guide: changesets flow, npm publish gates, post-release verification
-- **[Changelog](./CHANGELOG.md)** — Release history
+- **[Releasing](./docs/RELEASING.md)** — Maintainer guide: manual version-input release workflow, npm publish gates, post-release verification
 
 ## License
 

@@ -5,18 +5,17 @@ name: Post-Release Integration
 # missing exports/engines fields, version-stamp drift, and partial / non-
 # lockstep releases. See issue #102 for motivation.
 #
-# Triggers: workflow_run after every Release completion (gated to the
-# publish commit marker), or workflow_dispatch with optional version input.
+# Trigger: workflow_dispatch only. The Release workflow's publish job dispatches
+# this with the exact published version after cutting a Release (a Release made
+# via GITHUB_TOKEN does NOT emit a workflow-triggering `release` event, so we
+# invoke it explicitly). Can also be run by hand; empty version = npm latest.
 
-run-name: post-release-${{ inputs.version || github.event.workflow_run.head_sha || 'latest' }}
+run-name: post-release-${{ inputs.version || 'latest' }}
 
 permissions:
   contents: read
 
 on:
-  workflow_run:
-    workflows: [Release]
-    types: [completed]
   workflow_dispatch:
     inputs:
       version:
@@ -33,17 +32,9 @@ concurrency:
 
 jobs:
   prepare:
-    # workflow_dispatch is always allowed. workflow_run fires for every
-    # Release completion (including main pushes that didn't publish — the
-    # publish job in release.yml is gated on the commit-message marker and
-    # skips quietly otherwise), so we additionally require both upstream
-    # success and the publish marker to be present.
-    if: >-
-      ${{
-        github.event_name == 'workflow_dispatch' ||
-        (github.event.workflow_run.conclusion == 'success' &&
-         contains(github.event.workflow_run.head_commit.message, 'chore: release packages'))
-      }}
+    # Always runs for this workflow's only trigger (workflow_dispatch); the
+    # version-resolution step below fails closed if no version can be resolved.
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -109,7 +100,7 @@ jobs:
         if: always()
         env:
           GH_EVENT_NAME: ${{ github.event_name }}
-          GH_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          GH_SHA: ${{ github.sha }}
           VERSION: ${{ steps.resolve.outputs.version }}
           SOURCE: ${{ steps.resolve.outputs.source }}
           LOCKSTEP_OUTCOME: ${{ steps.lockstep.outcome }}
@@ -470,7 +461,7 @@ jobs:
       # always the one that shipped with the tarball under test. 
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || format('v{0}', needs.prepare.outputs.version) }}
+          ref: ${{ format('v{0}', needs.prepare.outputs.version) }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -620,8 +611,8 @@ jobs:
               *)                  SKIP=$((SKIP+1)) ;;
             esac
           done
-          # Non-publish workflow_run triggers cause `prepare` to skip
-          # via its job-level if-guard; verify + e2e then skip via
+          # A dispatch run with no resolvable version causes `prepare` to
+          # skip via its job-level if-guard; verify + e2e then skip via
           # needs-chain. All three skipped = workflow legitimately
           # bailed at the gate, not a failure.
           if [ "$PREPARE_RESULT" = "skipped" ] && [ "$VERIFY_RESULT" = "skipped" ] && [ "$E2E_RESULT" = "skipped" ]; then

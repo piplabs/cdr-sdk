@@ -2,123 +2,57 @@
 
 Maintainer-facing guide for cutting a new version of `@piplabs/cdr-contracts`, `@piplabs/cdr-crypto`, `@piplabs/cdr-sdk`, and `@piplabs/cdr-cli` to the npm public registry.
 
-> The release pipeline is fully automated by [Changesets](https://github.com/changesets/changesets) + [`changesets/action`](https://github.com/changesets/action), gated by a GitHub `npm-publish` environment with required reviewers. **Do not run `pnpm publish` manually.** All releases go through `main` and the gates below.
+> Releases are **two-phase**: run the `Release` workflow to open a version-bump PR, then squash-merge it to publish. All four packages move in **lockstep** (same version every release). Publishing is gated by a GitHub `npm-publish` environment with a required reviewer, and authenticated via npm **Trusted Publishing (OIDC)** — no long-lived token.
 
-## Pipeline architecture
+## How a release works
 
-Two **independent** workflows trigger on every push to `main`. They are split so a single failure in one workflow (e.g., audit catches a new CVE) never blocks the other.
+One workflow, [`.github/workflows/release.yml`](../.github/workflows/release.yml), with two triggers. `main`, the git tag, the npm tarballs, and the provenance all end up referencing the **same merged commit** — no SHA divergence even though we squash-merge.
 
-**`.github/workflows/bot-sync.yml` — Version Packages PR manager** (runs on every main push)
-- `pnpm install --frozen-lockfile` — minimal install (needed by `changesets/action`)
-- `changesets/action@v1` — opens / updates / closes the "Version Packages" PR depending on whether unreleased `.changeset/*.md` files exist
-- No build, no test, no audit. Cannot publish (no `publish` input passed to the action).
+**Phase 1 — `open-pr` job** (trigger: `workflow_dispatch` with a `version` input; **no gate, no external side effects**):
+- Validates the input is valid semver and strictly greater than the current npm `latest`.
+- Bumps all four `package.json` on a `release/v<version>` branch.
+- `pnpm install --frozen-lockfile` + audit (high+ severity prod-dep gate) + `pnpm -r run build` + `pnpm -r publish --dry-run` (packaging pre-flight).
+- Opens a **`chore: release v<version>`** PR. Publishes nothing; the bump isn't on `main` yet.
 
-**`.github/workflows/release.yml` — npm publish** (runs only on release commits)
-- Job-level guard: `if: contains(github.event.head_commit.message, 'chore: release packages')`. Any main push whose merge commit message lacks this marker is skipped before the runner starts.
-- `pnpm install --frozen-lockfile` + audit (high+ severity prod-dep gate) + `pnpm -r run build` + `pnpm -r publish --dry-run` + `pnpm changeset publish` (with OIDC provenance).
-- `environment: npm-publish` — required reviewer must click **Approve and deploy** before any step runs.
+**Phase 2 — `detect` + `publish` jobs** (trigger: `push` to `main`, i.e. the squash-merge of that PR):
+- `detect` (no gate, read-only): marks a release only when **both** the version in `main` is ahead of npm `latest` **and** the head commit starts with `chore: release v`. Ordinary merges fail this and `publish` is skipped — no approval prompt.
+- `publish` (`environment: npm-publish`, **required reviewer must Approve before any step runs**): `pnpm -r publish` via OIDC + provenance **from the merged commit**, then tags that commit `v<version>` and cuts a GitHub Release (notes = commits since the previous `v*` tag, edit afterwards). It never pushes to the `main` ref — the bump already arrived there via the merged PR.
 
-**`.github/workflows/test.yml` — unit tests** (runs on every PR + main push)
-- Independent of the release pipeline. Branch-protection-required for PR merges to `main`, so by the time a commit reaches `main` the unit tests are known to be green.
+> **`open-pr` is a pre-flight, not a guarantee.** `open-pr` and `publish` run on separate runners, so `publish` re-runs install/build. Both use `--frozen-lockfile`, so a green `open-pr` is a strong signal — but not a hard guarantee `publish` succeeds (e.g. a registry outage). The dry-run exists to catch packaging regressions early, not to make `publish` infallible.
 
-**`.github/workflows/post-release-integration.yml` — published-artifact smoke** (runs after every successful `release.yml`; also `workflow_dispatch` for manual re-runs)
-- `workflow_run` trigger gated on the upstream's `chore: release packages` marker. Manual dispatch accepts an optional `version` input (empty = npm-latest).
-- Three sequential gates that exercise the **published tarballs**, not the workspace tree: `prepare` (version resolution + 4-package lockstep), `verify` (clean-room `npm install` + `package.json` field audit + ESM/CJS import smoke + `cdr-cli --version`), `e2e-aeneid` (`uploadCDR` + `accessCDR` on Aeneid via funded subwallet).
-- Failures upload diagnostic artifacts and write per-gate tables to the run summary. Recovery flow below.
+### Triggers and gates, in order
 
-### Why the split
-
-The previous design ran build/test/audit AND `changesets/action` in the same job, meaning a failing audit step short-circuited the bot — no Version Packages PR could be opened or updated until the audit-blocking CVE was hotfixed. With the split: audit only blocks the actual publish; the bot keeps maintaining the Version Packages PR regardless of audit / test state.
-
-### Load-bearing operational rule
-
-> **Do not rename the auto-generated "chore: release packages" PR before merging.** The publish guard in `release.yml` checks that the merge commit message contains the literal string `"chore: release packages"`. A renamed title fails the guard closed → `release.yml` skips → no publish. (The bot uses that exact string as the PR title via the `title:` input on `changesets/action@v1` so the default squash-merge commit message already contains the marker — no need to hand-edit it.)
-
-For exact action behaviour see the upstream [`changesets/action` README](https://github.com/changesets/action#readme).
+1. **Trigger — `workflow_dispatch`** (write-access collaborators only; public read access does *not* grant this): opens the PR. Harmless — publishes nothing.
+2. **Gate — branch protection** on the PR merge: required checks + review + signatures, then a human squash-merges.
+3. **Trigger — `push` to `main`**: the merge. `detect` filters it to real releases.
+4. **Gate — `npm-publish` environment**: holds the entire `publish` job in "Waiting" until a required reviewer clicks **Approve and deploy** ("Prevent self-review" stops you approving your own). Hold off and **nothing goes live**; the irreversible publish is the only thing behind this gate.
 
 ## Day-to-day: shipping a code change
 
-```sh
-# 1. Branch + code
-git checkout -b yourname/some-feature
-# ... edit files ...
+Merge PRs to `main` as normal — no per-PR release bookkeeping (no changeset files, no changelog). When you want to ship what's accumulated:
 
-# 2. Declare intent (interactive)
-pnpm changeset
-# Prompts:
-#   - Which packages should be bumped?  (space to toggle, enter to confirm)
-#   - Which packages should have a major bump? (rarely)
-#   - Which packages should have a minor bump? (new public API)
-#   - The remaining are patch (bug fix / internal refactor)
-#   - Summary: short sentence that becomes a CHANGELOG bullet
-# Writes a file like .changeset/clever-mountain-rhinos.md
-git add .changeset/ <your-other-changes>
-git commit -m "feat(sdk): your change"
-git push origin yourname/some-feature
-gh pr create
-```
+1. **Actions → Release → Run workflow**, type the version (e.g. `0.2.2`), Run. → a `chore: release v0.2.2` PR appears once `open-pr` is green.
+2. Review the bump PR and **squash-merge** it. (Keep the squash commit title starting with `chore: release v` — it's the publish marker.)
+3. The merge starts the **publish** path; `detect` sees the version is ahead of npm and the `publish` job requests approval.
+4. A reviewer (not the merger, ideally) opens the run, confirms the version, and clicks **Approve and deploy**.
+5. All four packages publish; the merged commit is tagged `v0.2.2` and a GitHub Release is cut.
+6. Edit the auto-generated Release notes if you want them tidied.
 
-A PR with no `.changeset/*.md` is fine for pure docs / chore work that should not bump any package version. To declare "no version bump needed" explicitly, use `pnpm changeset --empty`.
-
-After your PR merges to `main`:
-
-1. **`bot-sync.yml`** runs (install + `changesets/action`). It sees your `.md` file and opens (or updates) a PR titled **"chore: release packages"** that:
-   - Bumps the affected packages' `version` fields in `package.json`
-   - Appends a CHANGELOG entry per package using `@changesets/changelog-github` (auto-links your PR + handle)
-   - Deletes the consumed `.changeset/*.md`
-   `test.yml` also runs in parallel to verify unit tests still pass on the new `main` commit.
-2. **`release.yml`** triggers but its `if` guard evaluates false (the merge commit message is your feature PR's title, not `chore: release packages`), so the job is skipped before the runner starts. No environment approval is requested.
-3. Maintainer reviews the "chore: release packages" PR (see [Reviewing the Version Packages PR](#reviewing-the-version-packages-pr) below) and merges it. **Do not rename the PR title** — the publish guard depends on it.
-4. On that merge, **`bot-sync.yml`** runs again and no-ops (no `.md` files left). **`release.yml`** triggers, its `if` guard evaluates true, the runner starts, and the `publish` job reaches the `environment: npm-publish` gate.
-5. A reviewer (someone in the environment's required reviewers list, not yourself due to **Prevent self-review**) approves in the Actions UI.
-6. `pnpm changeset publish` runs, which:
-   - Publishes each bumped package (whose `package.json.version > npm dist-tags.latest`)
-   - Adds OIDC-signed npm provenance attestation
-   - Creates per-package git tags like `@piplabs/cdr-sdk@0.1.3`
-   - Creates a GitHub Release per tag (`createGithubReleases` defaults to true)
-
-## First-time release of an unpublished package
-
-Same flow as day-to-day. The only nuance: the changeset should list **all three packages** so they all get the same version bump and ship together:
-
-```sh
-pnpm changeset
-# When prompted "Which packages should be bumped?":
-#   ◉ @piplabs/cdr-contracts
-#   ◉ @piplabs/cdr-crypto
-#   ◉ @piplabs/cdr-sdk
-# Bump type: patch (the existing 0.1.1 in package.json bumps to 0.1.2)
-# Summary: "Initial public release."
-```
-
-The Version Packages PR will bump all three to 0.1.2. After it merges + final approval, `pnpm changeset publish` publishes all three. From then on, packages can version independently — only mention the ones you changed in subsequent changesets.
+`npm install @piplabs/cdr-sdk` resolves to the new version as soon as publish finishes — `pnpm publish` (no `--tag`) moves the `latest` dist-tag automatically.
 
 ## Reviewing the approval
 
-The `npm-publish` environment gate is reached **only when the publish job runs**, which happens only on the merge of an auto-generated Version Packages PR. Reviewer responsibility at approval time:
+Before clicking Approve on the `publish` job:
 
-| The Actions run is for | What approval means |
-|---|---|
-| A merged "chore: release packages" PR (Version Packages PR) | Approve to publish to npm. **This is the irreversible step.** Confirm the package versions in the merge commit's `package.json` diffs match what you expect to ship. |
-| Anything else (chore / docs / fix / feature PR with changeset) | The publish job's `if` guard skips this run — no approval is requested in the first place. If you do see an unexpected approval request, **DO NOT APPROVE.** Investigate the merge commit; the only way the publish job runs is if its commit message contains `chore: release packages`, which should mean the Version Packages PR was merged.
+- [ ] The version being published matches what you intend to ship.
+- [ ] The merged commit is the `chore: release v<version>` bump (not something unexpected that happened to be ahead of npm).
+- [ ] The version is greater than the current npm `latest` (the workflow enforces this, but sanity-check).
 
-Before clicking Approve, click into the run, expand the `publish` job, and verify the diff that triggered it actually bumps versions you intend to release.
-
-## Reviewing the Version Packages PR
-
-Auto-opened by `changesets/action`, title `chore: release packages` (default). Review checklist:
-
-- [ ] `package.json` `version` bumps match the bump types declared in the consumed `.changeset/*.md` files (patch / minor / major)
-- [ ] `CHANGELOG.md` entries per package include the original PR's summary text + auto-generated PR link + contributor handle
-- [ ] No spurious changes outside `package.json` + `CHANGELOG.md` + `.changeset/` deletions
-- [ ] If multiple packages are bumped, `dependencies` in dependent packages reflects the new versions (e.g. `cdr-sdk` deps section should show `cdr-contracts: "0.1.2"` not `"workspace:*"` or `"0.1.1"`)
-- [ ] If this PR bumps to a new minor / major, the affected packages' breaking changes are reflected in the CHANGELOG, and any consumer-facing migration notes are present
-
-A bug in the bump type (e.g. patch declared but should have been minor) is fixed by editing `package.json` and `CHANGELOG.md` directly in the Version Packages PR before merging — Changesets's bump is a starting point, not gospel.
+This is the irreversible step — once published, a version cannot be reused.
 
 ## Local dry-run with Verdaccio
 
-Before any release with non-trivial publish surface changes (file layout, new dist outputs, peer-dep changes, scope tweaks), validate with [Verdaccio](https://verdaccio.org/) — a local npm registry mirror:
+Before a release with non-trivial publish-surface changes (file layout, new dist outputs, peer-dep changes, scope tweaks), validate against [Verdaccio](https://verdaccio.org/), a local npm registry mirror:
 
 ```sh
 # 1. Spin up Verdaccio
@@ -137,16 +71,12 @@ registry=http://localhost:4873/
 //localhost:4873/:_authToken=<paste-token>
 EOF
 
-# 4. Build + publish all 3 packages to Verdaccio
+# 4. Build + publish all four packages to Verdaccio
 pnpm install
 pnpm -r run build
-
-cd packages/contracts
-NPM_CONFIG_USERCONFIG=/tmp/verdaccio.npmrc pnpm publish --registry http://localhost:4873/ --no-git-checks
-cd ../crypto
-NPM_CONFIG_USERCONFIG=/tmp/verdaccio.npmrc pnpm publish --registry http://localhost:4873/ --no-git-checks
-cd ../sdk
-NPM_CONFIG_USERCONFIG=/tmp/verdaccio.npmrc pnpm publish --registry http://localhost:4873/ --no-git-checks
+for dir in packages/contracts packages/crypto packages/sdk apps/cli; do
+  ( cd "$dir" && NPM_CONFIG_USERCONFIG=/tmp/verdaccio.npmrc pnpm publish --registry http://localhost:4873/ --no-git-checks )
+done
 
 # 5. Smoke test: install in a fresh project
 mkdir /tmp/cdr-smoke && cd /tmp/cdr-smoke
@@ -160,59 +90,38 @@ sudo rm -rf /tmp/verdaccio-storage
 rm -rf /tmp/cdr-smoke /tmp/verdaccio.npmrc
 ```
 
-This catches: malformed `package.json`, missing `dist/`, `workspace:*` not substituted, runtime import failures — all without touching public npm.
+This catches malformed `package.json`, missing `dist/`, `workspace:*` not substituted, and runtime import failures — all without touching public npm.
 
-## Rotating NPM_TOKEN
+## Authentication: npm Trusted Publishing (OIDC)
 
-The `NPM_TOKEN` environment secret has a 90-day expiration by default. Rotate it before expiry. Any maintainer with publish rights to the `@piplabs` npm org can perform the rotation; the token belongs to whoever generated it, not to a fixed individual.
+There is **no `NPM_TOKEN`** in this repo. Each of the four packages has this repo + `release.yml` + the `npm-publish` environment configured as a **trusted publisher** in its npm package settings (npmjs.com → package → Settings → Trusted Publisher). At publish time GitHub mints a short-lived OIDC token that npm exchanges for a single-use publish credential — nothing is stored, nothing expires, nothing to rotate.
 
-1. Generate a new granular access token at https://www.npmjs.com/settings/<your-npm-handle>/tokens (the npmjs.com Account → Access Tokens page for your own npm user)
-   - Scope: `@piplabs` org, `Read and write` permission
-   - 90-day expiration
-2. **Verify the new token works against the real npm registry, locally**, before touching the secret:
-
-   ```sh
-   # Replace <new-token> with the value just generated.
-   # Single-line, no shell history (don't quote the token in a way that lands in ~/.zsh_history).
-   NPM_TOKEN_TEST=<new-token>; \
-     curl -fsS -H "Authorization: Bearer $NPM_TOKEN_TEST" https://registry.npmjs.org/-/whoami; \
-     unset NPM_TOKEN_TEST
-   # Expected: {"username":"<your-npm-handle>"}.  401 → token bad / wrong scope.
-   ```
-
-3. Repo Settings → Environments → `npm-publish` → Environment secrets → `NPM_TOKEN` → **Update**
-4. Revoke the old token in the previous owner's npmjs.com Access Tokens page
-
-If the token expires before rotation, releases fail at the publish step with a 401. Rotate, then re-run the failed workflow.
+If a publish fails authentication, check the trusted-publisher config on npm matches exactly: organization `piplabs`, repository `cdr-sdk`, workflow `release.yml`, environment `npm-publish`. Do **not** add an `NPM_TOKEN` secret — if both a token and the OIDC path are present, npm prefers the token and bypasses trusted publishing (and loses provenance).
 
 ## When something goes wrong
 
 | Situation | Recovery |
 |---|---|
-| Just published a wrong version (within 72 hours) | `npm unpublish @piplabs/<package>@<version>` (must be done by an org member with publish rights, from the same npm CLI auth that published). After 72 hours, unpublish is denied by npm policy. |
-| Just published a wrong version (> 72 hours) | Cannot unpublish. Use `npm deprecate @piplabs/<package>@<version> "Please use <newer-version> instead"` and ship a corrected version on top. |
-| `pnpm changeset publish` fails mid-way through 3 packages | Some packages published, others didn't. Check `npm view @piplabs/<each-package> versions` to identify what made it. Fix the underlying error, then re-run the workflow — `changeset publish` will skip already-published packages and only publish the rest. |
-| Wrong bump type committed (e.g. minor declared but should have been major) | Edit the `chore: release packages` PR before merging: bump `version` higher in `package.json`, edit CHANGELOG. The Changesets-generated content is editable. |
-| Reviewer accidentally approved a publish run that shouldn't have published | If npm publish hasn't completed yet, **Cancel workflow** in the Actions UI. If it has completed, fall back to unpublish/deprecate above. |
-| `npm publish` fails with `403 Forbidden` after token rotation | Granular token's package scope may not cover newly added packages. Either select the broader `@piplabs` scope when generating the token, or add the missing package explicitly. |
-| `post-release-integration` went red after a successful publish | Inspect the run summary's "Overall" table at the bottom and drill into the failing gate's section above. If transient (Aeneid RPC flake, npm registry mirror lag), re-run via Actions → "Post-Release Integration" → **Run workflow**. If reproducible, ship a fix-forward patch release that addresses the failing gate; don't advertise the broken version externally. |
+| Published a wrong version (within 72 hours) | `npm unpublish @piplabs/<package>@<version>` (org member with publish rights). After 72 hours, npm policy denies unpublish. |
+| Published a wrong version (> 72 hours) | Cannot unpublish. `npm deprecate @piplabs/<package>@<version> "Please use <newer-version> instead"` and ship a corrected version on top. |
+| `pnpm -r publish` failed partway through the four packages | The bump is already on `main` (the PR merged); only the tag/Release are still pending (they happen after a full publish). `pnpm -r publish` **skips packages already on the registry**, so use **Actions → re-run failed jobs** on that run. ⚠️ Edge case: if `@piplabs/cdr-sdk` itself published before the failure, `detect` will now see the version as *not* ahead of npm and skip `publish` on re-run — in that case publish the missing package(s) manually at that version, or open a new release PR at the next version. |
+| Reviewer approved a run that shouldn't publish | If the `publish` job hasn't run yet, **Cancel workflow** in the Actions UI. If it has, fall back to unpublish/deprecate above. |
+| Version rejected by `open-pr` validation | It's not valid semver or not greater than npm `latest`. Re-run the Release workflow with a corrected version. |
+| Squash commit title was edited and lost the `chore: release v` prefix | `detect` won't recognize it, so `publish` is skipped and nothing publishes. The bump is on `main` but unpublished — push an empty/trivial commit titled `chore: release v<version>` to `main` (via a PR), or run the publish manually. Keep release PR titles intact to avoid this. |
 
 ## Verifying provenance
 
-Configured via `NPM_CONFIG_PROVENANCE=true` in `.github/workflows/release.yml`. After publish, verify on npm:
+Configured via `NPM_CONFIG_PROVENANCE=true` in `release.yml`. After publish:
 
 ```sh
 npm view @piplabs/cdr-sdk@<version> --json | jq '.dist.attestations'
 ```
 
-Should show signed attestation bundle with the GitHub Actions run URL embedded. If absent, provenance configuration was lost — investigate the workflow env block.
+Should show a signed attestation bundle with the GitHub Actions run URL embedded. If absent, provenance config was lost — investigate the workflow env block.
 
 ## References
 
-- [Changesets — getting started](https://github.com/changesets/changesets#readme)
-- [Changesets CLI — full command list](https://github.com/changesets/changesets/blob/main/docs/command-line-options.md)
-- [`changesets/action` README](https://github.com/changesets/action#readme)
+- [npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers)
 - [npm provenance](https://docs.npmjs.com/generating-provenance-statements)
 - [GitHub Environments](https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment)
 - This repo's release workflow: [`.github/workflows/release.yml`](../.github/workflows/release.yml)
-- This repo's changesets config: [`.changeset/config.json`](../.changeset/config.json)
