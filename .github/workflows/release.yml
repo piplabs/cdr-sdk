@@ -94,8 +94,14 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       # Supply-chain pre-flight: fail on high+ severity vulns in shipped deps.
-      # pnpm 11 would self-delegate back to the `packageManager` pin, so audit a 
-      # pin-stripped copy of the lockfile in a temp dir instead.
+      # pnpm >=11 is the only line that speaks npm's current bulk advisory
+      # endpoint (older endpoints return HTTP 410), and it needs Node >=22.13
+      # (node:sqlite) — switch Node for this step only; restored right after.
+      # pnpm 11 would also self-delegate back to the `packageManager` pin, so
+      # audit a pin-stripped copy of the lockfile in a temp dir instead.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - name: Audit production dependencies
         run: |
           AUDIT_DIR="$(mktemp -d)"
@@ -119,6 +125,12 @@ jobs:
             exit 1
           fi
           echo "No high+ severity vulnerabilities in production deps."
+
+      # Restore the release build environment (deps were already installed
+      # under Node 20 above; no cache param needed here).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - run: pnpm -r run build
 
