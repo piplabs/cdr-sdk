@@ -247,8 +247,9 @@ jobs:
           cache: pnpm
 
       # npm 11+ is required for the OIDC Trusted Publisher token exchange.
+      # Pinned to the 11 line: npm 12 dropped Node 20 support.
       - name: Upgrade npm to support OIDC Trusted Publisher
-        run: npm install -g npm@latest
+        run: npm install -g npm@11
 
       # Record the previous release tag before adding the new one, for notes.
       - name: Capture previous release tag
