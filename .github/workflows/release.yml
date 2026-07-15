@@ -305,3 +305,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh workflow run post-release-integration.yml -f version="$VERSION"
+
+      # Maintain the release line branch (release/X.Y) at the latest released
+      # commit on that line.
+      - name: Update release line branch
+        run: |
+          LINE="release/$(echo "$VERSION" | cut -d. -f1-2)"
+          git push origin "HEAD:refs/heads/$LINE"
+          echo "Updated $LINE -> $(git rev-parse --short HEAD) (v$VERSION)"
