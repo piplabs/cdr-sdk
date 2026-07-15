@@ -94,13 +94,28 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       # Supply-chain pre-flight: fail on high+ severity vulns in shipped deps.
+      # pnpm 11 would self-delegate back to the `packageManager` pin, so audit a 
+      # pin-stripped copy of the lockfile in a temp dir instead.
       - name: Audit production dependencies
         run: |
-          pnpm audit --json --prod > /tmp/audit.json || true
-          COUNT=$(jq '[.advisories | to_entries[] | select(.value.severity == "high" or .value.severity == "critical")] | length' /tmp/audit.json)
+          AUDIT_DIR="$(mktemp -d)"
+          cp pnpm-lock.yaml pnpm-workspace.yaml "$AUDIT_DIR/"
+          jq 'del(.packageManager)' package.json > "$AUDIT_DIR/package.json"
+          (cd "$AUDIT_DIR" && npx -y pnpm@11 audit --json --prod > audit.json) || true
+          # Fail closed: no/invalid JSON or an {"error": ...} response means the
+          # audit didn't run — refuse to release on an unverified dep tree.
+          if ! jq -e . "$AUDIT_DIR/audit.json" >/dev/null 2>&1; then
+            echo "::error::pnpm audit produced no JSON output — failing closed"
+            exit 1
+          fi
+          if jq -e '.error' "$AUDIT_DIR/audit.json" >/dev/null; then
+            echo "::error::pnpm audit did not return advisories: $(jq -r '.error.message' "$AUDIT_DIR/audit.json")"
+            exit 1
+          fi
+          COUNT=$(jq '[.advisories | to_entries[] | select(.value.severity == "high" or .value.severity == "critical")] | length' "$AUDIT_DIR/audit.json")
           if [ "${COUNT:-0}" -gt 0 ]; then
             echo "::error::Found $COUNT high+ severity vulnerabilities in production deps"
-            jq '[.advisories | to_entries[] | select(.value.severity == "high" or .value.severity == "critical") | .value | {severity, title, module: .module_name}]' /tmp/audit.json
+            jq '[.advisories | to_entries[] | select(.value.severity == "high" or .value.severity == "critical") | .value | {severity, title, module: .module_name}]' "$AUDIT_DIR/audit.json"
             exit 1
           fi
           echo "No high+ severity vulnerabilities in production deps."
