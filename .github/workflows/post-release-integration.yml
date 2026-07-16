@@ -22,6 +22,11 @@ on:
         description: 'Version to verify (empty = resolve from npm latest)'
         required: false
         default: ''
+      force_e2e:
+        description: 'Run e2e-aeneid even if verify failed (burns ~0.1 IP; use only when the verify failures are known to be non-functional)'
+        required: false
+        type: boolean
+        default: false
 
 # Coalesce concurrent runs that target the same version. We don't
 # cancel-in-progress — a manual rerun while the auto-run is still going
@@ -445,7 +450,13 @@ jobs:
     # Sequential after `verify` (not parallel): if the install / audit /
     # smoke gates already failed, the artifact is known-broken and we
     # don't want to burn Aeneid test IP confirming the obvious.
+    # Exception: a human dispatch with force_e2e=true runs E2E despite a
+    # failed `verify` — for releases where the verify failures are known
+    # to be non-functional 
     needs: [prepare, verify]
+    if: >
+      always() && needs.prepare.result == 'success' &&
+      (needs.verify.result == 'success' || inputs.force_e2e == true)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
