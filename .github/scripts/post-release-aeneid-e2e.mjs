@@ -146,12 +146,8 @@ try {
     walletClient: subWallet,
     apiUrl: API_URL,
   });
-
-  // 10-byte returns-1 bytecode — open-condition fixture matching the
-  // examples / ephemeral-wallets suites. Always returns 1, so the
-  // upload/access flow is gated only by CDR contract logic itself.
   const openConditionBytecode =
-    "0x600a600c600039600a6000f3600160005260206000f3";
+    "0x602a600c600039602a6000f360003560e01c80635645dbbf14601f5780638db3eb1714601f5760006000fd5b600160005260206000f3";
   const deployTx = await subWallet.sendTransaction({
     data: openConditionBytecode,
     chain: subWallet.chain ?? null,

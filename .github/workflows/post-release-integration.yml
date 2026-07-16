@@ -27,6 +27,10 @@ on:
         required: false
         type: boolean
         default: false
+      harness_ref:
+        description: 'Git ref for the e2e harness checkout (empty = the vX.Y.Z tag under test). Set to main when the tagged harness has a test-only bug — tags are immutable, so harness fixes can never reach them.'
+        required: false
+        default: ''
 
 # Coalesce concurrent runs that target the same version. We don't
 # cancel-in-progress — a manual rerun while the auto-run is still going
@@ -469,10 +473,12 @@ jobs:
       # setup-node / install step environments.
     steps:
       # Pin checkout to the release revision so the harness file is
-      # always the one that shipped with the tarball under test. 
+      # always the one that shipped with the tarball under test.
+      # harness_ref overrides the pin for test-only harness fixes that
+      # postdate the (immutable) tag.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ format('v{0}', needs.prepare.outputs.version) }}
+          ref: ${{ inputs.harness_ref || format('v{0}', needs.prepare.outputs.version) }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
