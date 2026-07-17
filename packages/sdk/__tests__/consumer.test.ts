@@ -552,6 +552,63 @@ describe("Consumer", () => {
       }
     });
 
+    it("rejects pollIntervalMs combined with minIntervalMs/maxIntervalMs", async () => {
+      const { consumer } = makeConsumer(makeFakeObserver({ threshold: 2 }));
+      await expect(
+        consumer.collectPartials({
+          uuid: 1,
+          requesterPubKey: "0x04" as `0x${string}`,
+          pollIntervalMs: 5,
+          minIntervalMs: 5,
+        }),
+      ).rejects.toThrow(InvalidParamsError);
+    });
+
+    it("rejects an adaptive ceiling below the floor", async () => {
+      const { consumer } = makeConsumer(makeFakeObserver({ threshold: 2 }));
+      await expect(
+        consumer.collectPartials({
+          uuid: 1,
+          requesterPubKey: "0x04" as `0x${string}`,
+          minIntervalMs: 50,
+          maxIntervalMs: 10,
+        }),
+      ).rejects.toThrow(InvalidParamsError);
+    });
+
+    it("adaptive backoff polls less than a fixed floor-rate poll over the same window", async () => {
+      const { consumer } = makeConsumer(makeFakeObserver({ threshold: 3 }));
+      vi.mocked(queryCDRPartials).mockResolvedValue([]);
+
+      await consumer
+        .collectPartials({
+          uuid: 1,
+          requesterPubKey: "0x04" as `0x${string}`,
+          timeoutMs: 120,
+          minIntervalMs: 5,
+          maxIntervalMs: 40,
+        })
+        .catch(() => {});
+      const adaptivePolls = vi.mocked(queryCDRPartials).mock.calls.length;
+
+      vi.mocked(queryCDRPartials).mockClear();
+      await consumer
+        .collectPartials({
+          uuid: 1,
+          requesterPubKey: "0x04" as `0x${string}`,
+          timeoutMs: 120,
+          pollIntervalMs: 5,
+        })
+        .catch(() => {});
+      const fixedPolls = vi.mocked(queryCDRPartials).mock.calls.length;
+
+      // Backoff curve 5 → 7.5 → 11.25 → … → 40 covers the 120ms window in
+      // far fewer polls than a flat 5ms rate. Assert strictly-less rather
+      // than exact counts to stay robust to CI timer jitter.
+      expect(adaptivePolls).toBeGreaterThanOrEqual(2);
+      expect(adaptivePolls).toBeLessThan(fixedPolls);
+    });
+
     it("treats empty groups as 'wait, may arrive later'", async () => {
       const { consumer } = makeConsumer(makeFakeObserver({ threshold: 2 }));
       vi.mocked(queryCDRPartials)
