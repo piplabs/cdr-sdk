@@ -199,14 +199,15 @@ jobs:
               echo "CDR_TEST_PRIVATE_KEY=${{ secrets.CDR_AENEID_TEST_PRIVATE_KEY }}" >> $GITHUB_ENV
               # The public aeneid RPC rate-limits under burst load; run the
               # ephemeral-wallet suites at reduced concurrency there.
-              # Precedence: dispatch input > repo variable
-              # CDR_AENEID_WALLET_COUNT > hardcoded 50. Devnet keeps the
-              # suites' built-in default (100) unless the input is set.
-              echo "CDR_WALLET_COUNT=${{ inputs.concurrent_wallet_count || vars.CDR_AENEID_WALLET_COUNT || '50' }}" >> $GITHUB_ENV
+              # Aeneid default: repo variable CDR_AENEID_WALLET_COUNT,
+              # falling back to 50. Devnet keeps the suites' built-in 100.
+              echo "CDR_WALLET_COUNT=${{ vars.CDR_AENEID_WALLET_COUNT || '50' }}" >> $GITHUB_ENV
               ;;
           esac
 
-          # Explicit per-run override applies on any network.
+          # Explicit per-run override wins on any network (written last —
+          # GITHUB_ENV is last-write-wins, so this supersedes the aeneid
+          # default above).
           WC="${{ inputs.concurrent_wallet_count }}"
           if [ -n "$WC" ]; then
             echo "CDR_WALLET_COUNT=$WC" >> $GITHUB_ENV

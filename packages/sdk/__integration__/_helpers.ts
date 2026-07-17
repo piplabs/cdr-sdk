@@ -467,3 +467,23 @@ export async function sizeFundAndReport(opts: {
   );
   return perWalletFund;
 }
+
+/**
+ * Parse a positive-integer env override, falling back when the variable is
+ * unset, empty, non-numeric, zero or negative. Guards suites whose pass
+ * criteria scale with the value (e.g. `expect(n).toBe(WALLET_COUNT)` would
+ * vacuously pass with a NaN/0 wallet count).
+ */
+export function positiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[env] ${name}=${JSON.stringify(raw)} is not a positive integer; using ${fallback}`,
+    );
+    return fallback;
+  }
+  return n;
+}

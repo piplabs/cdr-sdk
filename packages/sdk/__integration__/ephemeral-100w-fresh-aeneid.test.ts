@@ -52,12 +52,13 @@ import {
   sizeFundAndReport,
   statsOf,
   writePerfStats,
+  positiveIntEnv,
 } from "./_helpers.js";
 import { pLimit, resilientHttp, withAeneidFlakeRetry } from "./_rpc-resilience.js";
 
 // Overridable so rate-limited networks (public Aeneid RPC) can run a reduced
 // concurrent-wallet load; defaults to the original 100 for devnet.
-const WALLET_COUNT = Number(process.env.CDR_WALLET_COUNT ?? "100");
+const WALLET_COUNT = positiveIntEnv("CDR_WALLET_COUNT", 100);
 const CYCLES_PER_WALLET = 1; // upload + access
 const ACCESS_TIMEOUT_MS = 180_000;
 const MAX_INFLIGHT = 25;
