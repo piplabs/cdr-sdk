@@ -329,7 +329,7 @@ export class Consumer {
    * const partials = await consumer.collectPartials({
    *   uuid: 42,
    *   requesterPubKey: "0x04...",
-   *   timeoutMs: 60_000,
+   *   timeoutMs: 180_000,
    * });
    * // partials[i].ciphertext is the same for every i — caller can use it
    * // for the subsequent decryptDataKey step without re-reading the chain.
@@ -339,7 +339,24 @@ export class Consumer {
     uuid: number;
     requesterPubKey: `0x${string}`;
     timeoutMs?: number;
+    /**
+     * Fixed poll interval. When set, adaptive backoff is disabled and the
+     * loop polls at exactly this rate. Mutually exclusive with `minIntervalMs`
+     * / `maxIntervalMs`.
+     */
     pollIntervalMs?: number;
+    /**
+     * Adaptive backoff floor (default 2000ms). The wait after the first
+     * poll; each subsequent poll grows the wait ×1.5 — partials mostly
+     * arrive shortly after the read tx, so polling thins out over time.
+     */
+    minIntervalMs?: number;
+    /**
+     * Optional adaptive backoff ceiling. Unset by default — the curve
+     * grows unbounded and is naturally capped by `timeoutMs` (each wait
+     * is clamped to the remaining budget) or by collection completing.
+     */
+    maxIntervalMs?: number;
     onInvalidPartial?: (
       event: PartialDecryptionEvent,
       reason: InvalidPartialReason,
@@ -362,8 +379,10 @@ export class Consumer {
     const {
       uuid,
       requesterPubKey,
-      timeoutMs = 60_000,
-      pollIntervalMs = 3_000,
+      timeoutMs = 180_000,
+      pollIntervalMs,
+      minIntervalMs,
+      maxIntervalMs,
       onInvalidPartial,
       attestationConfig,
       pinnedCiphertext,
@@ -371,6 +390,25 @@ export class Consumer {
 
     if (!requesterPubKey) {
       throw new InvalidParamsError("collectPartials: requesterPubKey is required");
+    }
+    if (
+      pollIntervalMs !== undefined &&
+      (minIntervalMs !== undefined || maxIntervalMs !== undefined)
+    ) {
+      throw new InvalidParamsError(
+        "collectPartials: pollIntervalMs (fixed rate) is mutually exclusive with minIntervalMs/maxIntervalMs (adaptive)",
+      );
+    }
+    // Fixed rate = a flat curve (floor == ceiling). Adaptive default:
+    // 2s floor, no ceiling — the curve grows ×1.5 per poll and is
+    // naturally bounded by the deadline clamp below or by collection
+    // completing. An explicit maxIntervalMs bounds the curve if set.
+    const intervalFloor = pollIntervalMs ?? minIntervalMs ?? 2_000;
+    const intervalCeil = pollIntervalMs ?? maxIntervalMs ?? Infinity;
+    if (intervalFloor <= 0 || intervalCeil < intervalFloor) {
+      throw new InvalidParamsError(
+        `collectPartials: invalid poll intervals (floor=${intervalFloor}ms, ceiling=${intervalCeil}ms)`,
+      );
     }
 
     // Pin the vault's current ciphertext for the entire poll loop. The
@@ -399,6 +437,12 @@ export class Consumer {
      * appears.
      */
     let lastNeeded = await this.observer.getThreshold().catch(() => 0);
+
+    // Adaptive backoff state: wait `interval` between polls,
+    // growing ×1.5 each iteration (unbounded unless maxIntervalMs is
+    // set) — partials mostly arrive shortly after the read tx, so
+    // polling thins out over time.
+    let interval = intervalFloor;
 
     while (Date.now() < deadline) {
       let groups: Awaited<ReturnType<typeof queryCDRPartials>> = [];
@@ -489,7 +533,12 @@ export class Consumer {
         }
       }
 
-      await sleep(pollIntervalMs);
+      // The wait is clamped to the remaining budget so the loop never
+      // overshoots the deadline by a full interval.
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      await sleep(Math.min(interval, remainingMs));
+      interval = Math.min(interval * 1.5, intervalCeil);
     }
 
     this.logger.warn("partial.collection.timeout", {
@@ -627,6 +676,12 @@ export class Consumer {
     recipientPrivKey?: Uint8Array;
     globalPubKey?: Uint8Array;
     timeoutMs?: number;
+    /** See {@link collectPartials} — fixed poll rate, disables backoff. */
+    pollIntervalMs?: number;
+    /** See {@link collectPartials} — adaptive backoff floor (default 2000ms). */
+    minIntervalMs?: number;
+    /** See {@link collectPartials} — optional adaptive backoff ceiling (unset = unbounded, clamped by timeoutMs). */
+    maxIntervalMs?: number;
     /** See {@link read}'s `feeOverride` — same strict-equality semantics. */
     feeOverride?: bigint;
     onInvalidPartial?: (
@@ -680,6 +735,9 @@ export class Consumer {
         uuid: params.uuid,
         requesterPubKey,
         timeoutMs: params.timeoutMs,
+        pollIntervalMs: params.pollIntervalMs,
+        minIntervalMs: params.minIntervalMs,
+        maxIntervalMs: params.maxIntervalMs,
         onInvalidPartial: params.onInvalidPartial,
         attestationConfig: params.attestationConfig,
         pinnedCiphertext: vaultCiphertext,
@@ -721,6 +779,12 @@ export class Consumer {
     globalPubKey?: Uint8Array;
     storageProvider: StorageProvider;
     timeoutMs?: number;
+    /** See {@link collectPartials} — fixed poll rate, disables backoff. */
+    pollIntervalMs?: number;
+    /** See {@link collectPartials} — adaptive backoff floor (default 2000ms). */
+    minIntervalMs?: number;
+    /** See {@link collectPartials} — optional adaptive backoff ceiling (unset = unbounded, clamped by timeoutMs). */
+    maxIntervalMs?: number;
     /** See {@link read}'s `feeOverride` — same strict-equality semantics. */
     feeOverride?: bigint;
     onInvalidPartial?: (
@@ -743,6 +807,9 @@ export class Consumer {
       recipientPrivKey: params.recipientPrivKey,
       globalPubKey: params.globalPubKey,
       timeoutMs: params.timeoutMs,
+      pollIntervalMs: params.pollIntervalMs,
+      minIntervalMs: params.minIntervalMs,
+      maxIntervalMs: params.maxIntervalMs,
       feeOverride: params.feeOverride,
       onInvalidPartial: params.onInvalidPartial,
       attestationConfig: params.attestationConfig,

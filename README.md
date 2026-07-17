@@ -68,7 +68,6 @@ const { uuid } = await client.uploader.uploadCDR({
 const { dataKey: recovered } = await client.consumer.accessCDR({
   uuid,
   accessAuxData: "0x",
-  timeoutMs: 120_000,
 });
 ```
 
@@ -132,7 +131,6 @@ const { content } = await client.consumer.downloadFile({
   uuid,
   accessAuxData: "0x",
   storageProvider: storage,
-  timeoutMs: 120_000,
 });
 ```
 

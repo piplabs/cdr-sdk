@@ -59,7 +59,6 @@ const accessAuxData = encodeAbiParameters(
 const { dataKey } = await client.consumer.accessCDR({
   uuid,
   accessAuxData,
-  timeoutMs: 120_000,
 });
 ```
 

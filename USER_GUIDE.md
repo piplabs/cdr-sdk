@@ -284,7 +284,10 @@ const { dataKey, txHash } = await client.consumer.accessCDR({
   requesterPubKey: `0x${string}`,         // your uncompressed secp256k1 public key
   recipientPrivKey: Uint8Array,           // your private key bytes (for ECIES decryption)
   globalPubKey?: Uint8Array,              // optional; auto-queried if omitted
-  timeoutMs?: number,                     // partial collection timeout (default: 60000)
+  timeoutMs?: number,                     // partial collection timeout (default: 180000)
+  pollIntervalMs?: number,                // fixed poll rate; disables adaptive backoff
+  minIntervalMs?: number,                 // adaptive backoff floor (default: 2000)
+  maxIntervalMs?: number,                 // optional backoff ceiling (default: uncapped)
   feeOverride?: bigint,                   // optional: override auto-queried read fee
 });
 ```
@@ -294,8 +297,15 @@ const { dataKey, txHash } = await client.consumer.accessCDR({
 | Method | Description |
 |--------|-------------|
 | `read({ uuid, accessAuxData, requesterPubKey, feeOverride? })` | Submit a read request on-chain |
-| `collectPartials({ uuid, requesterPubKey, timeoutMs?, pollIntervalMs?, attestationConfig? })` | Poll Story-API for partial decryptions |
+| `collectPartials({ uuid, requesterPubKey, timeoutMs?, pollIntervalMs?, minIntervalMs?, maxIntervalMs?, attestationConfig? })` | Poll Story-API for partial decryptions (adaptive backoff by default; `pollIntervalMs` forces a fixed rate) |
 | `decryptDataKey({ ciphertext, partials, recipientPrivKey, globalPubKey, label })` | Decrypt and combine partials |
+
+Partial collection polls with **adaptive exponential backoff**: waits start at
+2s and grow ×1.5 per poll, bounded only by `timeoutMs` (each wait is clamped
+to the remaining budget) — partials mostly arrive shortly after the read tx,
+so polling thins out over time, and collection returns as soon as enough
+partials are seen. Set `maxIntervalMs` to cap the curve, or `pollIntervalMs`
+for a fixed rate (mutually exclusive with the min/max options).
 
 ---
 
