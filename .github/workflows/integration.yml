@@ -28,6 +28,13 @@ on:
           - 1000-wallet-performance-devnet-only
           - 1H-stress-devnet-only
         default: default
+      concurrent_wallet_count:
+        type: string
+        description: >-
+          Override CDR_WALLET_COUNT for the ephemeral-wallet suites (empty =
+          network default: 50 on aeneid, 100 on devnet)
+        required: false
+        default: ''
   # Reusable-workflow entrypoint for cdr-monitor-per-round.yml. Strings (not
   # `choice`) because `workflow_call` doesn't support choice — callers MUST
   # pass values from the same set as workflow_dispatch's options or the
@@ -191,11 +198,19 @@ jobs:
               echo "CDR_RPC_URL=https://aeneid.storyrpc.io" >> $GITHUB_ENV
               echo "CDR_TEST_PRIVATE_KEY=${{ secrets.CDR_AENEID_TEST_PRIVATE_KEY }}" >> $GITHUB_ENV
               # The public aeneid RPC rate-limits under burst load; run the
-              # ephemeral-wallet suites at reduced concurrency there
-              # (devnet keeps the full 100).
-              echo "CDR_WALLET_COUNT=25" >> $GITHUB_ENV
+              # ephemeral-wallet suites at reduced concurrency there.
+              # Precedence: dispatch input > repo variable
+              # CDR_AENEID_WALLET_COUNT > hardcoded 50. Devnet keeps the
+              # suites' built-in default (100) unless the input is set.
+              echo "CDR_WALLET_COUNT=${{ inputs.concurrent_wallet_count || vars.CDR_AENEID_WALLET_COUNT || '50' }}" >> $GITHUB_ENV
               ;;
           esac
+
+          # Explicit per-run override applies on any network.
+          WC="${{ inputs.concurrent_wallet_count }}"
+          if [ -n "$WC" ]; then
+            echo "CDR_WALLET_COUNT=$WC" >> $GITHUB_ENV
+          fi
 
       - name: Verify env populated
         run: |
