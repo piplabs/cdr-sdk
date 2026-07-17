@@ -180,14 +180,20 @@ jobs:
         run: |
           case "$NETWORK" in
             devnet)
-              echo "CDR_API_URL=http://172.207.250.203:1317" >> $GITHUB_ENV
-              echo "CDR_RPC_URL=http://172.207.250.203:8545" >> $GITHUB_ENV
+              # qa2 canonical devnet, validator-1 (rebuilt 2026-07; the old
+              # 172.207.250.203 devnet was torn down)
+              echo "CDR_API_URL=http://20.222.52.61:1317" >> $GITHUB_ENV
+              echo "CDR_RPC_URL=http://20.222.52.61:8545" >> $GITHUB_ENV
               echo "CDR_TEST_PRIVATE_KEY=${{ secrets.CDR_DEVNET_TEST_PRIVATE_KEY }}" >> $GITHUB_ENV
               ;;
             aeneid)
               echo "CDR_API_URL=http://172.192.41.96:1317" >> $GITHUB_ENV
               echo "CDR_RPC_URL=https://aeneid.storyrpc.io" >> $GITHUB_ENV
               echo "CDR_TEST_PRIVATE_KEY=${{ secrets.CDR_AENEID_TEST_PRIVATE_KEY }}" >> $GITHUB_ENV
+              # The public aeneid RPC rate-limits under burst load; run the
+              # ephemeral-wallet suites at reduced concurrency there
+              # (devnet keeps the full 100).
+              echo "CDR_WALLET_COUNT=25" >> $GITHUB_ENV
               ;;
           esac
 

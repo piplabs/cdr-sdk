@@ -59,7 +59,7 @@
  *   pnpm test:stress
  *
  * Required env (from `.env.local`):
- *   CDR_API_URL          — Story-API REST URL (e.g. http://172.207.250.203:1317)
+ *   CDR_API_URL          — Story-API REST URL (e.g. http://20.222.52.61:1317)
  *   CDR_RPC_URL          — EVM JSON-RPC URL on the same chain
  *   CDR_TEST_PRIVATE_KEY — funded wallet (anvil-0 on DevNet)
  */
