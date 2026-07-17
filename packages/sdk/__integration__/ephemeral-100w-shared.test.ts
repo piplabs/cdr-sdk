@@ -63,9 +63,12 @@ import {
   sizeFundAndReport,
   statsOf,
   writePerfStats,
+  positiveIntEnv,
 } from "./_helpers.js";
 
-const WALLET_COUNT = 100;
+// Overridable so rate-limited networks (public Aeneid RPC) can run a reduced
+// concurrent-wallet load; defaults to the original 100 for devnet.
+const WALLET_COUNT = positiveIntEnv("CDR_WALLET_COUNT", 100);
 const CYCLES_PER_WALLET = 1; // 1 accessCDR per wallet, no upload
 const ACCESS_TIMEOUT_MS = 180_000;
 
