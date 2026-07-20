@@ -11,6 +11,7 @@ import {
 } from "../src/license-contracts.js";
 import {
   InsufficientBalanceError,
+  InvalidParamsError,
   LicenseMintPreparationError,
   LicenseTokensMintedEventNotFoundError,
   LicenseTransactionRevertedError,
@@ -179,6 +180,36 @@ describe("LicenseClient.mintLicenseToken", () => {
       license.mintLicenseToken({ licensorIpId: LICENSOR, licenseTermsId: 2645 }),
     ).rejects.toThrow(InsufficientBalanceError);
     expect(walletClient.prepareTransactionRequest).not.toHaveBeenCalled();
+  });
+
+  it("rejects amount < 1 and amount beyond MAX_SAFE_INTEGER", async () => {
+    const { license } = makeClients({ fee: 0n });
+    await expect(
+      license.mintLicenseToken({ licensorIpId: LICENSOR, licenseTermsId: 2645, amount: 0 }),
+    ).rejects.toThrow(InvalidParamsError);
+    await expect(
+      license.mintLicenseToken({
+        licensorIpId: LICENSOR,
+        licenseTermsId: 2645,
+        amount: BigInt(Number.MAX_SAFE_INTEGER) + 1n,
+      }),
+    ).rejects.toThrow(InvalidParamsError);
+  });
+
+  it("missing getBalance: skips the native preflight and proceeds to wrap", async () => {
+    const { license, publicClient, walletClient } = makeClients({
+      fee: 10n,
+      wipBalance: 0n,
+    });
+    // Structural client without getBalance — the typed preflight is skipped.
+    delete (publicClient as any).getBalance;
+    const result = await license.mintLicenseToken({
+      licensorIpId: LICENSOR,
+      licenseTermsId: 2645,
+    });
+    expect(result.wrappedWei).toBe(10n);
+    expect(result.txHashes.deposit).toBeDefined();
+    expect(walletClient.prepareTransactionRequest).toHaveBeenCalled();
   });
 
   it("non-WIP fee currency: throws UnsupportedLicenseCurrencyError", async () => {

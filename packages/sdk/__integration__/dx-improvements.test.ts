@@ -238,9 +238,15 @@ describe(`DX improvement tests (live: ${API_URL})`, () => {
       licenseTermsId: LICENSE_TERMS_ID,
     });
     expect(mintResult.licenseTokenIds).toHaveLength(1);
-    // The fresh reader held no WIP, so the helper must have wrapped the
-    // full fee (0 for free terms) — and skipped nothing it needed.
+    // These terms carry a minting fee (the pre-helper version of this test
+    // wrapped WIP specifically to pay it), so the fee path must be exercised
+    // — otherwise this test proves nothing about wrapping/approving. The
+    // fresh reader held no WIP, so the full fee must have been wrapped and a
+    // deposit tx produced.
+    expect(mintResult.feePaid).toBeGreaterThan(0n);
     expect(mintResult.wrappedWei).toBe(mintResult.feePaid);
+    expect(mintResult.txHashes.deposit).toBeDefined();
+    expect(mintResult.txHashes.approve).toBeDefined();
     console.log(
       `DX-03 | minted licenseTokenId=${mintResult.licenseTokenIds[0]} feePaid=${mintResult.feePaid} wrapped=${mintResult.wrappedWei}`,
     );

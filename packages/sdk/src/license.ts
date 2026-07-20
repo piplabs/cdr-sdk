@@ -150,6 +150,14 @@ export class LicenseClient {
     params: MintLicenseTokenParams,
   ): Promise<MintLicenseTokenResult> {
     const amount = BigInt(params.amount ?? 1);
+    // Upper bound is Number.MAX_SAFE_INTEGER because the token-id expansion
+    // below uses `Number(amount)`; beyond it that conversion loses precision.
+    // (Any real mint is a handful of tokens — this only rejects absurd input.)
+    if (amount < 1n || amount > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new InvalidParamsError(
+        `mintLicenseToken: amount must be between 1 and ${Number.MAX_SAFE_INTEGER}`,
+      );
+    }
     const licenseTermsId = BigInt(params.licenseTermsId);
     const licenseTemplate = params.licenseTemplate ?? PI_LICENSE_TEMPLATE_ADDRESS;
     const minter = getWalletAddress(this.walletClient.account);
@@ -200,7 +208,9 @@ export class LicenseClient {
           );
         }
         // Native must cover the wrap; check only when the structural client
-        // exposes getBalance (mirrors Consumer.read's fee preflight).
+        // exposes getBalance (mirrors Consumer.read's fee preflight). When it
+        // doesn't, the deposit still reverts on-chain for a true shortfall —
+        // just without the typed early error, so log the skip for parity.
         if (this.publicClient.getBalance) {
           const nativeBalance = await this.publicClient.getBalance({ address: minter });
           if (nativeBalance < shortfall) {
@@ -210,6 +220,11 @@ export class LicenseClient {
               "license minting fee (wrapping native DATA to WIP)",
             );
           }
+        } else {
+          this.logger.debug("license.wrap.preflight.skipped", {
+            reason: "publicClient has no getBalance",
+            shortfall: shortfall.toString(),
+          });
         }
         ({ hash: txHashes.deposit } = await this.writeAndConfirm("deposit", {
           address: WIP_ADDRESS,
