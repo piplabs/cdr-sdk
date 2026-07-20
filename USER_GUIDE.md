@@ -13,6 +13,7 @@ The **CDR (Confidential Data Rails) SDK** provides a TypeScript interface for en
   - [Observer (Read-Only)](#observer-read-only)
   - [Uploader (Write)](#uploader-write)
   - [Consumer (Read/Decrypt)](#consumer-readdecrypt)
+  - [License Helper](#license-helper)
 - [Examples](#examples)
   - [Query DKG State](#query-dkg-state)
   - [Upload Encrypted Data](#upload-encrypted-data)
@@ -306,6 +307,24 @@ to the remaining budget) — partials mostly arrive shortly after the read tx,
 so polling thins out over time, and collection returns as soon as enough
 partials are seen. Set `maxIntervalMs` to cap the curve, or `pollIntervalMs`
 for a fixed rate (mutually exclusive with the min/max options).
+
+### License Helper
+
+Mints Story Protocol license tokens for reading `LicenseReadCondition`-gated vaults, handling the WIP fee automatically (predict fee → wrap native DATA → approve RoyaltyModule → mint). Requires a `walletClient`.
+
+```typescript
+const { licenseTokenIds, feePaid, wrappedWei, txHashes } =
+  await client.license.mintLicenseToken({
+    licensorIpId: `0x${string}`,   // the licensor IP asset (IP ID)
+    licenseTermsId: bigint | number,
+    amount?: bigint | number,      // default 1
+    receiver?: `0x${string}`,      // default: your wallet address
+    autoWrap?: boolean,            // default true — wrap missing WIP from native
+    autoApprove?: boolean,         // default true — approve RoyaltyModule (maxUint256)
+  });
+```
+
+Fee preparation is idempotent — wrap/approve steps are skipped (and absent from `txHashes`) when the balance or a standing allowance already covers the fee. Only WIP-denominated license terms are supported; other currencies throw `UnsupportedLicenseCurrencyError`. Also available without a `CDRClient` as the standalone `mintLicenseToken({ publicClient, walletClient, ... })` export.
 
 ---
 

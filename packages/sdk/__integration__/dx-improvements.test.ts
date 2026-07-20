@@ -6,7 +6,8 @@
  *
  *   DX-01 (#11)  conditions.{open,tokenGate,ownerOnly,merkle,custom}
  *   DX-02 (#12)  accessCDR with just {uuid, accessAuxData}
- *   DX-03 (#13)  LicenseReadCondition (Aeneid-only; skipped on other chains)
+ *   DX-03 (#13)  LicenseReadCondition end-to-end via license.mintLicenseToken
+ *                (#39) — Aeneid-only; skipped on other chains
  *   DX-04 (#16)  Method aliases: createVault / readVault / *FileVault
  */
 
@@ -145,13 +146,7 @@ describe(`DX improvement tests (live: ${API_URL})`, () => {
     expect(txHash).toMatch(/^0x[0-9a-f]{64}$/);
   }, 240_000);
 
-  // DX-03 is currently `it.skip` because it needs `@story-protocol/core-sdk`
-  // to mint a license token, and that package is intentionally NOT a dep of
-  // @piplabs/cdr-sdk (it's a heavy SDK that the published cdr-sdk shouldn't
-  // pull in). The original story-cdr-e2e test wallet had it as a test-only
-  // dep. Flipping this on is a follow-up: add `@story-protocol/core-sdk` to
-  // packages/sdk devDependencies + change `it.skip` → `it`.
-  it.skip("DX-03: LicenseReadCondition gates vault access to license holders (Issue #13, Aeneid only) — needs @story-protocol/core-sdk dep", async () => {
+  it("DX-03: LicenseReadCondition gates vault access; license minted via license.mintLicenseToken (Issues #13 + #39, Aeneid only)", async () => {
     const { publicClient, walletClient } = makeCDRClient();
     const chainId = await publicClient.getChainId();
     if (chainId !== 1315) {
@@ -167,10 +162,6 @@ describe(`DX improvement tests (live: ${API_URL})`, () => {
       "0x4C9bFC96d7092b590D497A191826C3dA2277c34B" as `0x${string}`;
     const LICENSE_TOKEN =
       "0xFe3838BFb30B34170F00030B52eA4893d8aAC6bC" as `0x${string}`;
-    const WIP_TOKEN =
-      "0x1514000000000000000000000000000000000000" as `0x${string}`;
-    const ROYALTY_MODULE =
-      "0xD2f60c40fEbccf6311f8B47c4f2Ec6b040400086" as `0x${string}`;
     const IP_ID =
       "0x3Aa560C9072E0D4A1443CD192745C24A176b4925" as `0x${string}`;
     const LICENSE_TERMS_ID = 2054;
@@ -234,60 +225,29 @@ describe(`DX improvement tests (live: ${API_URL})`, () => {
       account: readerAccount,
     }) as unknown as WalletClient;
 
-    // Wrap 1 IP → WIP via WIP_TOKEN.deposit().
-    const wrapTx = await readerWallet.sendTransaction({
-      chain: readerWallet.chain ?? null,
-      account: readerWallet.account ?? null,
-      to: WIP_TOKEN,
-      data: "0xd0e30db0" as `0x${string}`,
-      value: parseEther("1"),
-    });
-    await publicClient.waitForTransactionReceipt({ hash: wrapTx });
-
-    const approveTx = await readerWallet.writeContract({
-      chain: readerWallet.chain ?? null,
-      account: readerWallet.account ?? null,
-      address: WIP_TOKEN,
-      abi: [
-        {
-          type: "function",
-          name: "approve",
-          inputs: [{ type: "address" }, { type: "uint256" }],
-          outputs: [{ type: "bool" }],
-          stateMutability: "nonpayable",
-        },
-      ],
-      functionName: "approve",
-      args: [ROYALTY_MODULE, parseEther("1")],
-    });
-    await publicClient.waitForTransactionReceipt({ hash: approveTx });
-
-    // Mint a license token via Story Protocol SDK.
-    // @ts-expect-error — @story-protocol/core-sdk is not a dep of @piplabs/cdr-sdk.
-    // This `it.skip`'d test would need the dep added before it can run.
-    const { StoryClient } = await import("@story-protocol/core-sdk");
-    const storyClient = StoryClient.newClient({
-      transport: http(RPC_URL),
-      account: readerAccount,
-    });
-    const mintResult = await storyClient.license.mintLicenseTokens({
-      licensorIpId: IP_ID,
-      licenseTermsId: LICENSE_TERMS_ID,
-      amount: 1,
-      maxMintingFee: "100000000000000000",
-      maxRevenueShare: 100,
-    });
-    const licenseTokenId = mintResult.licenseTokenIds![0];
-
+    // Mint a license token: the helper wraps the shortfall from the fresh
+    // reader's native balance into WIP, approves the RoyaltyModule, and mints.
     const readerCdr = new CDRClient({
       network: "testnet",
       publicClient,
       walletClient: readerWallet as unknown as WalletClient,
       apiUrl: API_URL!,
     });
+    const mintResult = await readerCdr.license.mintLicenseToken({
+      licensorIpId: IP_ID,
+      licenseTermsId: LICENSE_TERMS_ID,
+    });
+    expect(mintResult.licenseTokenIds).toHaveLength(1);
+    // The fresh reader held no WIP, so the helper must have wrapped the
+    // full fee (0 for free terms) — and skipped nothing it needed.
+    expect(mintResult.wrappedWei).toBe(mintResult.feePaid);
+    console.log(
+      `DX-03 | minted licenseTokenId=${mintResult.licenseTokenIds[0]} feePaid=${mintResult.feePaid} wrapped=${mintResult.wrappedWei}`,
+    );
+
     const accessAuxData = encodeAbiParameters(
       [{ type: "uint256[]" }],
-      [[BigInt(licenseTokenId)]],
+      [[mintResult.licenseTokenIds[0]]],
     );
     const { dataKey: recovered } = await readerCdr.consumer.accessCDR({
       uuid,
