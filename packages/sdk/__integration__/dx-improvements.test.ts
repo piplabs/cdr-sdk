@@ -146,12 +146,34 @@ describe(`DX improvement tests (live: ${API_URL})`, () => {
     expect(txHash).toMatch(/^0x[0-9a-f]{64}$/);
   }, 240_000);
 
-  it("DX-03: LicenseReadCondition gates vault access; license minted via license.mintLicenseToken (Issues #13 + #39, Aeneid only)", async () => {
+// Two known Aeneid LicenseReadCondition fixtures, exercised through the
+  // identical mint→gated-read journey. Free proves the wrap/approve SKIP
+  // (idempotency) path; fee-bearing proves the wrap→approve→pay path — the
+  // real reason license.mintLicenseToken exists (#39). Fees verified on-chain
+  // via predictMintingLicenseFee; the fee-bearing case spends 1 real WIP/run.
+  const LICENSE_FIXTURES = [
+    {
+      label: "free terms",
+      ipId: "0x3Aa560C9072E0D4A1443CD192745C24A176b4925" as `0x${string}`,
+      termsId: 2054,
+      expectFee: false,
+    },
+    {
+      label: "fee-bearing terms (1 WIP)",
+      ipId: "0x2dfCEf84c4772133981679Cf624854455e4dD98f" as `0x${string}`,
+      termsId: 2795,
+      expectFee: true,
+    },
+  ] as const;
+
+  async function runLicenseGatedFlow(
+    fixture: (typeof LICENSE_FIXTURES)[number],
+  ): Promise<void> {
     const { publicClient, walletClient } = makeCDRClient();
     const chainId = await publicClient.getChainId();
     if (chainId !== 1315) {
       console.log(
-        `DX-03 | SKIPPED: LicenseReadCondition only on Aeneid (chainId=${chainId})`,
+        `DX-03 [${fixture.label}] | SKIPPED: LicenseReadCondition only on Aeneid (chainId=${chainId})`,
       );
       return;
     }
@@ -162,9 +184,6 @@ describe(`DX improvement tests (live: ${API_URL})`, () => {
       "0x4C9bFC96d7092b590D497A191826C3dA2277c34B" as `0x${string}`;
     const LICENSE_TOKEN =
       "0xFe3838BFb30B34170F00030B52eA4893d8aAC6bC" as `0x${string}`;
-    const IP_ID =
-      "0x3Aa560C9072E0D4A1443CD192745C24A176b4925" as `0x${string}`;
-    const LICENSE_TERMS_ID = 2054;
 
     const uploaderAddr = privateKeyToAccount(PRIVATE_KEY!).address;
     const cdr = new CDRClient({
@@ -182,7 +201,7 @@ describe(`DX improvement tests (live: ${API_URL})`, () => {
     );
     const readCondData = encodeAbiParameters(
       [{ type: "address" }, { type: "address" }],
-      [LICENSE_TOKEN, IP_ID],
+      [LICENSE_TOKEN, fixture.ipId],
     );
 
     const { uuid } = await cdr.uploader.uploadCDR({
@@ -196,7 +215,7 @@ describe(`DX improvement tests (live: ${API_URL})`, () => {
       accessAuxData: "0x",
     });
 
-    // (a) Read without license fails.
+    // (a) Read without a license fails.
     const emptyAux = encodeAbiParameters([{ type: "uint256[]" }], [[]]);
     await expect(
       cdr.consumer.accessCDR({
@@ -206,8 +225,8 @@ describe(`DX improvement tests (live: ${API_URL})`, () => {
       }),
     ).rejects.toThrow();
 
-    // (b) Spin up a temp reader wallet, fund it, mint a license token,
-    // then read with it.
+    // (b) Fresh reader wallet (holds only native DATA, no WIP), funded to
+    // cover the fee + gas, mints a license via the helper, then reads.
     const readerKey = generatePrivateKey();
     const readerAccount = privateKeyToAccount(readerKey);
 
@@ -225,8 +244,6 @@ describe(`DX improvement tests (live: ${API_URL})`, () => {
       account: readerAccount,
     }) as unknown as WalletClient;
 
-    // Mint a license token: the helper wraps the shortfall from the fresh
-    // reader's native balance into WIP, approves the RoyaltyModule, and mints.
     const readerCdr = new CDRClient({
       network: "testnet",
       publicClient,
@@ -234,22 +251,27 @@ describe(`DX improvement tests (live: ${API_URL})`, () => {
       apiUrl: API_URL!,
     });
     const mintResult = await readerCdr.license.mintLicenseToken({
-      licensorIpId: IP_ID,
-      licenseTermsId: LICENSE_TERMS_ID,
+      licensorIpId: fixture.ipId,
+      licenseTermsId: fixture.termsId,
     });
     expect(mintResult.licenseTokenIds).toHaveLength(1);
-    // These terms carry a minting fee (the pre-helper version of this test
-    // wrapped WIP specifically to pay it), so the fee path must be exercised
-    // — otherwise this test proves nothing about wrapping/approving. The
-    // fresh reader held no WIP, so the full fee must have been wrapped and a
-    // deposit tx produced.
-    expect(mintResult.feePaid).toBeGreaterThan(0n);
-    expect(mintResult.wrappedWei).toBe(mintResult.feePaid);
-    expect(mintResult.txHashes.deposit).toBeDefined();
-    expect(mintResult.txHashes.approve).toBeDefined();
     console.log(
-      `DX-03 | minted licenseTokenId=${mintResult.licenseTokenIds[0]} feePaid=${mintResult.feePaid} wrapped=${mintResult.wrappedWei}`,
+      `DX-03 [${fixture.label}] | minted licenseTokenId=${mintResult.licenseTokenIds[0]} feePaid=${mintResult.feePaid} wrapped=${mintResult.wrappedWei}`,
     );
+
+    // The helper's fee handling is the crux of #39. wrappedWei === feePaid
+    // always holds (fresh reader had zero WIP). The rest asserts the two
+    // outcomes explicitly so neither passes vacuously.
+    expect(mintResult.wrappedWei).toBe(mintResult.feePaid);
+    if (fixture.expectFee) {
+      expect(mintResult.feePaid).toBeGreaterThan(0n);
+      expect(mintResult.txHashes.deposit).toBeDefined();
+      expect(mintResult.txHashes.approve).toBeDefined();
+    } else {
+      expect(mintResult.feePaid).toBe(0n);
+      expect(mintResult.txHashes.deposit).toBeUndefined();
+      expect(mintResult.txHashes.approve).toBeUndefined();
+    }
 
     const accessAuxData = encodeAbiParameters(
       [{ type: "uint256[]" }],
@@ -262,7 +284,7 @@ describe(`DX improvement tests (live: ${API_URL})`, () => {
     });
     expect(toHex(new Uint8Array(recovered))).toBe(toHex(dataKey));
 
-    // Best-effort cleanup: return remaining IP from reader to uploader.
+    // Best-effort cleanup: return remaining native balance to the uploader.
     try {
       const bal = await publicClient.getBalance({
         address: readerAccount.address,
@@ -280,7 +302,15 @@ describe(`DX improvement tests (live: ${API_URL})`, () => {
     } catch {
       /* swallow cleanup errors — best-effort */
     }
-  }, 300_000);
+  }
+
+  for (const fixture of LICENSE_FIXTURES) {
+    it(
+      `DX-03 [${fixture.label}]: LicenseReadCondition gates vault access; license minted via license.mintLicenseToken (Issues #13 + #39, Aeneid only)`,
+      () => runLicenseGatedFlow(fixture),
+      300_000,
+    );
+  }
 
   it("DX-04: createVault / readVault method aliases exist (Issue #16)", () => {
     const { client } = makeCDRClient();
