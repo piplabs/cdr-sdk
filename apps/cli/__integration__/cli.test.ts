@@ -22,6 +22,7 @@ import { describe, it, expect, beforeAll } from "vitest";
 import { execaNode } from "execa";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 
 /**
  * Per-case diagnostic logger. Mirrors `packages/sdk/__integration__/_helpers.ts:logCase`
@@ -124,6 +125,21 @@ beforeAll(async () => {
   // eslint-disable-next-line no-console
   console.log(`\n[suite-setup] openCondition deployed at ${openCondition}\n`);
 }, 30_000);
+
+// ---------------------------------------------------------------------------
+// Binary metadata — no network, no wallet.
+// ---------------------------------------------------------------------------
+
+describe("binary metadata", () => {
+  it("--version matches package.json (guards against #134-style drift)", async () => {
+    const require = createRequire(import.meta.url);
+    const { version } = require("../package.json") as { version: string };
+    const { stdout, exitCode } = await runCli(["--version"], {});
+    logCase("reported version", stdout);
+    expect(exitCode).toBe(0);
+    expect(stdout.trim()).toBe(version);
+  }, 30_000);
+});
 
 // ---------------------------------------------------------------------------
 // Read-only `status` commands — no wallet required, no chain mutation.

@@ -3,11 +3,12 @@ import { Command } from "commander";
 import { statusCommand } from "./commands/status.js";
 import { uploadCommand } from "./commands/upload.js";
 import { accessCommand } from "./commands/access.js";
+import { version } from "./version.js";
 
 const program = new Command()
   .name("cdr-cli")
   .description("CLI wrapping common SDK operations against a live Story L1 CDR system")
-  .version("0.1.2")
+  .version(version)
   .option("--network <network>", "Network (mainnet or testnet)", "testnet")
   .option("--rpc-url <url>", "EVM RPC URL (or CDR_RPC_URL env; falls back to network default)")
   .option("--api-url <url>", "Story-API REST URL (or CDR_API_URL env, required)")
