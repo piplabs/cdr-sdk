@@ -44,14 +44,22 @@ import { OPEN_CONDITION_BYTECODE } from "./_helpers.js";
 // EmptyVaultError — a genuinely empty vault stays empty, so a bounded retry
 // distinguishes indexer lag (recovers) from a real miss (still throws) — so the
 // benchmark measures the steady-state decrypt path, not indexer catch-up.
+//
+// Returns the retry count alongside the result: when retries > 0 the caller's
+// wall-clock timing includes retries × delayMs of settle backoff, so the perf
+// number must log `settle_retries` to stay attributable — a slow result with
+// retries > 0 is indexer-lag recovery noise, not a decrypt-latency regression.
 async function accessWithReadAfterWriteSettle(
   client: CDRClient,
   args: Parameters<CDRClient["consumer"]["accessCDR"]>[0],
   { attempts = 5, delayMs = 3_000 }: { attempts?: number; delayMs?: number } = {},
-): Promise<Awaited<ReturnType<CDRClient["consumer"]["accessCDR"]>>> {
+): Promise<{
+  result: Awaited<ReturnType<CDRClient["consumer"]["accessCDR"]>>;
+  retries: number;
+}> {
   for (let attempt = 1; ; attempt++) {
     try {
-      return await client.consumer.accessCDR(args);
+      return { result: await client.consumer.accessCDR(args), retries: attempt - 1 };
     } catch (err) {
       if (err instanceof EmptyVaultError && attempt < attempts) {
         await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -214,7 +222,7 @@ describe(`Perf micro-benchmarks (live: ${API_URL})`, () => {
     // Let accessCDR generate its own ephemeral keypair — DX-02 case.
     // We measure end-to-end latency, not the key-supply path.
     const t = Date.now();
-    const { dataKey: recovered } = await accessWithReadAfterWriteSettle(client, {
+    const { result: { dataKey: recovered }, retries } = await accessWithReadAfterWriteSettle(client, {
       uuid,
       accessAuxData: "0x",
       globalPubKey,
@@ -223,7 +231,9 @@ describe(`Perf micro-benchmarks (live: ${API_URL})`, () => {
     const totalMs = Date.now() - t;
 
     const match = toHex(new Uint8Array(recovered)) === toHex(dataKey);
-    console.log(`PERF-04 | accessCDR end-to-end: ${totalMs}ms key_match=${match}`);
+    console.log(
+      `PERF-04 | accessCDR end-to-end: ${totalMs}ms key_match=${match} settle_retries=${retries}`,
+    );
     expect(match).toBe(true);
   }, 240_000);
 
@@ -253,7 +263,7 @@ describe(`Perf micro-benchmarks (live: ${API_URL})`, () => {
     const uploadMs = Date.now() - s;
 
     s = Date.now();
-    const { dataKey: recovered } = await accessWithReadAfterWriteSettle(client, {
+    const { result: { dataKey: recovered }, retries } = await accessWithReadAfterWriteSettle(client, {
       uuid,
       accessAuxData: "0x",
       globalPubKey,
@@ -264,7 +274,7 @@ describe(`Perf micro-benchmarks (live: ${API_URL})`, () => {
     const totalMs = Date.now() - totalStart;
     const match = toHex(new Uint8Array(recovered)) === toHex(dataKey);
     console.log(
-      `PERF-05 | deploy=${deployMs}ms upload=${uploadMs}ms access=${accessMs}ms total=${totalMs}ms key_match=${match}`,
+      `PERF-05 | deploy=${deployMs}ms upload=${uploadMs}ms access=${accessMs}ms total=${totalMs}ms key_match=${match} settle_retries=${retries}`,
     );
     expect(match).toBe(true);
   }, 300_000);
