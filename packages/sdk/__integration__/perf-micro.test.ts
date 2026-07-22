@@ -33,7 +33,34 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { CDRClient, getWasm, initWasm } from "../src/index.js";
+import { EmptyVaultError } from "../src/errors.js";
 import { OPEN_CONDITION_BYTECODE } from "./_helpers.js";
+
+// A freshly-uploaded vault can briefly read empty on the Story-API REST
+// indexer even after uploadCDR's EVM tx has confirmed: the indexer lags the
+// EVM state by a block or two, and accessCDR fails fast with EmptyVaultError in
+// that window (consumer.loadAndCheckVault). These perf tests upload then access
+// immediately, so they are exposed to that read-after-write window. Retry ONLY
+// EmptyVaultError — a genuinely empty vault stays empty, so a bounded retry
+// distinguishes indexer lag (recovers) from a real miss (still throws) — so the
+// benchmark measures the steady-state decrypt path, not indexer catch-up.
+async function accessWithReadAfterWriteSettle(
+  client: CDRClient,
+  args: Parameters<CDRClient["consumer"]["accessCDR"]>[0],
+  { attempts = 5, delayMs = 3_000 }: { attempts?: number; delayMs?: number } = {},
+): Promise<Awaited<ReturnType<CDRClient["consumer"]["accessCDR"]>>> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await client.consumer.accessCDR(args);
+    } catch (err) {
+      if (err instanceof EmptyVaultError && attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
 
 const API_URL = process.env.CDR_API_URL;
 const RPC_URL = process.env.CDR_RPC_URL;
@@ -187,7 +214,7 @@ describe(`Perf micro-benchmarks (live: ${API_URL})`, () => {
     // Let accessCDR generate its own ephemeral keypair — DX-02 case.
     // We measure end-to-end latency, not the key-supply path.
     const t = Date.now();
-    const { dataKey: recovered } = await client.consumer.accessCDR({
+    const { dataKey: recovered } = await accessWithReadAfterWriteSettle(client, {
       uuid,
       accessAuxData: "0x",
       globalPubKey,
@@ -226,7 +253,7 @@ describe(`Perf micro-benchmarks (live: ${API_URL})`, () => {
     const uploadMs = Date.now() - s;
 
     s = Date.now();
-    const { dataKey: recovered } = await client.consumer.accessCDR({
+    const { dataKey: recovered } = await accessWithReadAfterWriteSettle(client, {
       uuid,
       accessAuxData: "0x",
       globalPubKey,

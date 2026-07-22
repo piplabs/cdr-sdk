@@ -172,10 +172,23 @@ jobs:
           LAST_GPK: ${{ steps.last.outputs.last_gpk }}
         run: |
           set -euo pipefail
-          should_test="false" chain_reset="false" forced="false"
+          should_test="false" chain_reset="false" forced="false" seed_only="false"
           if [ "$FORCE" = "true" ]; then
             should_test="true"; forced="true"
             echo "→ force=true; firing regardless of round delta"
+          elif [ "$LAST_ROUND" = "0" ]; then
+            # No reliable prior round. last_round=0 means the cache had no
+            # baseline for us: a genuine first-ever run, OR — the case that bit
+            # us in prod — an actions/cache eventual-consistency window where a
+            # freshly-saved state.json restores as empty/null. We CANNOT assert
+            # a round edge from a missing baseline, and firing here emits a false
+            # "round 0 → N" test + Slack alarm every tick until the cache settles.
+            # So seed the baseline silently: persist current state (the Write/Save
+            # steps below run on seed_only too), fire no test, post nothing. The
+            # next tick restores a real round and normal edge detection resumes.
+            # A genuine first deploy can still force one baseline test via force=true.
+            seed_only="true"
+            echo "→ no reliable baseline (last_round=0); seeding state silently, no test/alarm"
           elif [ -n "$LAST_GPK" ] \
                && [ "$CUR_ROUND" -le "$LAST_ROUND" ] \
                && [ "$CUR_GPK" != "$LAST_GPK" ]; then
@@ -200,10 +213,14 @@ jobs:
             echo "should_test=$should_test"
             echo "chain_reset=$chain_reset"
             echo "forced=$forced"
+            echo "seed_only=$seed_only"
           } >> "$GITHUB_OUTPUT"
 
       - name: Write new state.json when firing
-        if: steps.compare.outputs.should_test == 'true'
+        # Also write on seed_only: a cache-consistency glitch must persist the
+        # current round so the next tick has a real baseline (self-heal), even
+        # though we fired no test for it.
+        if: steps.compare.outputs.should_test == 'true' || steps.compare.outputs.seed_only == 'true'
         env:
           CUR_ROUND: ${{ steps.query.outputs.round }}
           CUR_GPK: ${{ steps.query.outputs.gpk }}
@@ -218,7 +235,7 @@ jobs:
           echo "Wrote ./state.json:"; cat ./state.json
 
       - name: Save new state to cache
-        if: steps.compare.outputs.should_test == 'true'
+        if: steps.compare.outputs.should_test == 'true' || steps.compare.outputs.seed_only == 'true'
         uses: actions/cache/save@v4
         with:
           path: ./state.json
