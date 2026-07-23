@@ -288,19 +288,31 @@ jobs:
 
       - name: 'Smoke: CJS imports'
         id: cjs_smoke
-        # NODE_OPTIONS=--no-experimental-require-module disables Node's
-        # implicit ESM-bridge for require(). Without it, Node 20.19+ and
-        # 22.12+ silently bridge `require("@piplabs/cdr-sdk")` even when
-        # the package is ESM-only with no exports.require — defeating the
-        # gate. With the flag, require() returns the original
-        # ERR_REQUIRE_ESM, catching the missing CJS entry that consumers
-        # on Node <20.19 (still LTS-supported) actually hit.
+        # Two-phase gate — see #135. Phase 1 (resolve, bridge OFF):
+        # require.resolve() under --no-experimental-require-module verifies a
+        # real CJS entry exists (exports.require / CJS main) without executing
+        # transitive ESM-only deps. Phase 2 (require, bridge ON = default Node
+        # options): require() the package the way a real consumer does. Every
+        # runtime engines admits (node >=20.19.0) bridges require(esm) by
+        # default, so an ESM-only transitive dep (@noble/hashes v2) loads —
+        # forcing the bridge off here was a false failure for a Node <20.19
+        # runtime engines already excludes.
         if: always() && steps.install.outcome == 'success'
-        env:
-          NODE_OPTIONS: --no-experimental-require-module
         run: |
           set -uo pipefail
           cd "$INSTALL_DIR"
+          # Phase 1 helper: resolve the CJS entry without loading it.
+          cat > resolve.cjs <<'JSEOF'
+          const pkgName = process.argv[2];
+          try {
+            const resolved = require.resolve(pkgName);
+            console.log(`OK ${pkgName}: CJS entry resolves (${resolved})`);
+          } catch (err) {
+            console.error(`FAIL ${pkgName}: ${err && err.code ? err.code + ": " : ""}${err && err.message ? err.message : err}`);
+            process.exit(1);
+          }
+          JSEOF
+          # Phase 2 helper: require() and confirm non-empty exports.
           cat > smoke.cjs <<'JSEOF'
           const pkgName = process.argv[2];
           try {
@@ -318,13 +330,21 @@ jobs:
           FAILED=()
           ROWS=()
           for pkg in @piplabs/cdr-contracts @piplabs/cdr-crypto @piplabs/cdr-sdk; do
+            # Phase 1: CJS entry must resolve (bridge OFF).
+            if ! OUTPUT=$(NODE_OPTIONS=--no-experimental-require-module node resolve.cjs "$pkg" 2>&1); then
+              SHORT=$(echo "$OUTPUT" | head -1 | tr -d '`' | tr '|' '/')
+              ROWS+=("| \`${pkg}\` | ❌ | resolve: ${SHORT:0:130} |")
+              FAILED+=("$pkg (resolve)")
+              continue
+            fi
+            # Phase 2: require() must work for a real consumer (bridge ON, default opts).
             if OUTPUT=$(node smoke.cjs "$pkg" 2>&1); then
               SHORT=$(echo "$OUTPUT" | head -1 | tr -d '`' | tr '|' '/')
               ROWS+=("| \`${pkg}\` | ✅ | ${SHORT:0:140} |")
             else
               SHORT=$(echo "$OUTPUT" | head -1 | tr -d '`' | tr '|' '/')
-              ROWS+=("| \`${pkg}\` | ❌ | ${SHORT:0:140} |")
-              FAILED+=("$pkg")
+              ROWS+=("| \`${pkg}\` | ❌ | require: ${SHORT:0:130} |")
+              FAILED+=("$pkg (require)")
             fi
           done
           {
