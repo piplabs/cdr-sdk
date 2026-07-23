@@ -48,6 +48,15 @@ await client.uploader.uploadCDR({
 });
 ```
 
+If you don't hold a license token yet, the SDK can mint one — it predicts the minting fee on-chain, wraps native DATA into WIP for it (the fee is pulled in WIP by Story's RoyaltyModule), approves, and mints in one call:
+
+```typescript
+const { licenseTokenIds } = await client.license.mintLicenseToken({
+  licensorIpId: "0x3Aa560C9072E0D4A1443CD192745C24A176b4925",  // the IP ID
+  licenseTermsId: 2645,
+});
+```
+
 At read time, pass the license token IDs as `accessAuxData`:
 
 ```typescript

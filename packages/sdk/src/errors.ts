@@ -132,6 +132,60 @@ export class VaultAllocatedEventNotFoundError extends CDRError {
 }
 
 /**
+ * The license terms' minting fee is denominated in a token the SDK cannot
+ * auto-wrap. Only the native-token wrapper WIP is supported — pay the fee
+ * manually in the terms' currency, then mint without this helper.
+ */
+export class UnsupportedLicenseCurrencyError extends CDRError {
+  currency: `0x${string}`;
+  constructor(currency: `0x${string}`) {
+    super(
+      `License minting fee is denominated in ${currency}, which is not the WIP native-token wrapper — auto-wrapping cannot pay it`,
+      "UNSUPPORTED_LICENSE_CURRENCY",
+    );
+    this.currency = currency;
+  }
+}
+
+/**
+ * A fee-preparation step (wrap / approve) was needed but disabled via
+ * `autoWrap: false` / `autoApprove: false`. Perform the step manually or
+ * re-enable the flag.
+ */
+export class LicenseMintPreparationError extends CDRError {
+  constructor(message: string) {
+    super(message, "LICENSE_MINT_PREPARATION");
+  }
+}
+
+export class LicenseTokensMintedEventNotFoundError extends CDRError {
+  constructor() {
+    super(
+      "LicenseTokensMinted event not found in transaction logs",
+      "LICENSE_TOKENS_MINTED_EVENT_NOT_FOUND",
+    );
+  }
+}
+
+/**
+ * A license-mint step (`deposit` / `approve` / `mint`) landed on-chain but
+ * its transaction reverted. `step` says which one, so the failure isn't
+ * mistaken for a missing mint event.
+ */
+export class LicenseTransactionRevertedError extends CDRError {
+  step: "deposit" | "approve" | "mint";
+  txHash: `0x${string}`;
+  constructor(step: "deposit" | "approve" | "mint", txHash: `0x${string}`) {
+    super(
+      `License ${step} transaction ${txHash} reverted`,
+      "LICENSE_TRANSACTION_REVERTED",
+    );
+    this.step = step;
+    this.txHash = txHash;
+  }
+}
+
+/**
  * Thrown by `hexToBytes` when the input is malformed. `reason` discriminates
  * the failure mode so callers can branch without parsing the message:
  *   - `"ODD_LENGTH"`: hex digit count was odd — `length` carries the count.
@@ -226,9 +280,9 @@ export class InvalidPartialError extends CDRError {
 export class InsufficientBalanceError extends CDRError {
   balance: bigint;
   required: bigint;
-  constructor(balance: bigint, required: bigint) {
+  constructor(balance: bigint, required: bigint, context = "read fee") {
     super(
-      `Insufficient balance for read fee: have ${balance}, need ${required}`,
+      `Insufficient balance for ${context}: have ${balance}, need ${required}`,
       "INSUFFICIENT_BALANCE",
     );
     this.balance = balance;
