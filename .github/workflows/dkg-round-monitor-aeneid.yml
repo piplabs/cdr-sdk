@@ -28,10 +28,16 @@ run-name: dkg-round-monitor-aeneid${{ github.event.inputs.start_round != '' && f
 # 2026-07-23, when the miss made the pointer fall back to a hardcoded round 24
 # and replay rounds 24-29 as six fresh notifications). The restore is a READ
 # miss — the saved state is still there and the next tick restores it fine — so
-# the right response is to change nothing: post one explicit cache-miss warning
-# and end the tick without touching or saving state. If the miss persists
-# (entry truly evicted), the warning repeats each tick until a manual
-# workflow_dispatch with start_round re-seeds the pointer.
+# the right response is to change nothing and end the tick without touching or
+# saving state. A transient miss is pure GitHub-infra noise, NOT a chain event,
+# so it does NOT post to Slack (it spammed the channel ~10x over the 2026-07-25..27
+# cache-flakiness window). Instead the miss is surfaced two quieter ways: a
+# `::warning::` line in the Actions log, and a non-zero exit so the run shows RED
+# in the workflow history — visible to anyone watching the workflow, without
+# paging the team channel. Two defences keep misses rare: the state cache is now
+# re-saved on EVERY successful tick (below) so the entry is minutes-old not
+# days-old, and a persistent miss shows as a run of red runs; if it truly won't
+# recover, re-seed the pointer via workflow_dispatch with start_round.
 #
 # Stage codes (story x/dkg DKGStage): 1=REGISTRATION 2=DEALING 3=FINALIZATION
 #   4=ACTIVE 5=FAILED 6=ENDED. A status of 5 always raises a WARNING.
@@ -141,13 +147,18 @@ jobs:
           else
             # No state restored — an intermittent actions/cache READ miss (the
             # entry almost certainly still exists; see header). Change nothing:
-            # announce it and end the tick. The next tick's restore will very
-            # likely succeed and the monitor resumes exactly where it was.
+            # end the tick and let the next tick's restore resume where it was.
             # Guessing a start round here (the old hardcoded-24 fallback) is
             # what replayed rounds 24-29 as fresh notifications on 2026-07-23.
-            notify "$(stage_emoji 5) WARNING: DKG round monitor could not restore its state cache (intermittent GitHub actions/cache read miss); leaving state untouched and retrying next tick. If this repeats, re-seed via workflow_dispatch (start_round)."
+            #
+            # DO NOT notify Slack here: a transient cache miss self-heals and is
+            # pure GitHub-infra noise for the channel (it fired ~10x over 3 days
+            # of cache flakiness, 2026-07-25..27). Instead surface it ONLY in the
+            # Actions log AND fail the job (exit 1) so the miss is still visible
+            # as a red run in the workflow history without paging the team.
+            echo "::warning::DKG round monitor could not restore its state cache (intermittent GitHub actions/cache read miss); state untouched, retrying next tick. If this persists across ticks, re-seed via workflow_dispatch (start_round)."
             echo "changed=0" >> "$GITHUB_OUTPUT"
-            exit 0
+            exit 1
           fi
           [[ "$WR" =~ ^[0-9]+$ ]] || { echo "::error::bad watch_round='$WR'"; exit 1; }
           [[ "$LS" =~ ^[0-6]$ ]] || LS=0
@@ -240,8 +251,15 @@ jobs:
           echo "new state: $(cat ./state.json)"
           echo "changed=$changed" >> "$GITHUB_OUTPUT"
 
-      - name: Persist watch state (only when it changed)
-        if: steps.run.outputs.changed == '1'
+      # Save on EVERY successful tick (not only on a stage change) so the cache
+      # entry stays fresh — minutes old, not days. The old changed-only gate let
+      # the sole entry go stale for days between slow aeneid round turns, which
+      # is what made the prefix restore-key miss so often (the root cause of the
+      # 2026-07-25..27 warning storm). A successful run always rewrote state.json,
+      # so `success()` + the file existing is the right condition; a cache-miss
+      # tick fails (exit 1) so success() is false and this is skipped (nothing to save).
+      - name: Persist watch state (refresh cache each tick)
+        if: success() && hashFiles('state.json') != ''
         uses: actions/cache/save@v4
         with:
           path: ./state.json
