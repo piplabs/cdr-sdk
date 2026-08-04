@@ -141,9 +141,10 @@ export async function waitForReceiptResilient(
 }
 
 /**
- * Retries `fn` on the two known aeneid public-RPC pool consistency bugs
- * (both observed in cdr-sdk run 26380050980 on the same `default` suite
- * within the same minute — neither is an SDK or contract bug):
+ * Retries `fn` on known aeneid public-RPC transients (none is an SDK or
+ * contract bug). Cases 1-2 were both observed in cdr-sdk run 26380050980 on
+ * the `default` suite within the same minute; case 3 in run 30867267549
+ * (100w-fresh-aeneid, 6 wallets failed on HTTP 429):
  *
  *   1. **receipt-not-found** — `eth_getTransactionReceipt` is served by a
  *      pool node that lags the one which served `eth_sendRawTransaction`.
@@ -164,8 +165,13 @@ export async function waitForReceiptResilient(
  *      seeing vaults[2655]=zero. Retrying the whole cycle re-runs
  *      allocate against a (different / caught-up) pool node and the
  *      write simulation passes.
+ *   3. **rate-limit (HTTP 429)** — the shared public pool throttles a
+ *      read (`vaults()` / `readFee()`) after `resilientHttp`'s ~31s
+ *      transport-retry envelope is exhausted by a concurrent burst. The
+ *      429 surfaces (often wrapped in `ContractFunctionExecutionError`)
+ *      and the cycle retry re-runs it once the burst subsides.
  *
- * Both rethrow unrelated errors immediately so genuine bugs still fail
+ * Unrelated errors rethrow immediately so genuine bugs still fail
  * the test on the first attempt. Default budget: 3 attempts, 5s between.
  * For an idempotent upload→access cycle the retry burns at most ~2× the
  * cycle fee (typically ~0.24 IP / cycle on aeneid), well under the
@@ -193,6 +199,12 @@ export async function withAeneidFlakeRetry<T>(
 }
 
 function isAeneidPoolFlake(err: unknown): boolean {
+  // Public-RPC rate limiting (HTTP 429). resilientHttp already retries 429 at
+  // the transport layer (~31s / 5 retries), but a 100-way burst against the
+  // shared public pool can throttle for longer than that envelope, exhausting
+  // it. A 429 is a transient endpoint condition, never an SDK/contract bug, so
+  // retry the whole cycle — by then the burst has usually subsided.
+  if (isRateLimited(err)) return true;
   if (!(err instanceof Error)) return false;
   // Viem tags receipt-related errors via `.name` even when wrapped.
   if (
@@ -208,4 +220,26 @@ function isAeneidPoolFlake(err: unknown): boolean {
     msg.includes("CDR: Write condition address not set") ||
     msg.includes("CDR: Read condition address not set")
   );
+}
+
+/**
+ * True if `err` (or anything in its `cause` chain) is an HTTP 429 from the RPC.
+ * viem throws `HttpRequestError` (with a numeric `.status`) for 429s and often
+ * wraps it inside a higher-level error — e.g. a `vaults()` / `readFee()` read
+ * surfaces it as `ContractFunctionExecutionError` with the 429 in `.cause`. We
+ * walk the chain and also match the rendered message so wrapping can't hide it.
+ */
+function isRateLimited(err: unknown): boolean {
+  for (let e: unknown = err, depth = 0; e != null && depth < 10; depth++) {
+    if (e instanceof Error) {
+      if ((e as { status?: number }).status === 429) return true;
+      if (/\bStatus:\s*429\b/.test(e.message) || /\b429 Too Many Requests\b/i.test(e.message)) {
+        return true;
+      }
+      e = (e as { cause?: unknown }).cause;
+    } else {
+      return false;
+    }
+  }
+  return false;
 }
