@@ -231,15 +231,19 @@ function isAeneidPoolFlake(err: unknown): boolean {
  */
 function isRateLimited(err: unknown): boolean {
   for (let e: unknown = err, depth = 0; e != null && depth < 10; depth++) {
-    if (e instanceof Error) {
-      if ((e as { status?: number }).status === 429) return true;
-      if (/\bStatus:\s*429\b/.test(e.message) || /\b429 Too Many Requests\b/i.test(e.message)) {
-        return true;
-      }
-      e = (e as { cause?: unknown }).cause;
-    } else {
-      return false;
+    // `status` lives on viem's HttpRequestError but could also ride a plain-object
+    // link — check it on any object, not just Error subclasses.
+    if (typeof e === "object" && (e as { status?: number }).status === 429) return true;
+    // Message match only makes sense on Error links.
+    if (
+      e instanceof Error &&
+      (/\bStatus:\s*429\b/.test(e.message) || /\b429 Too Many Requests\b/i.test(e.message))
+    ) {
+      return true;
     }
+    // Walk `.cause` whether or not this link is an Error subclass, so a 429 wrapped
+    // one level deeper behind a non-Error cause is still found (stop at primitives).
+    e = typeof e === "object" ? (e as { cause?: unknown }).cause : undefined;
   }
   return false;
 }
