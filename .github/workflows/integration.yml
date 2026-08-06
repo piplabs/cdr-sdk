@@ -32,7 +32,7 @@ on:
         type: string
         description: >-
           Override CDR_WALLET_COUNT for the ephemeral-wallet suites (empty =
-          network default: 50 on aeneid, 100 on devnet)
+          network default: 10 on aeneid, 100 on devnet)
         required: false
         default: ''
   # Reusable-workflow entrypoint for cdr-monitor-per-round.yml. Strings (not
@@ -200,8 +200,8 @@ jobs:
               # The public aeneid RPC rate-limits under burst load; run the
               # ephemeral-wallet suites at reduced concurrency there.
               # Aeneid default: repo variable CDR_AENEID_WALLET_COUNT,
-              # falling back to 50. Devnet keeps the suites' built-in 100.
-              echo "CDR_WALLET_COUNT=${{ vars.CDR_AENEID_WALLET_COUNT || '50' }}" >> $GITHUB_ENV
+              # falling back to 10. Devnet keeps the suites' built-in 100.
+              echo "CDR_WALLET_COUNT=${{ vars.CDR_AENEID_WALLET_COUNT || '10' }}" >> $GITHUB_ENV
               ;;
           esac
 
