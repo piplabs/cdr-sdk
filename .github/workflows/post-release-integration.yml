@@ -158,7 +158,7 @@ jobs:
       # the CJS-bridge behavior the smoke step below depends on.
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: Install packages in clean temp dir
         id: install
@@ -501,7 +501,7 @@ jobs:
           ref: ${{ inputs.harness_ref || format('v{0}', needs.prepare.outputs.version) }}
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: Verify Aeneid secret populated
         env:
