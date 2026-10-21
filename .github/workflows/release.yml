@@ -55,7 +55,7 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           cache: pnpm
 
       - name: Validate version input
@@ -130,7 +130,7 @@ jobs:
       # under Node 20 above; no cache param needed here).
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
 
       - run: pnpm -r run build
 
@@ -178,7 +178,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
       - name: Decide whether this is a release
         id: check
         env:
@@ -243,7 +243,7 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           cache: pnpm
 
       # npm 11+ is required for the OIDC Trusted Publisher token exchange.
